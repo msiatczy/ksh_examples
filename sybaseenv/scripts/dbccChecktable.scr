@@ -1,0 +1,117 @@
+#!/bin/ksh 
+#--------------------------------------------------------------------------
+#        Usage: dbccChecktable -S <DBSERVER> -D <dbname> -T <table> {-m <maildest> -p <pagedest>}
+#
+#  Description: Run dbcc checktable against specific table in databases
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	DBSERVER - database server
+#              	DBNAME - database name
+#              	TABLE - table name
+#              	MAILDEST - override default maildest of dba
+#              	PAGEDEST - page destination/flag
+#
+#  Modification History:
+#	06/06/05 M. Siatczynski	Original script (copied from checkdb)
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname> -T <table> {-m <maildest> -p <pagedest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -T)     export TABLE=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -p)     export PAGEDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBNAME" -o ! "$TABLE" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export ERRORFLAG=0
+export DBCCSQL=/tmp/dbccsql.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export LOGFILE=$LOGDIR/dbcc/$DBSERVER/$DBSERVER.$DBNAME.dbccChecktable.$DATETIME
+
+> $LOGFILE
+> $MAILFILE
+
+echo "SCRIPT START: `date`" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBCCSQL && \rm -f $DBCCSQL
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Execute checktable
+#--------------------------------------------------------------------------
+> $DBCCSQL
+echo "use $DBNAME" >> $DBCCSQL
+echo "go" >> $DBCCSQL
+echo "dbcc checktable ($TABLE)" >> $DBCCSQL
+echo "go" >> $DBCCSQL
+
+$SCRDIR/sqlTimer.scr -S $DBSERVER -i $DBCCSQL -o $LOGFILE -m $MAILFILE
+if [ $? -ne 0 ]
+then
+	export ERRORFLAG=1
+fi
+
+echo "SCRIPT END: `date`" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# If there were any failures, send email
+# If a page destination is set, then send a page
+#--------------------------------------------------------------------------
+if [ $ERRORFLAG -eq 1 ]
+then
+	echo "\nNOTE: Check $LOGFILE for further details.\n" >> $MAILFILE
+	export MAILSUBJECT="$DBSERVER DBCC CHECKTABLE FAILED"
+	sendMail
+	if [ "$PAGEDEST" ]
+	then
+		echo "$DBSERVER DBCC CHECKTABLE FAILED" > $PAGEMSG
+		sendPage
+	fi
+	exit 1
+else
+	exit 0
+fi

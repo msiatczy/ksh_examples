@@ -1,0 +1,194 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: uwhoInfo.scr -S DBSERVER {-active|-ip -pss -showplan}
+#
+#  Description: Show all processes, locks, showplans and temp tables.
+#		If -active is passed, only show active processes otherwise show all.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	-active - flag to only show active processes in uwho output
+#
+#
+#  Modification History:
+#	07/20/02 M. Siatczynski Rewrite original script
+#	08/23/02 M. Siatczynski Added sp_countconn
+#	07/18/03 M. Siatczynski showplan info converted to a stored proc and
+#				DB calls decreased from 2 to 1
+#				No longer a need to separately format sql
+#				Add -active parm and PROC variable
+#	07/23/03 M. Siatczynski Add -ip parm
+#	10/28/03 M. Siatczynski Centralized script and added -pss and -shoplan parms
+#				Converted inline SQL to temp sqlfile
+#	11/19/03 M. Siatczynski Add syslogshold info to output
+#	11/25/03 M. Siatczynski Take tempdb..sp_tablespace out until we can discover root cause with BIGBIRD
+#	03/03/04 K. Hess	Added sql to capture unique IP addresses from sysprocesses
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	04/27/11 M. Siatczynski	Update profile source to accommodate AMG East
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+#------------------------------------------------------------------------------
+# Initialize variables
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-active|-ip -pss -showplan}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -active)	export ACTIVE=1;shift 1;;
+	                -ip)	export IP=1;shift 1;;
+	                -pss)	export PSS=1;shift 1;;
+	                -showplan)	export SHOWPLAN=1;shift 1;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+test ! "$ACTIVE" && export ACTIVE=0
+test ! "$IP" && export IP=0
+test ! "$PSS" && export PSS=0
+test ! "$SHOWPLAN" && export SHOWPLAN=0
+
+# DBSERVER must be passed
+if [ ! "$DBSERVER" ]
+then
+	echo $USAGE
+	echo "ERROR - DBSERVER MUST be passed."
+	exit 1
+fi
+
+# -active and -ip can not be passed together
+if [ $ACTIVE -eq 1 -a $IP -eq 1 ]
+then
+	echo $USAGE
+	echo "ERROR - -active and -ip are mutually exclusive."
+	exit 1
+fi
+
+if [ $ACTIVE -eq 1 ]
+then
+	export PROC=sp_uwho_active
+elif [ $IP -eq 1 ]
+then
+	export PROC=sp_uwho_ip
+else
+	export PROC=sp_uwho
+fi
+
+# check for dbserver directory
+if [ ! -d $PERFDIR/uwhoInfo/$DBSERVER ]
+then
+	echo "ERROR - $PERFDIR/uwhoInfo/$DBSERVER does not exist.  Create directory and re-run script."
+	exit 1
+fi
+
+export SQLFILE=/tmp/uwhoInfo.sqlfile.$$
+export LOGFILE=$PERFDIR/uwhoInfo/$DBSERVER/$DBSERVER.uwhoInfo.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLFILE && \rm -f $SQLFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Format sql file
+#--------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "select \"sqlexe start\"=convert(char,getdate(),9)" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "exec sp_countconn" >> $SQLFILE
+echo "print \"Running $PROC...\"" >> $SQLFILE
+echo "exec $PROC" >> $SQLFILE
+
+if [ $SHOWPLAN -eq 1 ]
+then
+	echo "print \"SHOWPLANS:\"" >> $SQLFILE
+	echo "exec sp_showp_active" >> $SQLFILE
+fi
+
+echo "print \"LOCKS:\"" >> $SQLFILE
+echo "exec sp_lock_what" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "print \"TEMP TABLES:\"" >> $SQLFILE
+#echo "use tempdb" >> $SQLFILE
+#echo "go" >> $SQLFILE
+#echo "sp_tablespace" >> $SQLFILE
+#echo "go" >> $SQLFILE
+echo "print \"OLDEST TRANSACTIONS:\"" >> $SQLFILE
+echo "select * from master..syslogshold" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "print \"GET UNIQUE IP ADDRESSES:\"" >> $SQLFILE
+echo "select count(ipaddr),ipaddr" >> $SQLFILE
+echo "from sysprocesses" >> $SQLFILE
+echo "group by ipaddr" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "select \"sqlexe end\"=convert(char,getdate(),9)" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#--------------------------------------------------------------------------
+#  Write log header
+#  Execute the SQL
+#  Write log trailer
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "SCRIPT START: `date`" >> $LOGFILE
+
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w300 -i$SQLFILE | grep -v Password >> $LOGFILE
+
+echo "SCRIPT END: `date`" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+#  Gather dbcc pss info if -pss is passed
+#  Write log header
+#  Execute the SQL
+#  Write log trailer
+#--------------------------------------------------------------------------
+if [ $PSS -eq 1 ]
+then
+	export PSSLOGFILE=$PERFDIR/uwhoInfo/$DBSERVER/$DBSERVER.dbccpss.$DATETIME
+	> $PSSLOGFILE
+	echo "SCRIPT START: `date`" >> $PSSLOGFILE
+	
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w300 <<-! | grep -v Password >> $PSSLOGFILE
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	dbcc traceon(3604)
+	go
+	dbcc pss
+	go
+	dbcc traceoff(3604)
+	go
+	!
+
+	echo "SCRIPT END: `date`" >> $PSSLOGFILE
+fi
+
+#--------------------------------------------------------------------------
+# Exit the script with a zero status
+#--------------------------------------------------------------------------
+exit 0

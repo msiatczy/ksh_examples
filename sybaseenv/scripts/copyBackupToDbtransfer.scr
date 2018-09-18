@@ -1,0 +1,218 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: copyBackupToDbtransfer.scr -S <DBSERVER> {-full -D <dbname>|<DB list> -date <mmddyyyy>}
+#
+#  Description: Copy Tempe-based backups to the transfer location so they get snapped to 100
+#  NOTE:  ctl files are not affected by this script.  Another script transfers the sqlbt control files.
+#
+#  NOTE2:  System database are excluded from the copy.
+
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<full> - only copy last full (default is last full plus all associated tran dumps)
+#
+#  NOTE:  ASSUMPTION IS THERE ARE ONLY 5 LINES FROM 'begin dump' TO 'end dump'
+#		IN EACH SQLBT CONTROL FILE
+#
+#  Modification History:
+#	02/08/08 M. Siatczynski	Initial Script (copied from copySqlbtToDbtransfer.scr)
+#------------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-full -D <dbname>|<DB list> -date <mmddyyyy>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBSPEC=$2;shift 2;;
+                        -full)  export FULL=1;shift 1;;
+                        -date)  export PARMDATE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$FULL" && export FULL=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/backup/$DBSERVER/$DBSERVER.copyBackupToDbtransfer.$DATETIME
+export SEDFILE=/tmp/sedfile.$$
+export DBLIST=/tmp/dblist.$$
+export FILELIST=/tmp/filelist.$$
+export XDBLIST=/tmp/exclude.dblist.$$
+export TEMPCTLDIR=/tmp/$DBSERVER
+export TRANDIR=/sccm/dbtransfer/sybase/$DBSERVER
+
+if [ "$PARMDATE" ]
+then
+	export SQLBTCTLDIR=$SYBDRDIR/$DBSERVER/sqlbt/$DBSERVER$PARMDATE/physical
+else
+	export SQLBTCTLDIR=$SYBDRDIR/$DBSERVER/sqlbt/$DBSERVER/physical
+fi
+
+> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SEDFILE && \rm -f $SEDFILE
+	test $DBLIST && \rm -f $DBLIST
+	test $FILELIST && \rm -f $FILELIST
+	test $XDBLIST && \rm -f $XDBLIST
+	test -d $TEMPCTLDIR && \rm -rf $TEMPCTLDIR
+}
+
+trap 'tempCleanup' EXIT INT TEM
+
+#------------------------------------------------------------------------------------
+# make/chmod the transfer directory, if it doesn't exist
+#------------------------------------------------------------------------------------
+if [ ! -d $TRANDIR ]
+then
+	mkdir $TRANDIR
+	chmod 750 $TRANDIR
+fi
+test ! -d $TEMPCTLDIR && mkdir $TEMPCTLDIR
+
+#------------------------------------------------------------------------------------
+# format list of system databases to exclude
+#------------------------------------------------------------------------------------
+> $XDBLIST
+echo "^dba$" >> $XDBLIST
+echo "^dbccdb$" >> $XDBLIST
+echo "^dbccalt$" >> $XDBLIST
+echo "^lookjack$" >> $XDBLIST
+echo "^master$" >> $XDBLIST
+echo "^model$" >> $XDBLIST
+echo "^sybsecurity$" >> $XDBLIST
+echo "^sybsecurity_archive$" >> $XDBLIST
+echo "^sybsyntax$" >> $XDBLIST
+echo "^sybsystemdb$" >> $XDBLIST
+echo "^sybsystemprocs$" >> $XDBLIST
+
+#------------------------------------------------------------------------------------
+# format list of databases
+# if a file is passed, make sure it's > 0 bytes 
+# if it's not clearly a file, make sure it's not an invalid filename
+#------------------------------------------------------------------------------------
+if [ "$DBSPEC" ]
+then
+# make sure control file exists and has entries
+	if [ -f $DBSPEC ]
+	then
+		if [ -s $DBSPEC ]
+		then
+			cat $DBSPEC > $DBLIST
+		else
+			echo "ERROR - $DBSPEC is 0 bytes"
+			exit 1
+		fi
+	else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+		echo $DBSPEC | grep '/' > /dev/null
+		if [ $? -eq 0 ]
+		then
+			echo "ERROR - $DBSPEC is not valid--possible invalid filename?"
+			exit 1
+		else
+			echo $DBSPEC > $DBLIST
+		fi
+	fi
+else
+	ls $SQLBTCTLDIR | grep -v '\.skip$' | egrep -vf $XDBLIST | sort > $DBLIST
+fi
+
+#------------------------------------------------------------------------------------
+# For each database copy the most recent backup file to the transfer directory
+#------------------------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	export OLDCTLDIR=$SQLBTCTLDIR
+	if [ ! -d $TEMPCTLDIR ]
+	then
+		mkdir $TEMPCTLDIR
+	fi
+	> $TEMPCTLDIR/$DBNAME
+
+#------------------------------------------------------------------------------------
+# grab the 'options' section from the control file.
+#------------------------------------------------------------------------------------
+	head -`grep -n 'end options' $OLDCTLDIR/$DBNAME | cut -d":" -f1` $OLDCTLDIR/$DBNAME >> $TEMPCTLDIR/$DBNAME
+
+#------------------------------------------------------------------------------------
+# grab the 'dump' section for the last level 0 dump from the control file.
+# this is hardcoded to grab a certain number of lines.  if sqlbt version changes, verify this is still accurate.
+# if FULL=1, get only the last level 0, else get level 0 plus all tran dumps
+#------------------------------------------------------------------------------------
+	if [ $FULL -eq 1 ]
+	then
+		tail +`grep -n 'dump=0' $OLDCTLDIR/$DBNAME | tail -1 | cut -d":" -f1` $OLDCTLDIR/$DBNAME | head -7 >> $TEMPCTLDIR/$DBNAME
+	else
+		tail +`grep -n 'dump=0' $OLDCTLDIR/$DBNAME | tail -1 | cut -d":" -f1` $OLDCTLDIR/$DBNAME >> $TEMPCTLDIR/$DBNAME
+	fi
+
+#------------------------------------------------------------------------------------
+# validate that the last line of the control file = "end dump"
+#------------------------------------------------------------------------------------
+	if [ "`tail -1 $TEMPCTLDIR/$DBNAME`" != "end dump" ]
+	then
+		echo "ERROR - $TEMPCTLDIR/$DBNAME DUMP SECTION NOT ENDED PROPERLY"
+		exit 1
+	fi
+
+#------------------------------------------------------------------------------------
+# format list of files
+#------------------------------------------------------------------------------------
+	grep 'file=disk:' $TEMPCTLDIR/$DBNAME | sed -e 's/file=disk:[0-9A-Za-z_]*\//\//g' -e 's/<1>$/-0/g' > $FILELIST
+
+#------------------------------------------------------------------------------------
+# Copy backup files listed in the control file to the transfer directory
+# Only copy the file to $TRANDIR if it doesn't already exist there
+#------------------------------------------------------------------------------------
+	cat $FILELIST |
+	while read CTLDUMPPATH
+	do
+		export CTLDUMPPATH
+		export DUMPPATH=`dirname $CTLDUMPPATH`
+		export DUMPFILE=`basename $CTLDUMPPATH`
+		if [ ! -f $TRANDIR/$DUMPFILE ]
+		then
+			echo "`date` Copying $DUMPPATH/$DUMPFILE to $TRANDIR/$DUMPFILE" >> $LOGFILE
+			cp -p $DUMPPATH/$DUMPFILE $TRANDIR/$DUMPFILE
+		else
+			echo "$TRANDIR/$DUMPFILE already exists" >> $LOGFILE
+		fi
+	done
+done
+
+#------------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------------
+exit 0

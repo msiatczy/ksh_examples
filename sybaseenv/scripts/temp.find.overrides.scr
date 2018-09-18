@@ -1,0 +1,68 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkAllAseServers.scr
+#
+#  Description: Check something on all Sybase database servers
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	05/02/02 M. Siatczynski	Initial Script
+#	04/20/04 M. Siatczynski	Centralized script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+
+export DBSERVERLIST=/tmp/dbserver.list.$$
+
+getAseList > $DBSERVERLIST
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Execute something on each dbserver
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+#	/usr/ucb/echo -n "*** $DBSERVER  "
+#	echo "*** $DBSERVER"
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password:
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select @@servername,
+	case when attribute=0 then 'pwdexp'
+		when attribute=1 then 'pwdlength'
+		when attribute=2 then 'maxfailed'
+		else 'other'
+	end,
+	object,suser_name(object),int_value from sysattributes where object_cinfo="login" and object_type="PS" order by attribute,object
+	go
+	!
+done
+
+#--------------------------------------------------------------------------
+#  exit with 0
+#--------------------------------------------------------------------------
+exit 0

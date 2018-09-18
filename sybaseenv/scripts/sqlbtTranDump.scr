@@ -1,0 +1,227 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sqlbtTranDump.scr -S <DBSERVER> {-D <database> -m <maildest> -tasks <tasks> -to <pool> -pagehung <pagedest>}
+#
+#  Description: Perform tran log backup of database(s) on DBSERVER
+#		Tran dumps are associated with the control files for physical backups (BACKUPFMT always = physical).
+#
+#     Location:	/sccm/dba/syase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#              	<database> - single database to back up
+#              	<maildest> - mail destination to receive errors (default=dba)
+#              	<tasks> - number of dumps to run simultaneously (default=3)
+#              	<pool> - override default backup pool in control file
+#              	<backup format> - logical or physical (default=physical)
+#
+#  Modification History:
+#	09/13/02 M. Siatczynski	Initial Script (adapted from sqlbtBackup.scr)
+#	11/27/02 M. Siatczynski	Added code to ignore early morning failures for demographics
+#	08/26/03 K. Hess	Added -QUERY and -DEBUG to tran dump commands to help debug tran dump hangs
+#	09/10/03 K. Hess	Commenting out -QUERY and -DEBUG commands
+#	09/16/03 K. Hess	Added truss output to dump commands to help debug tran dump hangs and
+#				re-added -QUERY and -DEBUG options
+#	10/01/03 K. Hess	Commenting out QUERY, DEBUG and TRUSS commands
+#	10/03/03 M. Siatczynski	Added call to checkHungSqlbt.scr at completion of tran dumps
+#				Add optional -pagehung parm to page if sqlbt process hangs
+#       10/28/03 M. Siatczynski Centralize script, eliminate extra generation copy and write log to central log location
+#       01/26/04 M. Siatczynski Properly set HRC when normal trailers do not exist in output file
+#				Remove code for demographics
+#       08/09/04 M. Siatczynski Remove single dbname from logfile name
+#				Wirte to new DBSERVER-based DR location (rather than host-based)
+#       07/25/05 M. Siatczynski Replace DT- with BMCBKS (sqlbt 5.0 error message format)
+#       11/06/06 M. Siatczynski Add PID ($$) to LOGFILE name
+#       12/26/06 M. Siatczynski Comment out call to checkHungSqlbt.scr (hung processes no longer a problem and difficult to programatically detect)
+#       05/29/07 M. Siatczynski Dump to <DBSERVER>_tran7 by default (if -to parm is not passed)
+#--------------------------------------------------------------------------
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname> -m <maildest> -to <backup pool> -tasks <tasks> -pagehung <pagedest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -D)	export ONEDBNAME=$2;shift 2;;
+	                -m)	export MAILDEST=$2;shift 2;;
+	                -tasks)	export TASKS=$2;shift 2;;
+	                -to)	export POOL=$2;shift 2;;
+	                -pagehung)	export PAGEHUNG=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# NOTE:  SETDBSERVER must be set AFTER case statement and profile must be sourced AFTER case statement
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+test ! "$TASKS" && export TASKS=3
+
+export BACKUPFMT=physical
+
+# Create subdirectories for DR if they don't exist
+test ! -d $DBSERVER_DRDIR && mkdir $DBSERVER_DRDIR
+test ! -d $SQLBT_DRDIR && mkdir $SQLBT_DRDIR
+test ! -d $SQLBT_DRDIR/$DBSERVER && mkdir $SQLBT_DRDIR/$DBSERVER
+test ! -d $SQLBT_DRDIR/$DBSERVER$MMDDYYYY && mkdir $SQLBT_DRDIR/$DBSERVER$MMDDYYYY
+test ! -d $SQLBT_DRDIR/$DBSERVER/$BACKUPFMT && mkdir $SQLBT_DRDIR/$DBSERVER/$BACKUPFMT
+test ! -d $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/$BACKUPFMT && mkdir $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/$BACKUPFMT
+
+export SQLBT_DRDEST=$SQLBT_DRDIR/$DBSERVER/$BACKUPFMT
+export SQLBT_DRDEST_DATE=$SQLBT_DRDIR/$DBSERVER$MMDDYYYY/$BACKUPFMT
+
+export LOGFILE=$LOGDIR/backup/$DBSERVER/$DBSERVER.sqlbtTranDump.$$.$DATETIME
+export ERRORS=/tmp/errors.$$
+
+if [ "$ONEDBNAME" ]
+then
+	export SQLBT_CTLFILE=$DT_TRAN/$DBSERVER/$ONEDBNAME
+else
+	export SQLBT_CTLDIR=$DT_TRAN/$DBSERVER
+fi
+
+if [ $SQLBT_CTLDIR -a ! -d $SQLBT_CTLDIR ]
+then
+	echo "ERROR - $CALLED"
+	echo "$SQLBT_CTLDIR does not exist"
+	exit 1
+fi
+
+if [ $SQLBT_CTLFILE -a ! -s $SQLBT_CTLFILE ]
+then
+	echo "ERROR - $CALLED"
+	echo "$SQLBT_CTLFILE does not exist"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# if POOL is not passed, default to <DBSERVER>_tran7
+#--------------------------------------------------------------------------
+test ! "$POOL" && export POOL=${DBSERVER}_tran7
+
+grep "begin backup_pool=$POOL" $DT_TRAN/.dtoptions > /dev/null
+if [ $? -eq 1 ]
+then
+	echo "ERROR - $CALLED"
+	echo "Backup pool $POOL does not exist in $DT_TRAN/.dtoptions"
+	exit 1
+fi
+
+> $ERRORS
+
+# initialize return codes
+export SQLBTRC=0
+export HRC=0
+export EXITRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $ERRORS && \rm -f $ERRORS
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Backup the control file/directory and then save the control 
+# file/directory for DR purposes.
+#--------------------------------------------------------------------------
+> $LOGFILE
+
+test -n "$POOL" && export POOLSPEC="-to $POOL" || export POOLSPEC=""
+
+if [ "$ONEDBNAME" ]
+then
+	$DT_SBACKTRACK_HOME/bin/dtsbackup $SQLBT_CTLFILE $POOLSPEC -log_only >> $LOGFILE
+	SQLBTRC=$?
+	HRC=`grep 'return code was' $LOGFILE | sed 's/  */ /g' | cut -d" " -f6`
+	test ! "$HRC" && export HRC=99
+	cp -p $SQLBT_CTLFILE $SQLBT_DRDEST
+	cp -p $SQLBT_CTLFILE $SQLBT_DRDEST_DATE
+else
+#--------------------------------------------------------------------------
+# If full backups are running, don't run tran dumps
+# This is not a perfect solution since tran dumps for ALL databases are skipped.
+# Ideally, only the tran dump for the affected database(s) should be skipped.
+# This is not easily coded when backing up an entire control directory.
+#--------------------------------------------------------------------------
+	CHECKFULL=`ps -def | grep dtsdump | grep $DBSERVER | egrep -v '(grep|transaction)'`
+	if [ "$CHECKFULL" ]
+	then
+		echo "`date`:  Full backups currently running for $DBSERVER.  Tran dumps will not be run." >> $LOGFILE
+		exit 0
+	fi
+
+	$DT_SBACKTRACK_HOME/bin/dtsbackup $SQLBT_CTLDIR -tasks $TASKS $POOLSPEC -log_only >> $LOGFILE
+	SQLBTRC=$?
+	HRC=`grep 'return code was' $LOGFILE | sed 's/  */ /g' | cut -d" " -f6`
+	test ! "$HRC" && export HRC=99
+	cp -p $SQLBT_CTLDIR/* $SQLBT_DRDEST
+	cp -p $SQLBT_CTLDIR/* $SQLBT_DRDEST_DATE
+fi
+
+#--------------------------------------------------------------------------
+#  Check for errors
+#  the sed cmd accounts for multiple spaces in the "highest return code was" line
+#  Ignore broadvision dump errors between midnight and 8am
+#  	Full dump of broadivision runs at 8am
+#--------------------------------------------------------------------------
+if [ $SQLBTRC -ne 0 -o $HRC -ne 0 ]
+then
+	export EXITRC=1
+	echo "Execution of $CALLED \nended with non-zero return code\n" >> $ERRORS
+	egrep '(BMCBKS|completed with |^\*\*\*)' $LOGFILE >> $ERRORS
+
+        export MAILSUBJECT="$DBSERVER SQLBT TRAN ERRORS"
+
+# if the highest return code was not present in the log file, then mail the entire log file
+	if [ $HRC -eq 99 ]
+	then
+        	export MAILFILE=$LOGFILE
+	else
+		export MAILFILE=$ERRORS
+	fi
+
+# if the only errors are for broadvision between midnight and 8am, then consider dump successful, otherwise, send mail
+	export HOUR=`date +%H`
+	export ERRCOUNT=`grep -c 'completed with errors.' $ERRORS`
+	export DBCOUNT=`grep 'completed with errors.' $ERRORS | egrep -c '(broadvision)'`
+	if [ $HOUR -lt 8 -a $ERRCOUNT -eq $DBCOUNT ]
+	then
+		export EXITRC=0
+	else
+		sendMail
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# Check for hung SQLBT process(es)
+# If PAGEHUNG is set, send page, otherwise send email
+# At this time, hung process does not affect EXITRC
+#--------------------------------------------------------------------------
+#if [ "$PAGEHUNG" ]
+#then
+#	$SCRDIR/checkHungSqlbt.scr -S $DBSERVER -dumptype tran -p $PAGEHUNG
+#else
+#	$SCRDIR/checkHungSqlbt.scr -S $DBSERVER -dumptype tran
+#fi
+
+#--------------------------------------------------------------------------
+# Exit
+#--------------------------------------------------------------------------
+exit $EXITRC

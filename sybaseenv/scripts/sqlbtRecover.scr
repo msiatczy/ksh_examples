@@ -1,0 +1,324 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sqlbtRecover.scr -S <SOURCE DBSERVER> {-T <TARGET DBSERVER> -ctldir <control subdirectory> -D <database>|-L <list of databases> -asof '<asof datetime>' -targetdb <target dbname> -tasks <tasks> -B <backup format> -pagedone <pagedest> -no_online -man_online -noprompt}
+#
+#  Description: Perform physical database recover of one or more databases from SOURCE DBSERVER to TARGET DBSERVER
+#  NOTE:  This script performs a -copyover operation.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<SOURCE DBSERVER> - source dbserver and dbserver used to set environment
+#		<TARGET DBSERVER> - target dbserver
+#		<ctldir> - control subdirectory used for recovery--if not specified, defaults to SOURCE DBSERVER
+#              	<database> - single database to recover
+#              	<asof datetime> - specify with single database to perform asof recovery - MUST be in single quotes
+#              	<target dbname> - target database name - only used for alternate dbname recoveries of single databases
+#              	<list of database> - full path to list of databases to recover
+#              	<tasks> - number of loads to run simultaneously (default=3)
+#              	<backup format> - physical or logical (defaults to physical)
+#
+#  Modification History:
+#	08/29/05 M. Siatczynski	Initial Script (copied from sqlbtBackup.scr)
+#	08/30/05 M. Siatczynski	Allow -asof recover with list of databases
+#	03/01/06 M. Siatczynski	Remove PWDSTRING (will not be necessary once BMC implements password fix)
+#				Implement getPass
+#	03/15/06 M. Siatczynski	Remove sbackups from control directory path
+#	04/28/06 M. Siatczynski Add code to properly set HRC when 'return code was' is not present in LOGFILE
+#	09/19/06 M. Siatczynski Perform recovery as sybadmin rather than sa -- sa has been locked
+#	11/06/06 M. Siatczynski Add PID ($$) to LOGFILE name
+#	06/08/07 M. Siatczynski Add -no_online parm to avoid having SQLBT bring databases online (required for refreshes across ASE versions)
+#	12/26/07 M. Siatczynski Change exits:  exit 1 = WARNING; exit 2 = ERROR
+#	09/29/08 M. Siatczynski Add -man_online parm to manually bring databases online
+#	08/17/09 M. Siatczynski Echo WARNING messages to LOG ONLY, not to console (to avoid stdout msgs when run from Autosys)
+#--------------------------------------------------------------------------
+
+#--------------------------------------------------------------------------
+# Initialize Variables  
+#--------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <SOURCE DBSERVER> {-T <TARGET DBSERVER> -ctldir <control subdirectory> -D <dbname>|-L <list of databases> -asof '<asof datetime>' -targetdb <target dbname> -tasks <tasks> -B <backup format> -pagedone <pagedest> -no_online -man_online -noprompt}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 2
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)		export SOURCE_DBSERVER=$2;shift 2;;
+	                -T)		export TARGET_DBSERVER=$2;shift 2;;
+	                -ctldir)	export CTLSUBDIR=$2;shift 2;;
+	                -D)		export ONEDBNAME=$2;shift 2;;
+	                -targetdb)	export TARGETDB=$2;shift 2;;
+	                -L)		export DBLIST=$2;shift 2;;
+	                -tasks)		export TASKS=$2;shift 2;;
+	                -asof)		export ASOF=$2;shift 2;;
+	                -B)		export BACKUPFMT=$2;shift 2;;
+	                -pagedone)	export PAGEDONE=$2;shift 2;;
+	                -no_online)	export ONLINE=0;shift 1;;
+	                -man_online)	export MANONLINE=1;shift 1;;
+	                -noprompt)	export PROMPT=0;shift 1;;
+	                -*)		echo $USAGE;exit 2;;
+	                *)		echo $USAGE;exit 2;;
+	        esac
+	done
+fi
+
+# NOTE:  SETDBSERVER must be set AFTER case statement and profile must be sourced AFTER case statement
+export SETDBSERVER=$SOURCE_DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+# Validate parms/Initialize variables
+#--------------------------------------------------------------------------
+# SOURCE_DBSERVER MUST be passed
+if [ ! "$SOURCE_DBSERVER" ]
+then
+	echo "ERROR - Source dbserver MUST be passed."
+	exit 2
+fi
+
+# single dbname and list of databases is mutually exclusive
+if [ "$ONEDBNAME" -a "$DBLIST" ]
+then
+	echo "ERROR - Single dbname and list of databases are mutually exclusive."
+	exit 2
+fi
+
+# set defaults
+test ! "$TASKS" && export TASKS=3
+test ! "$BACKUPFMT" && export BACKUPFMT=physical
+test ! "$PROMPT" && export PROMPT=1
+test ! "$CTLSUBDIR" && export CTLSUBDIR=$SOURCE_DBSERVER
+test ! "$ONLINE" && export ONLINE=1
+test ! "$MANONLINE" && export MANONLINE=0
+test "$ONLINE" -eq 0 && export ONLINESPEC="-no_online" || export ONLINESPEC=""
+test -n "$ASOF" && export ASOFSPEC="-asof '$ASOF'" || export ASOF=""
+if [ "$TARGET_DBSERVER" ]
+then
+	export TARGETSPEC="-server $TARGET_DBSERVER"
+else
+	export TARGET_DBSERVER=$SOURCE_DBSERVER
+	export TARGETSPEC=""
+fi
+
+if [ "$TARGETDB" ]
+then
+	export DBSPEC="-database $TARGETDB"
+else
+	export DBSPEC=""
+fi
+
+export PAGEMSG=/tmp/pagemsg.$$
+export TMPDBLIST=/tmp/dblist.$$
+export ONLINEDBLIST=/tmp/onlinedblist.$$
+export ONLINESQL=/tmp/onlinesql.$$
+export SQLOUT=/tmp/sqlout.$$
+export LOGFILE=$LOGDIR/backup/$TARGET_DBSERVER/$TARGET_DBSERVER.sqlbtRecover.$$.$DATETIME
+export FMTDIR=$DTBASE/$BACKUPFMT
+
+> $LOGFILE
+export CTLSTRING=$FMTDIR/$CTLSUBDIR
+export INCLUDEDBSTRING=""
+
+# initialize return codes
+export SQLBTRC=0
+export HRC=0
+export ONLINERC=0
+export FILERC=0
+export EXITRC=0
+
+# if onedbname or list of databases passed, format list of control files, otherwise we'll use the whole control directory
+if [ "$ONEDBNAME" ]
+then
+	echo $ONEDBNAME >> $TMPDBLIST
+elif [ "$DBLIST" ]
+then
+	if [ ! -s $DBLIST ]
+	then
+		echo "WARNING - $DBLIST does not exist or is 0 bytes" >> $LOGFILE
+		exit 1
+	else
+#		if [ -n "$ASOFSPEC" ]
+#		then
+#			echo "ERROR - this script can only perform -asof recovery with a single database."
+#			exit 2
+#		fi
+
+		if [ -n "$DBSPEC" ]
+		then
+			echo "ERROR - can only specify target dbname with a single database recovery."
+			exit 2
+		fi
+
+		cat $DBLIST |
+		while read DBNAME
+		do
+			export DBNAME
+			echo $DBNAME >> $TMPDBLIST
+		done
+	fi
+else
+	if [ ! -d $FMTDIR/$CTLSUBDIR ]
+	then
+		echo "ERROR - $FMTDIR/$CTLSUBDIR does not exist"
+		exit 2
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# If backing up single or list of databases, make sure control files exist for each database
+# Format the database string with separating commas--note special handing of first database name
+# Start off assuming that all databases are invalid--if we encounter a single valid database name, then we will proceed with recovery.
+#--------------------------------------------------------------------------
+export VALIDDB=0
+if [ -s $TMPDBLIST ]
+then
+	export DBSTRING=""
+	export FIRSTVALID=1
+	cat $TMPDBLIST |
+	while read DBNAME
+	do
+		export DBNAME
+		if [ -f $FMTDIR/$CTLSUBDIR/$DBNAME ]
+		then
+			test $FIRSTVALID -eq 1 && export DBSTRING="$DBNAME" || export DBSTRING="$DBSTRING,$DBNAME"
+			export VALIDDB=1
+			export FIRSTVALID=0
+		else
+			echo "ERROR - control file $FMTDIR/$CTLSUBDIR/$DBNAME does not exist" | tee -a $LOGFILE
+			export FILERC=1
+		fi
+	done
+	export INCLUDEDBSTRING="-includedatabase $DBSTRING"
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $PAGEMSG && \rm -f $PAGEMSG
+	test $TMPDBLIST && \rm -f $TMPDBLIST
+	test $ONLINEDBLIST && \rm -f $ONLINEDBLIST
+	test $ONLINESQL && \rm -f $ONLINESQL
+	test $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# If FILERC = 1 and only recovering up one database then don't even attempt the recovery
+# -otherwise-
+# Prompt for continuation
+# Recover the control files/directory
+# Get the highest return code from the log file (the sed cmd accounts for multiple spaces in the "highest return code was" line)
+#--------------------------------------------------------------------------
+if [ $FILERC -ne 0 -a $VALIDDB -eq 0 ]
+then
+	echo "ERROR - No valid database names for which to attempt recovery." | tee -a $LOGFILE
+else
+# prompt for continuation
+	if [ $PROMPT -eq 1 ]
+	then
+	        echo "\n**************************************************************************************\n"
+	        echo "WARNING:  YOU ARE ABOUT TO PERFORM A DATABASE RECOVERY USING THE FOLLOWING COMMAND:\n"
+		echo "***$DT_SBACKTRACK_HOME/bin/dtsrecover $CTLSTRING $INCLUDEDBSTRING $TARGETSPEC $DBSPEC $ASOFSPEC $ONLINESPEC -tasks $TASKS -copyover -verbose -user $ADMINLOGIN -password <password>"
+	        echo "**************************************************************************************\n"
+	        CONTINUE=""
+	        while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+	        do
+	                echo "DO YOU WISH TO CONTINUE? {y/n}"
+	                read CONTINUE
+	        done
+	
+	        if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+	        then
+	                echo "\nScript exiting - no recover action taken on $TARGET_DBSERVER.\n" | tee -a $LOGFILE
+	                exit 1
+	        fi
+	fi
+
+#**********************************************************************************************
+# MAKE SURE THIS EXECUTION STRING IS ACCURATELY REFLECTED IN THE PROMPT TO CONTINUE ABOVE.
+# NOTE:  eval MUST be used, otherwise, the quoted -asof string is not interpretted correctly by dtsrecover
+# password currently shows up on command line
+# BMC enhancement #509839 will allow -password to be included on the cmd line without the password appearing in ps
+#**********************************************************************************************
+	eval $DT_SBACKTRACK_HOME/bin/dtsrecover $CTLSTRING $INCLUDEDBSTRING $TARGETSPEC $DBSPEC $ASOFSPEC $ONLINESPEC -tasks $TASKS -copyover -verbose -user $ADMINLOGIN -password `getPass $TARGET_DBSERVER $ADMINLOGIN` >> $LOGFILE
+	export SQLBTRC=$?
+	HRC=`grep 'return code was' $LOGFILE | sed -e 's/  */ /g' | cut -d" " -f6`
+# this check/setting of HRC accounts for a blank output file
+	test -z "$HRC" && export HRC=1
+fi
+
+#--------------------------------------------------------------------------
+# If -man_online was specified:
+# Get list of databases to bring online (if TMPDBLIST is empty, then we are recovering the whole control directory...get list of databases from ctldir)
+# Format sql to bring database online
+# Run sql to manually bring databases online
+# Check for errors
+#--------------------------------------------------------------------------
+if [ $MANONLINE -eq 1 ]
+then
+	echo "\nManually onlining database(s) on $TARGET_DBSERVER..." >> $LOGFILE
+
+	> $ONLINESQL
+	> $SQLOUT
+
+	if [ -s $TMPDBLIST ]
+	then
+		cat $TMPDBLIST > $ONLINEDBLIST
+	else
+		ls $FMTDIR/$CTLSUBDIR > $ONLINEDBLIST
+	fi
+
+	cat $ONLINEDBLIST |
+	while read DBNAME
+	do
+		echo "online database $DBNAME" >> $ONLINESQL
+		echo "go" >> $ONLINESQL
+	done
+
+	getPass $TARGET_DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$TARGET_DBSERVER -w200 -e -i$ONLINESQL | grep -v Password >> $SQLOUT
+
+	cat $SQLOUT >> $LOGFILE
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - executing online SQL against $TARGET_DBSERVER.  Review errors in $LOGFILE" >> $LOGFILE
+		export ONLINERC=1
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  Set the exit return code
+#  If sqlbt execution failed (SQLBTRC <> 0), set a non-zero return code
+#  If log file contains non-zero return code (HRC <> 0), set a non-zero return code
+#  If any of the control files specified were invalid,(FILERC <> 0) set a non-zero return code
+#  If online sql was not successful (ONLINERC <> 0), set non-zero return code
+#--------------------------------------------------------------------------
+if [ $SQLBTRC -ne 0 -o $HRC -ne 0 -o $FILERC -ne 0 -o $ONLINERC -ne 0 ]
+then
+        export EXITRC=1
+fi
+
+#--------------------------------------------------------------------------
+#  If PAGEDONE set, set appropriate page message and send page
+#--------------------------------------------------------------------------
+if [ "$PAGEDONE" ]
+then
+	test $EXITRC -eq 0 && export PAGESTATUS=SUCCESS || export PAGESTATUS="FAILURE/WARNING"
+	echo "`date` $TARGET_DBSERVER recovery completion status=$PAGESTATUS" > $PAGEMSG
+	export PAGEDEST=$PAGEDONE
+	sendPage
+fi
+
+#--------------------------------------------------------------------------
+# Exit
+#--------------------------------------------------------------------------
+exit $EXITRC

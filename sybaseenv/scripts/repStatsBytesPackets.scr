@@ -1,0 +1,98 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: repStatsBytesPackets.scr -S <DBSERVER> -date <mmddyy>
+#
+#  Description: Compile total bytes and packets passed through replication server
+#		from a source DBSERVER for a given date.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	08/03/06 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -date <mmddyy>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -date)     export DATE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DATE" ]
+then
+        echo $USAGE
+        exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SYSMONFILES=$PERFDIR/sysmon/$DBSERVER/$DBSERVER.sysmon.$DATE.*
+export TMPBYTEDETAIL=/tmp/bytedetail.$$
+export TMPPACKETDETAIL=/tmp/packetdetail.$$
+export TMPBYTEVALUES=/tmp/bytevalues.$$
+export TMPPACKETVALUES=/tmp/packetvalues.$$
+export SUMBYTES=0
+export SUMPACKETS=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TMPBYTEDETAIL && \rm -f $TMPBYTEDETAIL
+	test -f $TMPPACKETDETAIL && \rm -f $TMPPACKETDETAIL
+	test -f $TMPBYTEVALUES && \rm -f $TMPBYTEVALUES
+	test -f $TMPPACKETVALUES && \rm -f $TMPPACKETVALUES
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  grep byte and packet info from the sysmon files
+#  replacing multiple spaces with a single space
+#--------------------------------------------------------------------------
+grep '^    Amount of Bytes Sent           ' $SYSMONFILES > $TMPBYTEDETAIL
+grep '^    Packets Sent                   ' $SYSMONFILES > $TMPPACKETDETAIL
+
+sed -e 's/  */ /g' $TMPBYTEDETAIL | cut -d" " -f8 | grep -v ^0$ > $TMPBYTEVALUES
+sed -e 's/  */ /g' $TMPPACKETDETAIL | cut -d" " -f6 | grep -v ^0$ > $TMPPACKETVALUES
+
+cat $TMPBYTEVALUES |
+while read SIZE
+do
+	export SUMBYTES=`echo $SUMBYTES $SIZE | awk '{print $1 + $2}'`
+done
+
+cat $TMPPACKETVALUES |
+while read SIZE
+do
+	export SUMPACKETS=`echo $SUMPACKETS $SIZE | awk '{print $1 + $2}'`
+done
+
+echo "\nTOTAL BYTES sent from $DBSERVER on $DATE:  $SUMBYTES"
+echo "\nTOTAL PACKETS sent from $DBSERVER on $DATE:  $SUMPACKETS"
+
+exit 0

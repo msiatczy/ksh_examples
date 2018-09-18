@@ -1,0 +1,229 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: killConn.scr -S <DBSERVER> {-D <DBNAME|DBlist> -noprompt -xnorad}
+#
+#  Description: Kill all connections to a DBSERVER EXCEPT for sa
+#		NOTE:  this will not kill Rep Agents, since their suser_name()=NULL
+#
+#     Location:	/sccm/dba/sybase/scripts/killConn.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - Database server name
+#		<DBSPEC> - Database name or list of databases
+#
+#
+#  Modification History:
+#	07/10/02 M. Siatczynski	Initial Script
+#	01/15/03 M. Siatczynski	Added DBNAME to kill connections for a particular DBNAME
+#	02/20/03 M. Siatczynski	Added suser_name(suid)<>NULL to where clause for for DBNAME kill
+#	02/18/04 M. Siatczynski	Centralized script
+#	03/22/04 M. Siatczynski	Ignore errors when trying to kill inactive processes
+#	07/07/04 M. Siatczynski	Add -xpatrol and -xpanacya flags, do not kill sa for specific DBNAME
+#	07/09/04 M. Siatczynski	Add -noprompt parm
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	02/15/06 M. Siatczynski	Add code to the current connection won't be killed (now that connection is done via sybadmin)
+#	05/23/07 M. Siatczynski	Removed code for panacya -- login no longer exists
+#				Add code to NOT kill $ADMINLOGIN connections to master database (to prevent sysmons from getting killed)
+#	01/02/08 M. Siatczynski	Allow for list of databases; Change exits:  1=WARNING, 2=ERROR
+#	08/17/09 M. Siatczynski	Echo WARNING messages to LOG ONLY, not to console (to avoid stdout msgs when run from Autosys)
+#	05/03/10 M. Siatczynski	Add logic to kill spids holding locks in specific database
+#	09/24/10 M. Siatczynski	Change code for patrol to norad
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <DBNAME|DBlist> -noprompt -xnorad}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 2
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -D)	export DBSPEC=$2;shift 2;;
+	                -noprompt)	export PROMPT=0;shift 1;;
+	                -xnorad)	export XNORAD=1;shift 1;;
+	                -*)	echo $USAGE;exit 2;;
+	                *)	echo $USAGE;exit 2;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+	echo $USAGE
+	exit 2
+fi
+
+test ! "$PROMPT" && export PROMPT=1
+test ! "$XNORAD" && export XNORAD=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.killConn.$DATETIME
+export KILLSQL=/tmp/kill.sql.$$
+export CHECKLOG=/tmp/checkfile.$$
+export DBLIST=/tmp/dblist.$$
+
+# format INCLAUSE based on exclusions
+export INCLAUSE="('sa'"
+test $XNORAD -eq 1 && export INCLAUSE="${INCLAUSE},'norad'"
+export INCLAUSE="${INCLAUSE})"
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $KILLSQL && \rm -f $KILLSQL
+	test $CHECKLOG && \rm -f $CHECKLOG
+	test $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# write log header
+#------------------------------------------------------------------------------
+> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Prompt for confirmation
+#------------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+	echo "\nYou are about to kill connections on $DBSERVER\n"
+	CONTINUE=""
+	while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+	do
+		echo "DO YOU WISH TO CONTINUE? {y/n}"
+		read CONTINUE
+	done
+	if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+	then
+		echo "\n`date` Script exiting - no action taken on $DBSERVER.\n" | tee -a $LOGFILE
+		exit 0
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# Format list of databases
+#--------------------------------------------------------------------------
+# make sure control file exists and has entries
+if [ "$DBSPEC" ]
+then
+	if [ -f $DBSPEC ]
+	then
+		if [ -s $DBSPEC ]
+		then
+			cat $DBSPEC > $DBLIST
+		else
+			echo "WARNING - $DBSPEC is 0 bytes" >> $LOGFILE
+			exit 1
+		fi
+	else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+		echo $DBSPEC | grep '/' > /dev/null
+		if [ $? -eq 0 ]
+		then
+			echo "ERROR - $DBSPEC is not valid--possible invalid filename?" | tee -a $LOGFILE
+			exit 2
+		else
+			echo $DBSPEC > $DBLIST
+		fi
+	fi
+
+# format DBINCLAUSE
+	export FIRSTDB=1
+	export DBINCLAUSE="("
+	cat $DBLIST |
+	while read DBNAME
+	do
+		test $FIRSTDB -eq 1 && export DBINCLAUSE="${DBINCLAUSE}'$DBNAME'" || export DBINCLAUSE="${DBINCLAUSE},'$DBNAME'"
+		export FIRSTDB=0
+	done
+	export DBINCLAUSE="${DBINCLAUSE})"
+fi
+
+#------------------------------------------------------------------------------
+# get list of users currently connected to DBSERVER and format kill statements
+# EXCLUDE the following:
+# 1.  any 'sa' connections
+# 2.  spids with NULL suser_name (this includes RepAgents)
+#------------------------------------------------------------------------------
+echo "CURRENT CONNECTIONS...`date`" >> $LOGFILE
+> $KILLSQL
+echo "use master" >> $KILLSQL
+echo "go" >> $KILLSQL
+echo "sp_uwho" >> $KILLSQL
+echo "go" >> $KILLSQL
+echo "sp_lock_what" >> $KILLSQL
+echo "go" >> $KILLSQL
+
+if [ "$DBSPEC" ]
+then
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password >> $KILLSQL
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	select "kill ",spid,convert(char(1),0xa)+"go"
+	from master..sysprocesses
+	where
+	db_name(dbid) in $DBINCLAUSE and
+	suser_name(suid) <> NULL and
+	suser_name(suid) not in $INCLAUSE and
+	spid <> @@spid
+	union
+	select "kill ",l.spid,convert(char(1),0xa)+"go"
+	from master..syslocks l, master..sysprocesses p
+	where
+	db_name(l.dbid) in $DBINCLAUSE and
+	(l.spid = p.spid and suser_name(p.suid) <> NULL)
+	go
+	!
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password >> $KILLSQL
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	select "kill ",spid,convert(char(1),0xa)+"go"
+	from master..sysprocesses
+	where
+	suser_name(suid) not in $INCLAUSE
+	and spid <> @@spid
+-- by default, do not kill ADMINLOGIN connections to master
+	and not (suser_name(suid) = "$ADMINLOGIN" and db_name(dbid) = "master")
+	go
+	!
+fi
+
+echo "waitfor delay '00:00:10'" >> $KILLSQL
+echo "go" >> $KILLSQL
+echo "sp_uwho" >> $KILLSQL
+echo "go" >> $KILLSQL
+echo "sp_lock_what" >> $KILLSQL
+echo "go" >> $KILLSQL
+
+#------------------------------------------------------------------------------
+# kill the connections
+# ignore 'Msg 6106,' errors (Process '1186' is not an active process number.)
+# (sometimes the kill of one process causes others to exit before the kill command is issued against them)
+# check for errors
+#------------------------------------------------------------------------------
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e -i $KILLSQL >> $LOGFILE
+grep -v 'Msg 6106,' $LOGFILE > $CHECKLOG
+
+checkSqlErr $CHECKLOG
+if [ $? -eq 1 ]
+then
+        echo "$0 FAILED - output in $LOGFILE"
+        exit 2
+else
+        exit 0
+fi

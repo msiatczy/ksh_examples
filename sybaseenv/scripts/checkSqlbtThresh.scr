@@ -1,0 +1,241 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkSqlbtThresh.scr -S <DBSERVER> {-D <dbname> -pct <thresh pct> -m <maildest>}
+#
+#  Description: Check thresholds in one or more databases on a server for threshold 
+#		settings which are less than thresh pct.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#              	<DBNAME> - database name
+#              	<PCT> - if the threshold is set less than 1% below the passed pct, report only these databases
+#			Default is to report on all thresholds
+#
+#  NOTE:  Pass a percentage for production servers and generate full report for dev/test servers.
+# 	 	There should not be any sqlbt thresholds in dev/test (unless we decide to do tran dumps in dev/test).
+#
+#  Modification History:
+#	05/26/04 M. Siatczynski	Initial Script
+#	01/12/06 M. Siatczynski	Check for thresholds in DBs with trunc log on chkpt set, and ignore read only DBs
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	05/09/07 M. Siatczynski	Ignore offline databases (status2=16)
+#	05/17/07 M. Siatczynski	Ignore databases with trunc log on chkpt set which are configured to use Rep Agent
+#	12/02/08 M. Siatczynski	Extra parentheses needed around a calculation to avoid numeric truncation
+#	01/07/10 J. Aspenleiter	Updated select query looking for sp_threshold_sqlbt to include sp_threshold_native.
+#				And - updated the #thesh temp table to include proc_name so we know what one is being used...
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+# only send mail if maildest is passed
+unset MAILDEST
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname> -pct <thresh pct> -m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+                        -pct)   export PCT=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test "$PCT" && export CHECKPCT=`expr $PCT - 1`
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBLIST=/tmp/dblist.$$
+export LOGFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.checkSqlbtThresh.$DATETIME
+export HIGHRC=0
+
+> $LOGFILE
+echo "Threshold report generated `date`" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+# Exclude read only DBs (status=1024) and offline DBs (status2=16)
+# If processing all databases, ignore those databases which are configured to use Rep Agent
+#--------------------------------------------------------------------------
+if [ "$ONEDBNAME" ]
+then
+	echo $ONEDBNAME > $DBLIST
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases
+	where status & 1024 <> 1024
+	and status2 & 16 <> 16
+	order by name
+	go
+	!
+
+	checkSqlErr $DBLIST
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - getting list of databases for $DBSERVER" >> $LOGFILE
+		cat $DBLIST >> $LOGFILE
+		exit 1
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# Format sql to check non-last chance thresholds on logsegments
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "select dbid=dbid,logmb=(sum(size)/512) into #logsizes from master..sysusages where segmap = 4 group by dbid" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "create table #threshinfo (" >> $SQLFILE
+echo "dbserver char(15)," >> $SQLFILE
+echo "dbname char(20)," >> $SQLFILE
+echo "logsize_mb int," >> $SQLFILE
+echo "thresh_pgs int," >> $SQLFILE
+echo "thresh_mb decimal(8,2)," >> $SQLFILE
+echo "thresh_pct decimal(6,2)," >> $SQLFILE
+echo "proc_name varchar(30)" >> $SQLFILE
+echo ")" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	echo "use $DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "if exists (select * from systhresholds where status <> 1 and proc_name in ('sp_threshold_sqlbt','sp_threshold_native'))" >> $SQLFILE
+	echo "insert #threshinfo" >> $SQLFILE
+	echo "select" >> $SQLFILE
+	echo "convert(char(15),@@servername)," >> $SQLFILE
+	echo "convert(char(20),db_name())," >> $SQLFILE
+	echo "l.logmb," >> $SQLFILE
+	echo "free_space," >> $SQLFILE
+	echo "convert(decimal(8,2),t.free_space/512.00)," >> $SQLFILE
+	echo "convert(decimal(6,2),((t.free_space/512.00)/l.logmb)*100.00)," >> $SQLFILE
+	echo "t.proc_name" >> $SQLFILE
+	echo "from systhresholds t, #logsizes l, syssegments s" >> $SQLFILE
+	echo "where l.dbid = db_id()" >> $SQLFILE
+	echo "and t.segment = s.segment" >> $SQLFILE
+	echo "and t.status <> 1" >> $SQLFILE
+	echo "and t.proc_name in ('sp_threshold_sqlbt','sp_threshold_native')" >> $SQLFILE
+	test "$PCT" && echo "and (convert(decimal(6,2),((t.free_space/512.00)/l.logmb))*100.00) < $CHECKPCT" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+# check to make sure a sqlbt threshold exists if the database does not have truncate log on chkpt set
+	echo "if exists (select * from master..sysdatabases d where d.name = \"$DBNAME\" and d.status & 8 <> 8)" >> $SQLFILE
+	echo "and not exists (select * from $DBNAME..systhresholds t where t.proc_name in ('sp_threshold_sqlbt','sp_threshold_native'))" >> $SQLFILE
+	echo "print \"WARNING - No SQLBT or NATIVE threshold exists for $DBNAME\"" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+# check to make sure a sqlbt threshold DOES NOT exist if the database HAS truncate log on chkpt set
+# exclude databases which have trunc log on chkpt enabled but DO have Rep Agent configured
+        echo "if exists (select * from master..sysdatabases d where d.name = \"$DBNAME\" and d.status & 8 = 8)" >> $SQLFILE
+        echo "and exists (select * from $DBNAME..systhresholds t where t.proc_name in ('sp_threshold_sqlbt','sp_threshold_native'))" >> $SQLFILE
+	echo "and (select count(*) from $DBNAME..sysattributes a where a.object_type = 'RA') = 0" >> $SQLFILE
+        echo "print \"WARNING - SQLBT or NATIVE threshold exists for $DBNAME (trunc log on chkpt).  Remove the threshold with deleteSqlbtThresh.scr\"" >> $SQLFILE
+        echo "go" >> $SQLFILE
+done
+
+echo "if exists (select * from #threshinfo)" >> $SQLFILE
+echo "begin" >> $SQLFILE
+echo "print ' '" >> $SQLFILE
+echo "select * from #threshinfo order by dbname,thresh_pgs" >> $SQLFILE
+echo "end" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "drop table #logsizes" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "drop table #threshinfo" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# pipe in the sql
+#------------------------------------------------------------------------------
+> $SQLOUT
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w500 -i$SQLFILE | grep -v Password >> $SQLOUT
+
+#------------------------------------------------------------------------------
+# If the sqlout file contains data, check for errors
+# Write appropriate messages to LOGFILE, depending on whether PCT is set
+#------------------------------------------------------------------------------
+if [ -s $SQLOUT ]
+then
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "ERROR - executing SQL against $DBSERVER" >> $LOGFILE
+	else
+		if [ "$PCT" ]
+		then
+			echo "\nThe following SQLBT or NATIVE thresholds are invalid or less than $PCT % on $DBSERVER:\n" >> $LOGFILE
+		else
+			echo "\nSQLBT or NATIVE thresholds for all databases on $DBSERVER:\n" >> $LOGFILE
+			echo "NOTE:  Thresholds should not exist on non-prod ASEs.\n" >> $LOGFILE
+		fi
+	fi
+
+	cat $SQLOUT >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# If maildest is passed, and there was SQL output, send email
+#------------------------------------------------------------------------------
+	if [ "$MAILDEST" ]
+	then
+		export MAILFILE=$LOGFILE
+		export MAILSUBJECT="$DBSERVER SQLBT and NATIVE Threshold Report"
+		sendMail
+	fi
+
+else
+	if [ "$PCT" ]
+	then
+		echo "\nNo SQLBT or NATIVE thresholds are invalid or less than $PCT % on $DBSERVER for updateable databases" >> $LOGFILE
+	else
+		echo "\nNo SQLBT or NATIVE thresholds exist on $DBSERVER for updateable databases" >> $LOGFILE
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+exit $HIGHRC

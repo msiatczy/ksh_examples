@@ -1,0 +1,195 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: deleteSqlbtThresh.scr -S DBSERVER {-D DBNAME -noprompt}
+#
+#  Description: Delete SQLBT thresholds
+# 		SQLBT thresholds are usually only used on prod servers.  This script
+# 		is typically used to delete these thresholds from non-prod servers.
+#
+#     Location:	/sccm/dba/sybase/scripts/deleteSqlbtThresh.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	09/20/02 M. Siatczynski	Original script
+#	02/21/03 M. Siatczynski	Added DBNAME variable
+#	05/28/04 M. Siatczynski	Centralized script, added prompt
+#	05/04/05 M. Siatczynski	Ignore tempdbs and read only databases (status=1024)
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	03/29/06 M. Siatczynski	Ignore offline databases (status2=16)
+#	05/29/09 M. Siatczynski	Updated to call getDbList function
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D DBNAME -noprompt}"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+                        -noprompt)     export PROMPT=0;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$PROMPT" && export PROMPT=1
+
+#---------------------------------------------------------------------------------------
+# set/initialize variables
+#---------------------------------------------------------------------------------------
+export DROPSQL=/tmp/dropsql.$$
+export SQLTEMP=/tmp/sqltemp.$$
+export DBLIST=/tmp/dblist.$$
+export THRESHLIST=/tmp/threshlist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DROPSQL && \rm -f $DROPSQL
+	test $SQLTEMP && \rm -f $SQLTEMP
+	test $DBLIST && \rm -f $DBLIST
+	test $THRESHLIST && \rm -f $THRESHLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+# Ignore read only databases (status=1024)
+#--------------------------------------------------------------------------
+if [ "$ONEDBNAME" ]
+then
+	export OUTFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.$ONEDBNAME.deleteSqlbtThresh.$DATETIME
+	echo $ONEDBNAME > $DBLIST
+else
+	export OUTFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.deleteSqlbtThresh.$DATETIME
+	getDbList -S $DBSERVER -user -system -xreadonly > $DBLIST
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - Getting list of databases on $DBSERVER"
+		exit 1
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# write report headers
+#--------------------------------------------------------------------------
+> $OUTFILE
+echo "Dropping sqlbt thresholds on $DBSERVER `date`" >> $OUTFILE
+
+#---------------------------------------------------------------------------------------
+# format sql to get the threshold
+#---------------------------------------------------------------------------------------
+> $SQLTEMP
+echo "set nocount on" >> $SQLTEMP
+echo "go" >> $SQLTEMP
+
+cat $DBLIST |
+while read DB
+do
+	export DB
+	echo "use $DB" >> $SQLTEMP
+	echo "go" >> $SQLTEMP
+	echo "select db=convert(char(20),db_name()),segment=convert(char(18),s.name),free_space" >> $SQLTEMP
+	echo "from systhresholds t, syssegments s" >> $SQLTEMP
+	echo "where proc_name = \"sp_threshold_sqlbt\"" >> $SQLTEMP
+	echo "and t.segment = s.segment" >> $SQLTEMP
+	echo "go" >> $SQLTEMP
+
+done
+
+#---------------------------------------------------------------------------------------
+# get the sqlbt threshold in each database
+# remove leading space from each line
+#---------------------------------------------------------------------------------------
+> $THRESHLIST
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w500 -i$SQLTEMP | grep -v Password | sed -e 's/^ //g' >> $THRESHLIST
+
+checkSqlErr $THRESHLIST
+if [ $? -ne 0 ]
+then
+	echo "ERROR - checking thresholds on $DBSERVER"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  If there are thresholds to delete, format the sql
+#--------------------------------------------------------------------------
+if [ -s $THRESHLIST ]
+then
+	> $DROPSQL
+	cat $THRESHLIST |
+	while read DB SEGMENT FREE
+	do
+		export DB SEGMENT FREE
+		echo "use $DB" >> $DROPSQL
+		echo "go" >> $DROPSQL
+		echo "sp_dropthreshold $DB,\"$SEGMENT\",$FREE" >> $DROPSQL
+		echo "go" >> $DROPSQL
+	done
+else
+	echo "No SQLBT thresholds exist on $DBSERVER $ONEDBNAME" >> $OUTFILE
+	exit 0
+fi
+
+#--------------------------------------------------------------------------
+#  prompt to continue
+#--------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+        echo "\nSQLBT thresholds will be deleted for the following database(s) on $DBSERVER:\n"
+        cut -d" " -f1 $THRESHLIST
+        echo ""
+        export CONTINUE=""
+        while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+        do
+                echo "DO YOU WISH TO CONTINUE? {y/n}"
+                read CONTINUE
+        done
+
+        if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+        then
+                echo "\nExiting - No thresholds deleted on $DBSERVER\n"
+                exit 0
+        fi
+fi
+
+#---------------------------------------------------------------------------------------
+# drop the thresholds
+# check for errors
+# exit
+#---------------------------------------------------------------------------------------
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e -i$DROPSQL >> $OUTFILE
+
+checkSqlErr $OUTFILE
+if [ $? -ne 0 ]
+then
+	echo "Threshold delete for $DBSERVER $ONEDBNAME FAILED" | tee -a $OUTFILE
+	exit 1
+else
+	echo "Threshold delete for $DBSERVER $ONEDBNAME SUCCESSFUL" >> $OUTFILE
+	exit 0
+fi

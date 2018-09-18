@@ -1,0 +1,145 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: runIsql.scr -S <DBSERVER> -i <input sql file> {-o <output file> -pagefail <pagedest> | -pagedone <pagedest> -echosql}
+#
+#  Description: Quick way to run isql passing an input file, output file is now optional
+#
+#     Location:	/sccm/dba/sybase/scripts/runIsql.scr
+#
+#   Parameters:	<DBSERVER>
+#              	<input sql file> - full path/filename of input sql file (by default, input is NOT echoed to the output file)
+#              	<output file> - full path/filename of output file ($DATETIME is appended to file)
+#              	<PAGEFAIL> - page only for failures
+#              	<PAGEDONE> - page upon completion (success or failure)
+#		             PAGEDONE takes precedence over PAGEFAIL
+#
+#  Modification History:
+#	12/27/06 M. Siatczynski runIsql.scr replaces cronIsql.scr since we no longer use cron, cronIsql.scr links to runIsql.scr
+#	12/29/06 M. Siatczynski Add -echo parm--by default, do NOT echo input to sqloutput file (sometimes input contains text that gets flagged as error)
+#	01/02/07 M. Siatczynski Update setting of ECHO--if not passed, set to 0, also, change var from ECHO to ECHOSQL
+#	02/01/07 M. Siatczynski shift 1 on -echosql parm
+#	04/12/11 M. Siatczynski Update profile for AMG East
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+#------------------------------------------------------------------------------
+# Initialize variables
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -i <input sql file> {-o <output file> -pagefail <pagedest> | -pagedone <pagedest> -echosql}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)		export DBSERVER=$2;shift 2;;
+	                -i)		export INSQL=$2;shift 2;;
+	                -o)		export OUTSPEC=$2;shift 2;;
+	                -pagefail)	export PAGEFAIL=$2;shift 2;;
+	                -pagedone)	export PAGEDONE=$2;shift 2;;
+	                -echosql)	export ECHOSQL=1;shift 1;;
+	                -*)		echo $USAGE;exit 1;;
+	                *)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" -o ! "$INSQL" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+test ! "$ECHOSQL" && export ECHOSQL=0
+
+# Make sure INSQL exists and is not empty
+if [ -f "$INSQL" ]
+then
+	if [ ! -s $INSQL ]
+	then
+		echo "ERROR - $INSQL is 0 bytes"
+		exit 1
+	fi
+else
+	echo "ERROR - $INSQL does not exist"
+	exit 1
+fi
+
+# if output location is specified, append $DATETIME to end of filename
+# if output location is not specified, default to logdir location (include pid as part of the output file name)
+if [ "$OUTSPEC" ]
+then
+	export OUTFILE=$OUTSPEC.$DATETIME
+else
+	export OUTFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.runIsql.$$.$DATETIME
+fi
+
+# if both pagefail and pagedone are passed, pagedone takes precedence
+if [ "$PAGEFAIL" -a "$PAGEDONE" ]
+then
+	unset PAGEFAIL
+fi
+
+export PAGEMSG=/tmp/pagefile.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Execute the SQL from the input file
+#  Echo SQL commands to the output file
+#  Check sql output and set return code
+#--------------------------------------------------------------------------
+if [ $ECHOSQL -eq 1 ]
+then
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w500 -e -i$INSQL -o$OUTFILE | grep -v Password
+else
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w500 -i$INSQL -o$OUTFILE | grep -v Password
+fi
+
+checkSqlErr $OUTFILE
+if [ $? -ne 0 ]
+then
+        export HIGHRC=1
+else
+        export HIGHRC=0
+fi
+
+#------------------------------------------------------------------------------
+# send page(s) if applicable
+# format the pagemsg
+# if pagedone, send appropriate page
+# if pagefail, send page only for failure
+#------------------------------------------------------------------------------
+test $HIGHRC -ne 0 && echo "$INSQL FAILED against $DBSERVER" > $PAGEMSG || echo "$INSQL SUCCESSFUL against $DBSERVER" > $PAGEMSG
+
+if [ "$PAGEDONE" ]
+then
+	export PAGEDEST=$PAGEDONE
+	sendPage
+elif [ "$PAGEFAIL" -a $HIGHRC -ne 0 ]
+then
+	export PAGEDEST=$PAGEFAIL
+	sendPage
+fi
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+test $HIGHRC -ne 0 && exit 1 || exit 0

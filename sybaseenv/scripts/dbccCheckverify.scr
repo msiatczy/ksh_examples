@@ -1,0 +1,256 @@
+#!/bin/ksh 
+#--------------------------------------------------------------------------
+#        Usage: dbccCheckverify -S <DBSERVER> {-D <dbname>|-L <dblist> -m <maildest> -p <pagedest> -checksoft}
+#
+#  Description: Run dbcc checkverify against database(s)
+#
+#     Location:	/sccm/dba/sybase/scripts/dbccCheckverify.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	DBSERVER - database server
+#              	DBNAME - database name
+#              	DBLIST - list of databases
+#              	MAILDEST - override default maildest of dba
+#              	PAGEDEST - page destination/flag
+#
+#
+#  Modification History:
+#	02/24/03 M. Siatczynski	Rewrite original script
+#	02/28/03 M. Siatczynski	Added checksoft parm and SOFTLIMIT variable
+#				If more than x soft faults, skip checkverify for that database
+#	07/11/03 K. Hess	Updated code to exclude all tempdbs
+#       10/31/03 M. Siatczynski Centralized script
+#       02/10/06 M. Siatczynski Implement ISQLEXE, getPass, ADMINLOGIN
+#       03/03/06 M. Siatczynski Ignore read only (status 1024) databases when processing all DBs on an ASE
+#       05/09/07 M. Siatczynski Ignore offline databases (status2=16)
+#       05/29/09 M. Siatczynski Updated to call getDbList function
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>|-L <dblist> -m <maildest> -p <pagedest> -checksoft}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     	export DBSERVER=$2;shift 2;;
+                        -D)     	export DBNAME=$2;shift 2;;
+                        -L)     	export DBLIST=$2;shift 2;;
+                        -m)     	export MAILDEST=$2;shift 2;;
+                        -p)     	export PAGEDEST=$2;shift 2;;
+                        -checksoft)     export CHECKSOFT=1;shift 1;;
+                        -*)     	echo $USAGE;exit 1;;
+                        *)      	echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+if [ "$DBNAME" -a "$DBLIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - DBNAME and DBLIST are mutually exclusive"
+        exit 1
+fi
+
+if [ "$DBLIST" -a ! -s "$DBLIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - DBLIST does not exist or is 0 bytes"
+        exit 1
+fi
+
+test ! "$CHECKSOFT" && export CHECKSOFT=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export ERRORFLAG=0
+export SOFTLIMIT=1000
+export XLIST=$CTLDIR/$DBSERVER/$DBSERVER.dbccExclude.lst
+export DBCCSQL=/tmp/dbccsql.$$
+export SORTDBLIST=/tmp/sortdblist.$$
+export TMPDBLIST=/tmp/dblist.$$
+export TMPXLIST=/tmp/xlist.$$
+export SOFTTEMP=/tmp/soft.$$
+export SOFTLIST=/tmp/softlist.$$
+export CHECKLIST=/tmp/checklist.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+if [ "$DBNAME" ] 
+then 
+        export LOGFILE=$LOGDIR/dbcc/$DBSERVER/$DBSERVER.$DBNAME.dbccCheckverify.$DATETIME
+else   
+        export LOGFILE=$LOGDIR/dbcc/$DBSERVER/$DBSERVER.dbccCheckverify.$DATETIME
+fi
+
+> $LOGFILE
+> $MAILFILE
+
+echo "SCRIPT START: `date`" >> $LOGFILE 
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBCCSQL && \rm -f $DBCCSQL
+	test -f $SORTDBLIST && \rm -f $SORTDBLIST
+	test -f $TMPDBLIST && \rm -f $TMPDBLIST
+	test -f $TMPXLIST && \rm -f $TMPXLIST
+	test -f $SOFTLIST && \rm -f $SOFTLIST
+	test -f $SOFTTEMP && \rm -f $SOFTTEMP
+	test -f $CHECKLIST && \rm -f $CHECKLIST
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Determine what databases to run dbcc checkverify on:
+#	- single database (-D option)
+#	- list of databases (-L option)
+#	- all databases (no option)
+#  NOTE:  sed removes the spaces from the isql output, otherwise the files can't 
+#  be accurately compared to the exclusion list
+#--------------------------------------------------------------------------
+> $SORTDBLIST
+if [ "$DBNAME" ]
+then
+	echo $DBNAME > $TMPDBLIST
+elif [ "$DBLIST" ]
+then
+	sort $DBLIST > $TMPDBLIST
+else
+	getDbList -S $DBSERVER -user -system -xreadonly | sort > $SORTDBLIST
+
+#--------------------------------------------------------------------------
+#  Exclude databases in the exclusion list
+#--------------------------------------------------------------------------
+	if [ -s $XLIST ]
+	then
+		sort $XLIST > $TMPXLIST
+		comm -23 $SORTDBLIST $TMPXLIST > $TMPDBLIST
+
+	        echo "The following databases are excluded from checkverify:\n" >> $LOGFILE 
+	        cat $TMPXLIST >> $LOGFILE 
+	        echo "" >> $LOGFILE 
+	else
+		cat $SORTDBLIST > $TMPDBLIST
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  Get a list of database with more than x soft faults
+#  NOTE:  sed removes the spaces from the isql output, otherwise the files can't 
+#  be accurately compared to the exclusion list
+#  The order by must be included so list can be compared to other lists.
+#--------------------------------------------------------------------------
+if [ $CHECKSOFT = 1 ]
+then
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password | sed -e 's/^ //g' | sort > $SOFTTEMP
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select dbname=db_name(l.dbid),l.start,l.finish,r.intvalue
+	from dbccdb..dbcc_operation_log l, dbccdb..dbcc_operation_results r
+	where l.optype = 2
+	and l.opid = (select max(opid) from dbccdb..dbcc_operation_log)
+	and l.dbid = r.dbid
+	and l.opid = r.opid
+	and l.optype = r.optype
+	and r.type_code = 1001
+	and r.intvalue > $SOFTLIMIT
+	order by db_name(l.dbid)
+	go
+	!
+fi
+
+#--------------------------------------------------------------------------
+# Write the database list to the output file
+#--------------------------------------------------------------------------
+if [ -s $SOFTTEMP ]
+then
+# probably more efficient way to do this echo, but this works for now
+	echo "THE FOLLOWING DATABASES HAVE MORE THAN $SOFTLIMIT SOFT FAULTS AND WILL NOT BE CHECKED BY CHECKVERIFY:" >> $LOGFILE
+	echo "THE FOLLOWING DATABASES HAVE MORE THAN $SOFTLIMIT SOFT FAULTS AND WILL NOT BE CHECKED BY CHECKVERIFY:" >> $MAILFILE
+	echo "Format:  dbname - start time - end time - soft faults\n" >> $LOGFILE
+	echo "Format:  dbname - start time - end time - soft faults\n" >> $MAILFILE
+	cat $SOFTTEMP >> $LOGFILE
+	cat $SOFTTEMP >> $MAILFILE
+	echo "" >> $LOGFILE
+	echo "" >> $MAILFILE
+
+# strip off the database names
+	cut -d" " -f1 $SOFTTEMP > $SOFTLIST
+fi
+
+#--------------------------------------------------------------------------
+# Exclude databases in the soft list
+# If the soft list contains one of the databases to be checked, then set the error flag
+#--------------------------------------------------------------------------
+if [ -s $SOFTLIST ]
+then
+	comm -23 $TMPDBLIST $SOFTLIST > $CHECKLIST
+	egrep -f $SOFTLIST $TMPDBLIST > /dev/null
+	export GREPRC=$?
+	test $GREPRC -eq 0 && export ERRORFLAG=1
+else
+	cat $TMPDBLIST > $CHECKLIST
+fi
+
+#--------------------------------------------------------------------------
+#  Execute checkverify for each database
+#--------------------------------------------------------------------------
+for DBNAME in `cat $CHECKLIST`
+do
+	> $DBCCSQL
+	echo "dbcc checkverify ($DBNAME)" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+
+	$SCRDIR/sqlTimer.scr -S $DBSERVER -i $DBCCSQL -o $LOGFILE -m $MAILFILE
+	if [ $? -ne 0 ]
+	then
+		export ERRORFLAG=1
+	fi
+done
+
+echo "SCRIPT END: `date`" >> $LOGFILE 
+
+#--------------------------------------------------------------------------
+# If there were any failures, send email
+# If a page destination is set, then send a page
+#--------------------------------------------------------------------------
+if [ $ERRORFLAG -eq 1 ]
+then
+	echo "\nNOTE: Check $LOGFILE for further details.\n" >> $MAILFILE
+	export MAILSUBJECT="$DBSERVER DBCC CHECKVERIFY FAILED"
+	sendMail
+	if [ "$PAGEDEST" ]
+	then
+		echo "$DBSERVER DBCC CHECKVERIFY FAILED" > $PAGEMSG
+	        sendPage
+	fi
+	exit 1
+else
+	exit 0
+fi

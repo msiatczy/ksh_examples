@@ -1,0 +1,127 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: addSqlbtCtlDir.scr -S <DBSERVER>|all -ctldir <ctldir>
+#
+#  Description: Create a new SQLBT control directory for one or all ASEs on a host
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	03/15/06 M. Siatczynski Original script
+#	02/12/07 M. Siatczynski Add hostname to list of servicenames
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|all -ctldir <ctldir>"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -ctldir) export NEWCTLDIR=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+
+if [ ! "$ONEDBSERVER" -o ! "$NEWCTLDIR" ]
+then
+        echo $USAGE
+        echo "ERROR - DBSERVER and ctldir MUST be passed"
+        exit 1
+fi
+
+test "$ONEDBSERVER" = "all" && export ALL=1 || export ALL=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SERVICENAMES=/tmp/servicenames.$$
+export ASELIST=/tmp/aselist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SERVICENAMES && \rm -f $SERVICENAMES
+	test -f $ASELIST && \rm -f $ASELIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Format list of ASEs
+#--------------------------------------------------------------------------
+if [ $ALL -eq 0 ]
+then
+	echo $ONEDBSERVER > $ASELIST
+else
+# get list of service names available on this host
+	/sccm/software/bin/get_service_name > $SERVICENAMES
+	echo $HOST >> $SERVICENAMES
+
+# from the service name list, get list of Sybase ASEs
+	if [ -s $SERVICENAMES ]
+	then
+		egrep -f $SERVICENAMES $ASEDIRLIST | cut -d" " -f1 > $ASELIST
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  For each ASE on this host...
+#  Run dtscheck against the main physical control directory
+#--------------------------------------------------------------------------
+if [ -s $ASELIST ]
+then
+	for DBSERVER in `cat $ASELIST`
+	do
+		export SETDBSERVER=$DBSERVER
+# re-source profile to set environment for ASE
+		. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+# set variables related to new control directory
+# Check if the new ctldir already exists, then check the link to .dtoptions
+# link .dtoptions to the central copy of .dtoptions (under the physical directory)
+#--------------------------------------------------------------------------
+		export NEWSQLBTCTLDIR=$DTBASE/$NEWCTLDIR
+
+		if [ -d $NEWSQLBTCTLDIR ]
+		then
+			echo "$NEWSQLBTCTLDIR ALREADY EXISTS - checking links and subdirs beneath"
+			test ! -L $NEWSQLBTCTLDIR/.dtoptions && ln -s $DT_PHYSICAL/.dtoptions $NEWSQLBTCTLDIR/.dtoptions
+			test ! -d $NEWSQLBTCTLDIR/$DBSERVER && mkdir $NEWSQLBTCTLDIR/$DBSERVER
+			test ! -f $NEWSQLBTCTLDIR/$DBSERVER/.dtoptions && touch $NEWSQLBTCTLDIR/$DBSERVER/.dtoptions
+		else
+			echo "CREATING DIRECTORY: $NEWSQLBTCTLDIR"
+			mkdir $NEWSQLBTCTLDIR
+			ln -s $DT_PHYSICAL/.dtoptions $NEWSQLBTCTLDIR/.dtoptions
+			mkdir $NEWSQLBTCTLDIR/$DBSERVER
+			touch $NEWSQLBTCTLDIR/$DBSERVER/.dtoptions
+		fi
+	done
+else
+	echo "INFO:  There are no ASEs on `hostname`"
+fi
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+exit 0

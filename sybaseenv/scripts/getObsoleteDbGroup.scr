@@ -1,0 +1,197 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getObsoleteDbGroup.scr  <DBSERVER> <dbname> <maildest> | -all
+#  Description: Get list of database groups that are not being utilized.
+#     Location:	/sccm/dba/sybase/scripts
+#    Called by:	(optional) Script or Autosys script that calls this script
+#        Calls:	(optional) Any scripts this script executes
+#   Parameters:	<parm1> - short description of parm if not obvious
+#
+#  Modification History:
+#	06/08/04 K. Hess	Initial Script
+#	12/31/04 K. Hess	Updated DBSERVERLIST to be dbsrvlist
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	05/29/09 M. Siatczynski	Updated to call getDbList function
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname> -m <maildest> } | -all"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -all)   export ALL=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$ALL" && export ALL=0
+
+if [ ! "$ONEDBSERVER" -a "$ALL" -eq 0 ]
+then
+	echo "ERROR - MUST pass either DBSERVER or -all"
+        echo $USAGE
+        exit 1
+fi
+
+if [ "$ONEDBSERVER" -a "$ALL" -eq 1 ]
+then
+        echo "ERROR - DBSERVER and -all are mutually exclusive"
+        echo $USAGE
+        exit 1
+fi
+
+if [ "$ONEDBNAME" -a ! "$ONEDBSERVER" ]
+then
+        echo "ERROR - DBSERVER MUST be passed with dbname"
+        echo $USAGE
+        exit 1
+fi
+
+if [ "$ONEDBNAME" ]
+then
+        export FILENAME=$ONEDBSERVER.$ONEDBNAME.obsoleteDbGroups.$DATETIME
+else
+        export FILENAME=$ONEDBSERVER.obsoleteDbGroups.$DATETIME
+fi
+ 
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export TMPFILE=/tmp/$FILENAME.$$
+export MAILMSG=/tmp/mailmsg.$$
+export DBSERVERLIST=/tmp/dbsrvlist.$$
+export DBLIST=/tmp/dblist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test $TMPFILE && \rm -f $TMPFILE
+        test $MAILMSG && \rm -f $MAILMSG
+        test $DBSERVERLIST && \rm -f $DBSERVERLIST
+        test $DBLIST && \rm -f $DBLIST
+}
+ 
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Create dbserver list
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" ]
+then
+        echo $ONEDBSERVER > $DBSERVERLIST
+else
+        getAseList | sort > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+#  Isql into server(s) and get database group(s) that are not being utilized
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	#--------------------------------------------------------------------------
+	# Create a working dblist
+	#--------------------------------------------------------------------------
+	if [ "$ONEDBNAME" ]
+	then
+		echo $ONEDBNAME > $DBLIST
+	else
+		getDbList -S $DBSERVER -user -system > $DBLIST
+		if [ $? -eq 1 ]
+		then
+			echo "ERROR - Getting list of databases on $DBSERVER"
+			continue
+		fi
+	fi
+	
+	export RPTFILE=$RPTDIR/misc/$DBSERVER/$FILENAME
+	export LOGFILE=$LOGDIR/misc/$DBSERVER/$FILENAME
+
+	#--------------------------------------------------------------------------
+	# Isql into DBSERVER and create report of obsolete database groups
+	#--------------------------------------------------------------------------
+	cat $DBLIST | 
+	while read DBNAME
+	do
+		export DBNAME
+		$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password >> $RPTFILE
+		`getPass $DBSERVER $ADMINLOGIN`
+		set nocount on
+		go
+		use $DBNAME
+		go
+		select db_name(),G.name
+		from sysusers G
+		where
+		G.uid between @@mingroupid and @@maxgroupid
+		and not exists (select * from sysroles R where G.uid = R.lrid)
+		and G.name not in
+		(select distinct g.name
+		from sysusers u, sysusers g, master.dbo.syslogins m
+		where u.suid *= m.suid
+		and u.gid *= g.uid
+		and ((u.uid < @@mingroupid and u.uid != 0 and u.name != 'dbo')
+		or (u.uid > @@maxgroupid)))
+		and G.name not in ('maint_grp','inquiry')
+		order by G.name
+		go
+		!
+	done
+	
+	
+	#--------------------------------------------------------------------------
+	# If the report file contains data and mail destination is set, send mail with
+	# obsolete groups to designated mail destination
+	#--------------------------------------------------------------------------
+	if [ -s $RPTFILE ]
+	then
+		if [ "$MAILDEST" ]
+        	then
+			export MAILFILE=$RPTFILE
+			export MAILSUBJECT="$DBSERVER Obsolete Database Groups Report"
+			sendMail
+		fi
+		else
+			echo "\nNo obsolete database groups on $DBSERVER" >> $LOGFILE
+	fi
+
+#	#--------------------------------------------------------------------------
+#	# Uncomment the following to automatically delete the obsolete groups
+#	#--------------------------------------------------------------------------
+#	if [ -s $RPTFILE ]
+#	then
+#		cat $RPTFILE | 
+#		while read DB GROUP
+#		do
+#			export DB GROUP
+#			$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password >> $LOGFILE
+#			`getPass $DBSERVER $ADMINLOGIN`
+#			set nocount on
+#			go
+#			use $DB
+#			go
+#			print "Dropping group $GROUP in $DB"
+#			go
+#			sp_dropgroup $GROUP
+#			go
+#			!
+#		done
+#	fi
+
+done

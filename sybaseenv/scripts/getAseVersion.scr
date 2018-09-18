@@ -1,0 +1,69 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getAseVersion.scr
+#  Description: Gets current Sybase ASE version
+#     Location: /sccm/dba/sybase/scripts
+#    Called by: getDr.scr
+#   Parameters: DBSERVER
+#  Modification History:
+#       04/16/04 K. Hess        Initial script
+#       02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#----------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Parameters:  Database server
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>"
+ 
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+ 
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export SETDBSERVER=$DBSERVER
+
+. /sccm/dba/sybase/.dbaSybProfile
+ 
+export RPTFILE=$RPTDIR/dr/$DBSERVER/$DBSERVER.getDr.$MMDDYYYY
+export ASEVERSIONLOG=$DBSERVER_DRDIR/$DBSERVER.aseversion.log
+
+#----------------------------------------------------------------------------
+#  Verify dr directory exists; if not, create the directory
+#----------------------------------------------------------------------------
+test ! -d $DBSERVER_DRDIR && mkdir $DBSERVER_DRDIR
+
+#--------------------------------------------------------------------------
+#  Header for DR Report
+#--------------------------------------------------------------------------
+echo "--ASE VERSION REPORT for $DBSERVER on $DATETIME" >> $RPTFILE
+
+#----------------------------------------------------------------------------
+# Isql and get version information
+#----------------------------------------------------------------------------
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password >> $ASEVERSIONLOG
+`getPass $DBSERVER $ADMINLOGIN`
+set nocount on
+go
+use master
+go
+select getdate(),@@servername,@@version
+go
+!
+
+#--------------------------------------------------------------------------
+#  Exit with 0
+#--------------------------------------------------------------------------
+exit 0

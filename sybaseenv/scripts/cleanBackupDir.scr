@@ -1,0 +1,106 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: cleanBackupDir.scr -f <ctlfile>
+#
+#  Description: Wrapper script to call cleanDir.scr for a list of Sybase
+#		backup directories and specific sized files in a control file.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) cleanDir.scr
+#   
+#   Parameters:	<ctlfile> - list of directories to cleanup
+# 		<maildest> - mail destination
+#
+#  Modification History:
+#	08/27/04	K. Hess	Initial Script
+#	01/03/06 M. Siatczynski Update to make size an optional parm from control file
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -f <ctlfile>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -f)	export CTLFILE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! -s $CTLFILE ]
+then
+	echo "ERROR - $CTLFILE does not exist or is 0 bytes"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export RPTFILE=$RPTDIR/misc/cleanBackupDir.$DATETIME
+export HIGHRC=0
+
+> $RPTFILE
+
+#--------------------------------------------------------------------------
+#  Write report headers
+#--------------------------------------------------------------------------
+date >> $RPTFILE
+echo "$CALLED\n" >> $RPTFILE
+
+#--------------------------------------------------------------------------
+#  Read the control file
+#  Format the execution string
+#  Execute the string
+#--------------------------------------------------------------------------
+export EXESTRING=""
+grep -v '^#' $CTLFILE | while read LINE
+do
+	export LINE
+	export DIR=`echo $LINE | nawk -F"^" '{print $1}'`
+	export DAYS=`echo $LINE | nawk -F"^" '{print $2}'`
+	export SIZE=`echo $LINE | nawk -F"^" '{print $3}'`
+
+#	if [ ! "$DIR" -o ! "$DAYS" -o ! "$SIZE" ]
+	if [ ! "$DIR" -o ! "$DAYS" ]
+	then
+		echo "ERROR - input line = $LINE" >> $RPTFILE
+		echo "ERROR - directory and days_to_keep MUST be passed\n" >> $RPTFILE
+		export HIGHRC=1
+		continue
+	fi
+
+#	export EXESTRING="$SCRDIR/cleanDir.scr -dir $DIR -days $DAYS -size $SIZE"
+	export EXESTRING="$SCRDIR/cleanDir.scr -dir $DIR -days $DAYS"
+	test "$SIZE" && export EXESTRING="$EXESTRING -size $SIZE"
+
+	echo "Executing $EXESTRING" >> $RPTFILE
+
+	$EXESTRING
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - Cleanup FAILED for $DIR" >> $RPTFILE
+		export HIGHRC=1
+	else
+		echo "Cleanup SUCCESSFUL for $DIR" >> $RPTFILE
+	fi
+	echo "`date`\n" >> $RPTFILE
+done
+
+#--------------------------------------------------------------------------
+# Exit with highest return status
+#--------------------------------------------------------------------------
+exit $HIGHRC

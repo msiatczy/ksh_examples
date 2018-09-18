@@ -1,0 +1,111 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: pushSqlbtLicense.scr -prod -nonprod {-S <DBSERVER>}
+#
+#  Description: Pushes /sccm/dba/sybase/dist/sqlbt/license
+#
+#     Location: /sccm/dba/sybase/scripts/pushSqlbtLicense.scr
+#
+#  Modification History:
+#	02/17/06 K. Hess	Initial script
+#	06/08/06 M. Siatczynski	Add logic to push to single ASE
+#
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -prod -nonprod -S <DBSERVER>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -prod)		export PROD=1;shift 1;;
+                        -nonprod)	export NONPROD=1;shift 1;;
+                        -S)		export ONEDBSERVER=$2;shift 2;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$PROD" && export PROD=0
+test ! "$NONPROD" && export NONPROD=0
+
+export PARMSUM=`expr $PROD + $NONPROD`
+
+if [ $PARMSUM -eq 0 -a ! "$ONEDBSERVER" ]
+then
+	echo $USAGE
+	echo "ERROR - at least one parameter (-prod -nonprod) or DBSERVER must be specified"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export PRODLIST=/tmp/prodlist.$$
+export NONPRODLIST=/tmp/nonprodlist.$$
+export TMPASE=/tmp/tmpase.$$
+
+export ASELIST=$CTLDIR/aseDirectory.lst
+export SOURCEFILE=$DISTDIR/sqlbt/license
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $PRODLIST && \rm -f $PRODLIST
+	test -f $NONPRODLIST && \rm -f $NONPRODLIST
+	test -f $TMPASE && \rm -f $TMPASE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Gen prod/nonprod lists
+#--------------------------------------------------------------------------
+> $TMPASE
+
+if [ "$ONEDBSERVER" ]
+then
+	grep "^$ONEDBSERVER " $ASELIST | cut -d" " -f1-5 >> $TMPASE
+else
+	if [ $PROD -eq 1 ]
+	then
+		grep -v '^#' $ASELIST | cut -d" " -f1-5 | grep -v nonprod >> $TMPASE
+	fi
+
+	if [ $NONPROD -eq 1 ]
+	then
+		grep -v '^#' $ASELIST | cut -d" " -f1-5 | grep nonprod >> $TMPASE
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  Make copy of local license file and push out master license file
+#--------------------------------------------------------------------------
+cat $TMPASE |
+while read DBSERVER SN SYBDIR ASEDIR STATUS
+do
+	export DBSERVER SN SYBDIR ASEDIR
+	export SETDBSERVER=$DBSERVER
+	. /sccm/dba/sybase/.dbaSybProfile
+	export DESTFILE=$DTBASE/sbacktrack/ctl/license
+	echo "Updating $SN:$DESTFILE...\n"
+	ssh -n $SN cp -p $DESTFILE $DESTFILE.$DATETIME
+	scp -p $SOURCEFILE $SN:$DESTFILE 
+done
+
+#--------------------------------------------------------------------------
+#  Exit
+#--------------------------------------------------------------------------
+echo "\nPUSH IS COMPLETE.\n"
+exit 0

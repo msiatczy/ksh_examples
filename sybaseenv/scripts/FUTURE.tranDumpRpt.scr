@@ -1,0 +1,87 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: tranDumpRpt.scr -S DBSERVER {-M minutes}
+#
+#  Description: Report on databases whose tran dumps are x minutes behind
+#		(Default minutes = 120)
+#
+#     Location:	/opt/sccm/dba/scripts/tranDumpRpt.scr
+#		/sccm/home/dba/sybase/dist/scripts/tranDumpRpt.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	10/17/02 M. Siatczynski Original script
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Initialize variables
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-M minutes}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -M)	export MINUTES=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+. /opt/sccm/dba/.dbaProfile
+
+test ! "$MINUTES" && export MINUTES=120
+
+export DBLIST=/tmp/dblist.$$
+export RPTFILE=$RPTDIR/tranDumpRpt.$DBSERVER.$DATETIME
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Generate report of all database withOUT trunc log on chkpt whose
+#  tran dumps are $MINUTES behind
+#--------------------------------------------------------------------------
+
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 <<-! | grep -v Password > $DBLIST
+`getPass $DBSERVER $ADMINLOGIN`
+set nocount on
+go
+if exists (select name from master..sysdatabases where status & 8 <> 8 and (datediff(mi,dumptrdate,getdate())) > $MINUTES)
+select DBNAME=name,LAST_TRANDUMP=dumptrdate,MINUTES_BEHIND=datediff(mi,dumptrdate,getdate())
+from master..sysdatabases
+where status & 8 <> 8
+and (datediff(mi,dumptrdate,getdate())) > $MINUTES
+order by name
+go
+!
+
+#--------------------------------------------------------------------------
+#  Format and mail the report
+#--------------------------------------------------------------------------
+if [ -s $DBLIST ]
+then
+	> $RPTFILE
+	echo "Report datetime:  `date`\n" >> $RPTFILE
+	echo "The following databases have not had a recent tran dump:\n" >> $RPTFILE
+	cat $DBLIST >> $RPTFILE
+	mailx -s "$DBSERVER Tran Dump Report" $MAILDEST < $RPTFILE
+	exit 0
+fi

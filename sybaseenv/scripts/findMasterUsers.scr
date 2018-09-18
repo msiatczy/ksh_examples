@@ -1,0 +1,166 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findMasterUsers.scr -S <DBSERVER>|all {-m <maildest>}
+#
+#  Description: Look for users in master database - users should not be added directly to master
+#		Access to master is allowed via guest account
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	09/24/10 M. Siatczynski	Initial Script
+#	11/30/10 M. Siatczynski	Exclude master_maint
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|all {-m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export MAILFILE=/tmp/mailfile.$$
+export FOUNDFILE=/tmp/foundfile.$$
+export LOGFILE=$LOGDIR/useradmin/central/findMasterUsers.$DATETIME
+export HIGHRC=0
+export USERSFOUND=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $FOUNDFILE && \rm -f $FOUNDFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dbserverlist
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+#  write headers
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Checking for users in master database on the following ASEs:" >> $LOGFILE
+cat $DBSERVERLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+# write header to FOUNDFILE...used only if users are found in master
+> $FOUNDFILE
+echo "WARNING - Users found in master database - details for each ASE follow" >> $FOUNDFILE
+echo "\nUsers should have access to master database via guest account." >> $FOUNDFILE
+echo "If guest account exists in master database, these users may be dropped from master following standard change procedures." >> $FOUNDFILE
+echo "NOTE:  You will not be able to drop the user from master if the login has a current connection to master.\n" >> $FOUNDFILE
+echo " ASE                            INVALID master users" >> $FOUNDFILE
+echo " ------------------------------ -------------------------------" >> $FOUNDFILE
+
+#--------------------------------------------------------------------------
+# Format SQL
+#--------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "select 'ASE'=@@servername,'INVALID master users'=user_name(uid) from master..sysusers where suid > 0 and user_name(uid) not in ('dbo','guest','probe','master_maint')" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#--------------------------------------------------------------------------
+# For each DBSERVER
+# execute SQL
+# check for errors
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	> $SQLOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w500 -b -i$SQLFILE | grep -v Password >> $SQLOUT
+
+	checkSqlErr $SQLOUT
+	if [ $? -ne 0 ]
+	then
+	        echo "$DBSERVER:  SQL FAILED" >> $LOGFILE
+	        export HIGHRC=1
+	else
+		if [ -s $SQLOUT ]
+		then
+			export USERSFOUND=1
+	        	echo "$DBSERVER:  USERS found in master" >> $LOGFILE
+			echo "" >> $FOUNDFILE
+			cat $SQLOUT >> $FOUNDFILE
+		else
+	        	echo "$DBSERVER:  NO USERS found in master" >> $LOGFILE
+		fi
+	fi
+
+	cat $SQLOUT >> $LOGFILE
+done
+
+echo "\n`date` END Checking for users in master database" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# Only send mail if users found in master or errors occurred
+# Exit with final status
+#--------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+	cat $LOGFILE > $MAILFILE
+	export MAILSUBJECT="ERROR - Checking users in master"
+	sendMail
+	exit 1
+else
+	if [ $USERSFOUND -eq 1 ]
+	then
+		cat $FOUNDFILE > $MAILFILE
+		export MAILSUBJECT="WARNING - Users found in master database"
+		sendMail
+	fi
+	exit 0
+fi

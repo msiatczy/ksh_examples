@@ -1,0 +1,72 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getTempdb.scr
+#  Description: Gets current Sybase temporary database configurations
+#     Location: /sccm/dba/sybase/scripts
+#   Parameters: DBSERVER
+#  Modification History:
+#       08/02/05 K. Hess        Initial script
+#       02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#----------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Parameters:  Database server
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>"
+ 
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+ 
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export SETDBSERVER=$DBSERVER
+export OUTFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.getTempdb.$DATETIME
+#--------------------------------------------------------------------------
+#  Use this to describe major sections of code
+#--------------------------------------------------------------------------
+> $OUTFILE
+
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password: | grep -v 'return status' >> $OUTFILE
+`getPass $DBSERVER $ADMINLOGIN`
+set nocount on
+go
+print 'SERVER NAME'
+go
+select @@servername
+go
+print 'TEMPORARY DATABASES'
+go
+sp_tempdb 'show','db'
+go
+print 'TEMPORARY DATABASE GROUPS'
+go
+sp_tempdb 'show','gr'
+go
+print 'TEMPORARY DATABASE LOGINS'
+go
+sp_tempdb 'show','login'
+go
+print 'TEMPORARY DATABASE APPLICATIONS'
+go
+sp_tempdb 'show','app'
+go
+!
+
+#--------------------------------------------------------------------------
+#  Exit with 0
+#--------------------------------------------------------------------------
+exit 0

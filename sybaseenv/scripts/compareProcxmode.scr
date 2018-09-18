@@ -1,0 +1,171 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: compareProcxmode.scr -S1 <DBSERVER1> -S2 <DBSERVER2> -L <rep ctl list> {-m <maildest>}
+#
+#  Description: Compare the proc execution modes of stored procs between two servers
+#
+#     Location:	/sccm/dba/sybase/scripts/compareProcxmode.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  NOTE:  This is a short term script.  It is associated with Sybase case #11147174
+#         We are currently replicating between ASE 12.5.3 and ASE 12.5.0.3.
+#         The parameters to sp_procxmode changed between ASE versions and do not replicate properly to the standby.
+#         We will use this script to make sure proc modes are consistent between BIGBIRD/ELMO unti ELMO is upgraded on July 9, 2005.
+#
+#  Modification History:
+#	06/21/05 M. Siatczynski	Initial Script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+#--------------------------------------------------------------------------------
+#  Initialize variables and files
+#--------------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+USAGE="ERROR - Usage: $0 -S1 <DBSERVER1> -S2 <DBSERVER2> -L <rep ctl list> {-m <maildest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S1)	export DBSERVER1=$2;shift 2;;
+	                -S2)	export DBSERVER2=$2;shift 2;;
+	                -L)	export CTLLIST=$2;shift 2;;
+	                -m)	export MAILDEST=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER1" -o ! "$DBSERVER2" -o ! "$CTLLIST" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+export PROCS1=/tmp/procs1.$$
+export PROCS2=/tmp/procs2.$$
+export MISMATCH=/tmp/mismatch.$$
+export DBLIST=/tmp/dblist.$$
+export MAILFILE=/tmp/mailfile.$$
+export REPLIST=$CTLDIR/replication/$CTLLIST
+export LOGFILE=$LOGDIR/misc/$DBSERVER1/$DBSERVER1.$DBSERVER2.compareProcxmode.$DATETIME
+export HIGHRC=0
+
+# get the database names from the replist
+# NOTE:  the servernames from the replist are not used--just the database names
+if [ -s $REPLIST ]
+then
+	cut -d " " -f2 $REPLIST > $DBLIST
+else
+	echo "ERROR - $REPLIST does not exist or is 0 bytes"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $PROCS1 && \rm -f $PROCS1
+	test -f $PROCS2 && \rm -f $PROCS2
+	test -f $MISMATCH && \rm -f $MISMATCH
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $MAILFILE && \rm -f $MAILFILE
+}
+
+#trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Get procs and modes for DBSERVER1 and DBSERVER2
+# Remove all leading and trailing blanks and make sure there is 
+#	only a single space between suid and name
+# Sort again with a unix sort
+# Check for errors
+# If errors, exit with 1, else exit with 0
+#------------------------------------------------------------------------------
+> $LOGFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+#------------------------------------------------------------------------------
+# DBSERVER1
+#------------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER1 -w200 -b <<-! | grep -v Password | sed -e 's/^ *//g' -e 's/ *$//g' -e 's/  */ /g' | sort -n > $PROCS1
+	`getPass $DBSERVER1 $ADMINLOGIN`
+	set nocount on
+	go
+	use $DBNAME
+	go
+	if db_name() = "$DBNAME" exec sp_procxmode
+	go
+	!
+
+	checkSqlErr $PROCS1
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting procs/modes on $DBSERVER1"
+		cat $PROCS1
+		exit 1
+	fi
+
+#------------------------------------------------------------------------------
+# DBSERVER2
+#------------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER2 -w200 -b <<-! | grep -v Password | sed -e 's/^ *//g' -e 's/ *$//g' -e 's/  */ /g' | sort -n > $PROCS2
+	`getPass $DBSERVER2 $ADMINLOGIN`
+	set nocount on
+	go
+	use $DBNAME
+	go
+	if db_name() = "$DBNAME" exec sp_procxmode
+	go
+	!
+
+	checkSqlErr $PROCS2
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting procs/modes on $DBSERVER2"
+		cat $PROCS2
+		exit 1
+	fi
+
+#------------------------------------------------------------------------------
+# Compare proc modes between servers
+# Send a separate email for each database out of sync
+#------------------------------------------------------------------------------
+
+	sdiff -s $PROCS1 $PROCS2 > $MISMATCH
+	export RC=$?
+
+	if [ $RC -eq 0 ]
+	then
+		echo "`date +'%D %T'` : proc modes match for between $DBSERVER1 and $DBSERVER2 ($DBNAME)" >> $LOGFILE
+	else
+		> $MAILFILE
+		export HIGHRC=1
+		echo "`date +'%D %T'` : proc modes DO NOT match between $DBSERVER1 and $DBSERVER2 ($DBNAME) - details follow" >> $MAILFILE
+		echo "--------------------------------------------------------------------------------" >> $MAILFILE
+		echo "$DBSERVER1 proc/owner/mode          |          $DBSERVER2 proc/owner/mode" >> $MAILFILE
+		echo "--------------------------------------------------------------------------------" >> $MAILFILE
+		tail +2 $MISMATCH | sed -e 's/  */ /g' >> $MAILFILE
+		cat $MAILFILE >> $LOGFILE
+		export MAILSUBJECT="$DBSERVER1 vs. $DBSERVER2 ($DBNAME) : proc mode mismatch"
+		sendMail
+	fi
+done
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+test $HIGHRC -ne 0 && exit 1 || exit 0

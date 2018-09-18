@@ -1,0 +1,82 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sybaseServerUsage.scr
+#
+#  Description: Generate Sybase server usages report.
+#
+#     Location:	/sccm/dba/sybase/scripts/sybServerUsage.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	09/30/02 M. Siatczynski	Rewrite original script
+#	10/31/03 M. Siatczynski	Centralize script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	10/01/07 M. Siatczynski	Use sp_devusage rather than SQLFILE to summarize space
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export TEMP1=/tmp/sybusage.1.$$
+export MAILFILE=/tmp/mailfile.$$
+export RPTFILE=$RPTDIR/central/sybServerUsage.$DATETIME
+
+> $TEMP1
+> $RPTFILE
+> $MAILFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TEMP1 && rm -f $TEMP1
+	test -f $MAILFILE && rm -f $MAILFILE
+	test -f $DBSERVERLIST && rm -f $DBSERVERLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Get list of ASEs
+#--------------------------------------------------------------------------
+getAseList | sort > $DBSERVERLIST
+
+#--------------------------------------------------------------------------
+# Collect usage stats for each server in list
+# Check for errors
+#--------------------------------------------------------------------------
+for DBSERVER in `cat $DBSERVERLIST`
+do
+	export DBSERVER
+	$ISQLEXE -w200 -U$ADMINLOGIN -S$DBSERVER <<-! | egrep -v '(Password:|return status)' >> $TEMP1
+	`getPass $DBSERVER $ADMINLOGIN`
+	exec sp_devusage "summary"
+	go
+	!
+done
+
+checkSqlErr $TEMP1
+if [ $? -eq 1 ]
+then
+	export MAILSUBJECT="ERROR OCCURRED GETTING SPACE INFO"
+	cat $TEMP1 >> $MAILFILE
+	sendMail
+	exit 1
+else
+	echo 'SERVER USAGE AS OF '`date`'\n' >> $RPTFILE
+	head -2 $TEMP1 >> $RPTFILE
+	grep 'ASE SUMMARY:' $TEMP1 >> $RPTFILE
+
+	cat $RPTFILE > $MAILFILE
+	export MAILSUBJECT="Server Usage `date +%D`"
+	sendMail
+	exit 0
+fi

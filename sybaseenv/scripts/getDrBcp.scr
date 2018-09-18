@@ -1,0 +1,116 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getDrBcp.scr
+#
+#  Description: Get bcp files for specific system tables per database server
+#
+#     Location: /sccm/dba/sybase/scripts
+#
+#    Called by: AutoSys
+#
+#   Parameters: DBSERVER
+#
+#  Modification History:
+#       02/25/04 K. Hess        Initial script
+#       02/27/04 K. Hess        Updated field delimiter for bcp files
+#       03/04/04 K. Hess        Updated report output
+#       03/31/04 K. Hess        Updated report output
+#       03/24/05 K. Hess        Exclude dynamic system tables from bcp out
+#       02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#       02/21/06 M. Siatczynski	Add -X to bcp (security)
+#       10/01/07 M. Siatczynski	Remove -X from bcp (temp fix to address CR 468669 memory leak with ASE 15.0.2)
+#       10/15/07 M. Siatczynski	Replace -X on bcp
+#       10/17/08 M. Siatczynski	Change RPTFILE to LOGFILE and change $RPTDIR to $LOGDIR
+#				Change LOGFILE filename to include script name and $DATETIME stamp
+#----------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Parameters:  Database server
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>"
+ 
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+ 
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export SETDBSERVER=$DBSERVER
+
+. /sccm/dba/sybase/.dbaSybProfile
+ 
+export LOGFILE=$LOGDIR/dr/$DBSERVER/$DBSERVER.getDrBcp.$DATETIME
+export SYSTBLLIST=/tmp/$DBSERVER.master.lst.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $SYSTBLLIST && \rm -f $SYSTBLLIST
+}
+trap 'tempCleanup' EXIT INT TERM
+
+#----------------------------------------------------------------------------
+#  Verify dr directory exists; if not, create the directory
+#  Verify bcp sub-directory exists; if not, create the directory
+#----------------------------------------------------------------------------
+test ! -d $DBSERVER_DRDIR && mkdir $DBSERVER_DRDIR
+test ! -d $DBSERVER_DRDIR/bcp && mkdir $DBSERVER_DRDIR/bcp
+
+#--------------------------------------------------------------------------
+#  Init LOGFILE
+#  Header for DR Report
+#--------------------------------------------------------------------------
+echo "--BCP OUT for $DBSERVER on $DATETIME" > $LOGFILE
+
+#----------------------------------------------------------------------------
+# Bcp out of system tables
+#----------------------------------------------------------------------------
+# Create list of master database system tables
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | sed -e s/-//g -e '/Password:/d' -e '/affected/d' -e s/\ //g -e '/^$/d' >> $SYSTBLLIST
+`getPass $DBSERVER $ADMINLOGIN`
+use master
+go
+select name
+from sysobjects
+where type = 'S'
+and name not in ('sysprocesses','sysmonitors','syslocks','syslogshold','sysmessages')
+order by name
+go
+!
+
+# Bcp out $DBSERVER system tables from master
+cat $SYSTBLLIST |
+while read SYSTBL
+do
+	export BCPFILE=$DBSERVER_DRDIR/bcp/$DBSERVER.$SYSTBL.$DATETIME.dat
+
+	echo "--$SYSTBL" >> $LOGFILE
+	getPass $DBSERVER $ADMINLOGIN | $OCSBIN/bcp master..$SYSTBL out $BCPFILE -c -t"^^" -X -U$ADMINLOGIN -S$DBSERVER >> $LOGFILE
+	echo "" >> $LOGFILE
+done
+
+#--------------------------------------------------------------------------
+# Cleanup of temporary files; old bcp files
+#-------------------------------------------------------------------------- 
+#--------------------------------------------------------------------------
+# Cleanup of files under bcp dir older than 7 days
+#--------------------------------------------------------------------------
+find $DBSERVER_DRDIR/bcp -type f -mtime +7 -print -exec \rm -f {} \; >> $LOGFILE
+
+#--------------------------------------------------------------------------
+#  Exit with 0
+#--------------------------------------------------------------------------
+exit 0

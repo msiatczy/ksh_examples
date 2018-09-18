@@ -1,0 +1,160 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dbccConfigRpt.scr -S <DBSERVER>|all {-m <maildest>}
+#
+#  Description: Report on various aspects related to our dbcc configuration
+#		Can be run for on or all ASEs
+#
+#     Location:	/sccm/dba/sybase/scripts/dbccConfigRpt.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - single ASE or -all
+#		<maildest> - mail destination -- defaults to dba	
+#
+#  Modification History:
+#       02/24/06 M. Siatczynski Initial script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER>|all {-m <maildest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export ONEDBSERVER=$2;shift 2;;
+			-m)		export MAILDEST=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$ONEDBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export SQLFILE=/tmp/usersql.$$
+export SQLOUT=/tmp/sqlout.$$
+export MAILFILE=/tmp/mailfile.$$
+export RPTFILE=$RPTDIR/dbcc/central/dbccConfigRpt.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create working list of ASEs
+#------------------------------------------------------------------------------
+test "$ONEDBSERVER" = "all" && getAseList > $DBSERVERLIST || echo $ONEDBSERVER > $DBSERVERLIST
+
+#------------------------------------------------------------------------------
+# Write report headers
+#------------------------------------------------------------------------------
+> $RPTFILE
+echo "`date` START Executing DBCC Configuration Report against the following ASEs:" >> $RPTFILE
+cat $DBSERVERLIST >> $RPTFILE
+
+#------------------------------------------------------------------------------
+# Report:  Invalid dbcc configs
+# - dbid,stringvalue combinations in dbccdb..dbcc_config which correspond to invalid database
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "use dbccdb" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+echo "select dbid,convert(char(30),stringvalue) from dbccdb..dbcc_config" >> $SQLFILE
+echo "where" >> $SQLFILE
+echo "(type_code=6 and dbid <> 0)" >> $SQLFILE
+echo "and" >> $SQLFILE
+echo "(db_name(dbid) <> stringvalue or db_name(dbid) is null)" >> $SQLFILE
+echo "order by dbid" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# append the output to the logfile
+#------------------------------------------------------------------------------
+
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	echo "\n`date` Checking $DBSERVER" >> $RPTFILE
+
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password > $SQLOUT
+
+#------------------------------------------------------------------------------
+# Check for errors
+# If successful, but something in the file, it's an exception
+#------------------------------------------------------------------------------
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "`date` Report FAILED for $DBSERVER" >> $RPTFILE
+		cat $SQLOUT >> $RPTFILE
+
+		echo "`date` Report FAILED for $DBSERVER" >> $MAILFILE
+		cat $SQLOUT >> $MAILFILE
+	else
+		if [ -s $SQLOUT ]
+		then
+			export HIGHRC=1
+			echo "`date` Report EXCEPTIONS for $DBSERVER" >> $RPTFILE
+			echo "\n$DBSERVER: The following dbccdb..dbcc_config(dbid,dbname) combinations are invalid" >> $RPTFILE
+			echo "Use sp_dbcc_deletedb '<dbid>' to remove these entries." >> $RPTFILE
+			cat $SQLOUT >> $RPTFILE
+
+			echo "\n$DBSERVER: The following dbccdb..dbcc_config(dbid,dbname) combinations are invalid" >> $MAILFILE
+			echo "Use sp_dbcc_deletedb '<dbid>' to remove these entries." >> $MAILFILE
+			cat $SQLOUT >> $MAILFILE
+		else
+			echo "`date` Report SUCCESSFUL for $DBSERVER" >> $RPTFILE
+		fi
+	fi
+done
+
+echo "\n`date` END DBCC Configuration Report" >> $RPTFILE
+
+#------------------------------------------------------------------------------
+# If the mailfile contains anything, send it
+# Exit with final return status
+#------------------------------------------------------------------------------
+if [ -s $MAILFILE ]
+then
+	test $HIGHRC -eq 0 && export STATUS=SUCCESSFUL || export STATUS="FAILED/EXCEPTIONS"
+	export MAILSUBJECT="DBCC Configuration Report $STATUS"
+	sendMail
+fi
+
+test $HIGHRC -eq 0 && exit 0 || exit 1

@@ -1,0 +1,107 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dlwatch.scr -S <DBSERVER> 
+#
+#  Description: lists all active dumps and loads going on in an ASE.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script 
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - source dbserver and dbserver used to set environment
+#
+#  Modification History:
+#	08/29/05 J. Aspenleiter	Initial Script 
+#--------------------------------------------------------------------------
+
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+# Initialize Variables  
+#--------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 2
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)		export DBSERVER=$2;shift 2;;
+	                -*)		echo $USAGE;exit 2;;
+	                *)		echo $USAGE;exit 2;;
+	        esac
+	done
+fi
+
+#--------------------------------------------------------------------------
+# Validate parms/Initialize variables
+#--------------------------------------------------------------------------
+# DBSERVER MUST be passed
+if [ ! "$DBSERVER" ]
+then
+	echo "ERROR - Source dbserver MUST be passed."
+	exit 2
+fi
+
+export SQLIN=/tmp/sqlin.$$
+export SQLOUT=/tmp/sqlout.$$
+#export LOGFILE=$LOGDIR/backup/$TARGET_DBSERVER/$TARGET_DBSERVER.nativeLoad.$$.$DATETIME
+
+#> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLOUT && \rm -f $SQLOUT
+	test $SQLIN && \rm -f $SQLIN
+	clear
+	exit 0
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#--------------------------------------------------------------------------
+> $SQLIN
+> $SQLOUT
+OLD_LINES=0
+CNT=0
+echo "exec sp_dlwatch" >> $SQLIN
+echo "go" >> $SQLIN
+clear
+#run for 5 minutes, then break out...
+while (($CNT <= 60))  
+do
+    	let CNT=$CNT+1
+	export LINES=`wc -l < $SQLOUT`
+	#LINES=2
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w500 -i$SQLIN | grep -v Password > $SQLOUT	
+
+	#put the cursor tot he top, delete the lines below it - number of lines come from the last SQLOUT file
+	#then cat the new sqlout...
+	tput cuu $LINES
+
+	if (($OLD_LINES > $LINES))
+	then
+		tput dl $OLD_LINES
+	fi
+
+	if (($OLD_LINES < $LINES))
+	then
+		tput dl $LINES
+	fi
+
+	cat $SQLOUT
+
+	OLD_LINES=$LINES
+		
+    	sleep 5
+done
+exit 0

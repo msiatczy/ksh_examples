@@ -1,0 +1,135 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: bounceSysam.scr {-wait <n> -noprompt}
+#
+#  Description: Troubleshooting script to routinely bounce sysam
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	01/13/10 M. Siatczynski	Original script
+#	02/04/11 M. Siatczynski	change wait cmd to sleep
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+export USAGE="ERROR - Usage: $0 {-wait <num seconds> -noprompt}"
+export CALLED="$0 $*"
+
+#if [ $# -eq 0 ]
+#then
+#        echo $USAGE
+#        exit 1
+#else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -wait)     export WAITSEC=$2;shift 2;;
+                        -noprompt)  export PROMPT=0;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+#fi
+
+#--------------------------------------------------------------------------
+#  Set ulimit
+#--------------------------------------------------------------------------
+ulimit -H -n 1024
+ulimit -n 1024
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+test ! "$PROMPT" && export PROMPT=1
+# default wait time to 10 seconds
+test ! "$WAITSEC" && export WAITSEC=10
+export LOGFILE=$LOGDIR/misc/bounceSysam.$DATETIME
+
+#------------------------------------------------------------------------------
+# write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Executing script to bounce sysam on `hostname`" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Prompt for confirmation
+#------------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+	echo "\nYou are about to bounce sysam...\n"
+	CONTINUE=""
+	while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+	do
+		echo "DO YOU WISH TO CONTINUE? {y/n}"
+		read CONTINUE
+	done
+
+	if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+	then
+		echo "\n`date` Script exiting - no action taken.\n" >> $LOGFILE
+		exit 0
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# Stop the SYSAM license manager
+#--------------------------------------------------------------------------
+export SYSAMBIN=$SYSAMDIR/$SYBASE_SYSAM2/bin
+
+if [ -f $LM_LICENSE_FILE ]
+then
+	echo "Checking SYSAM license server on `hostname`"
+	export SYSAMRUNNING=0
+	$SYSAMBIN/sysam status | grep 'Cannot connect to license server' > /dev/null
+	export SYSAMRUNNING=$?
+	if [ $SYSAMRUNNING -eq 1 ]
+	then
+		echo "sysam running on `hostname`...it will be stopped" >> $LOGFILE
+		echo "`date` Stopping SYSAM license server on `hostname`" | tee -a $LOGFILE
+		$SYSAMBIN/sysam stop -q
+	else
+		echo "SYSAM license server was not running on `hostname`" >> $LOGFILE
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# Wait a few seconds before trying to restart sysam
+#--------------------------------------------------------------------------
+echo "Waiting $WAITSEC seconds...." | tee -a $LOGFILE
+sleep $WAITSEC
+
+#--------------------------------------------------------------------------
+# Start the SYSAM license manager
+# LM_LICENSE_FILE is set in SYBASE.ksh
+# If LM_LICENSE_FILE exists, it indicates that SYSAM 2.0 is used in this NFS environment
+# First check to see if the license server is running.  If it's not, start it.
+#--------------------------------------------------------------------------
+if [ -f $LM_LICENSE_FILE ]
+then
+	echo "Checking SYSAM license server"
+	export SYSAMRUNNING=0
+	$SYSAMBIN/sysam status | grep 'Cannot connect to license server' > /dev/null
+	export SYSAMRUNNING=$?
+	if [ $SYSAMRUNNING -eq 0 ]
+	then
+		echo "sysam NOT running on `hostname`...it will be started" >> $LOGFILE
+		echo "`date` Starting SYSAM license server on `hostname`" | tee -a $LOGFILE
+		$SYSAMBIN/sysam start &
+		sleep 5
+	else
+		echo "SYSAM license server is already running on `hostname`" >> $LOGFILE
+	fi
+fi
+
+echo "`date` Script execution complete on `hostname`" >> $LOGFILE
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+exit 0

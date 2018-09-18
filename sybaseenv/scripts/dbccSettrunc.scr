@@ -1,0 +1,147 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dbccSettrunc.scr -S DBSERVER {-D DBNAME -noprompt}
+#
+#  Description: Remove secondary truncation points for one or all databases on a server
+#
+#     Location:	/sccm/dba/sybase/scripts/dbccSettrunc.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#              	<DBNAME> - database name
+#              	<noprompt> - do not prompt for confirmation
+#
+#  Modification History:
+#	09/20/02 M. Siatczynski	Original script
+#	05/28/04 M. Siatczynski	Centralize script
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <DBNAME> -noprompt}"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)		export DBSERVER=$2;shift 2;;
+                        -D)		export ONEDBNAME=$2;shift 2;;
+                        -noprompt)	export PROMPT=0;shift 1;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$PROMPT" && export PROMPT=1
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+export OUTFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.dbccSettrunc.$DATETIME
+export DBCCSQL=/tmp/dbccsql.$$
+export DBLIST=/tmp/dblist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DBCCSQL && \rm -f $DBCCSQL
+	test $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# write headers
+#------------------------------------------------------------------------------
+> $OUTFILE
+echo "Executing DBCC settrunc(ltm,ignore) against $DBSERVER `date`" >> $OUTFILE
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+#--------------------------------------------------------------------------
+if [ "$ONEDBNAME" ]
+then
+        echo $ONEDBNAME > $DBLIST
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select db_name(dbid) from syslogshold where name like '%replication_truncation_point%' order by db_name(dbid)
+	go
+	!
+fi
+
+#------------------------------------------------------------------------------
+# If there are databases to process, then format the sql
+#------------------------------------------------------------------------------
+if [ -s $DBLIST ]
+then
+	> $DBCCSQL
+	cat $DBLIST |
+	while read DBNAME
+	do
+		export DBNAME
+		echo "use $DBNAME" >> $DBCCSQL
+		echo "go" >> $DBCCSQL
+		echo "dbcc settrunc(ltm,ignore)" >> $DBCCSQL
+		echo "go" >> $DBCCSQL
+	done
+else
+	echo "No databases have a secondary truncation point on $DBSERVER." >> $OUTFILE
+	exit 0
+fi
+
+#------------------------------------------------------------------------------
+# Confirm action for server specified
+#------------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+	echo "\n**************************************************************************************\n"
+	echo "WARNING:	TRUNCATING SECONDARY TRUNCATION MARKERS IN A REPLICATED"
+	echo "		ENVIRONMENT COULD BE EXTREMELY DESTRUCTIVE!!!\n"
+	echo "**************************************************************************************\n"
+	echo "You are about to remove secondary truncation marker(s) for $DBSERVER $ONEDBNAME\n"
+	CONTINUE=""
+	while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+	do
+		echo "DO YOU WISH TO CONTINUE? {y/n}"
+		read CONTINUE
+	done
+
+	if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+	then
+		echo "Script exiting - no action taken on $DBSERVER." | tee -a $OUTFILE
+		exit 1
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# execute the sql
+# check for errors
+#------------------------------------------------------------------------------
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e -i$DBCCSQL | grep -v Password >> $OUTFILE
+
+checkSqlErr $OUTFILE
+if [ $? -ne 0 ]
+then
+	echo "ltm ignore for $DBSERVER $ONEDBNAME FAILED" | tee -a $OUTFILE
+	exit 1
+else
+	echo "ltm ignore for $DBSERVER $ONEDBNAME SUCCESSFUL" >> $OUTFILE
+	exit 0
+fi

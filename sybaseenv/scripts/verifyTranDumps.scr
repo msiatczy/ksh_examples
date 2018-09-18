@@ -1,0 +1,147 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: verifyTranDumps.scr -S <DBSERVER>|all | {-xdbserver -m <maildest>}
+#
+#  Description: Verify tran dumps are configured via sybdb..dl_dump_opt table for one or more dbservers.
+#		Ignore databases with trunc log on chkpt set.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	10/14/02	M. Siatczynski	Initial Script - adapted from verifyBackups.scr
+#	03/31/04	K. Hess		Added sort to $DBLIST create statement
+#	05/13/04	M. Siatczynski	Centralize script, implement dbserver and db exclusion lists
+#	06/03/04	M. Siatczynski	Add logic to account for empty exclude list
+#	12/17/04	K. Hess		Updated rsh to ssh
+#	02/17/06	M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN, changed CTLDIR to SQLBTCTLDIR
+#	11/17/06	M. Siatczynski	Allow for comments in sqlbtDirectory.lst
+#       12/21/06        M. Siatczynski  Change DBSERVEREXCLUDE to RPTASEEXCLUDELIST and DBEXCLUDE to RPTDBEXCLUDELIST
+#       12/22/06        M. Siatczynski  Change LOGNAME to USER
+#       06/01/09        M. Siatczynski  Updated to ignore archive databases
+#       09/23/10        M. Siatczynski  Updates for native backup solution
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|all {-xdbserver -m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -xdbserver)   export XDBSERVER=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$XDBSERVER" && export XDBSERVER=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserver.lst.$$
+export SQLOUT=/tmp/sqlout.$$
+export TEMPOUT=/tmp/tempout.$$
+export SORTXLIST=/tmp/sortxlist.$$
+export RPTFILE=$RPTDIR/backup/central/verifyTranDumps.$DATETIME
+
+#--------------------------------------------------------------------------
+#  Define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+        test -f $SQLOUT && \rm -f $SQLOUT
+        test -f $TEMPOUT && \rm -f $TEMPOUT
+        test -f $SORTXLIST && \rm -f $SORTXLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dbserver list
+# If excluding ASEs from report, sort list, otherwise create empty exclusion list
+#--------------------------------------------------------------------------
+test $XDBSERVER -eq 1 && sort $RPTASEEXCLUDELIST > $SORTXLIST || > $SORTXLIST
+
+if [ "$ONEDBSERVER" = "all" ]
+then
+	test -s "$SORTXLIST" && getAseList | egrep -vf $SORTXLIST > $DBSERVERLIST || getAseList > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+#  For each DBSERVER
+#  Make sure databases do not have tran dumps disabled
+#  Ignore dbs with trunc log on chkpt set (status=8) and archive databases (status3=4194304)
+#  If there are no databases to process, then skip to next dbserver
+#  Check for errors
+#--------------------------------------------------------------------------
+# TEMPOUT is temp holding file for all ASEs
+> $TEMPOUT
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	> $SQLOUT
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password >> $SQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name,name from master..sysdatabases d, sybdb..dl_dump_opt o
+	where d.status & 8 <> 8 and d.status3 & 4194304 <> 4194304
+	and d.name = o.dbname and o.tran_inactive = 1
+	go
+	!
+
+	checkSqlErr $SQLOUT
+	if [ $? -ne 0 ]
+	then
+		echo "\nERROR - checking databases on $DBSERVER" >> $TEMPOUT
+	else
+		if [ -s $SQLOUT ]
+		then
+			echo "\n$DBSERVER - TRAN DUMPS are NOT enabled for the following databases:" >> $TEMPOUT
+		fi
+	fi
+
+	cat $SQLOUT >> $TEMPOUT
+done
+
+#--------------------------------------------------------------------------
+#  Mail report
+#--------------------------------------------------------------------------
+if [ -s "$TEMPOUT" ]
+then
+        > $RPTFILE
+        echo `date` >> $RPTFILE
+        echo "\n$0 executed by user $USER on `hostname`\n" >> $RPTFILE
+	cat $TEMPOUT >> $RPTFILE
+
+	export MAILFILE=$RPTFILE
+	export MAILSUBJECT="REPORT: Sybase Tran Dumps"
+	sendMail
+fi
+
+#------------------------------------------------------------------------------
+# Exit
+#------------------------------------------------------------------------------
+exit 0

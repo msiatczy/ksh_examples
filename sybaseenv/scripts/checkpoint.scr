@@ -1,0 +1,103 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkpoint.scr -S <DBSERVER> {-D <dbname>}
+#
+#  Description: Checkpoint one or all databases on a server
+#
+#     Location:	/sccm/dba/sybase/scripts/checkpoint.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - Database server name
+#
+#
+#  Modification History:
+#	03/05/03 M. Siatczynski	Standardize original script
+#	08/03/04 M. Siatczynski	Centralized script
+#	01/28/05 M. Siatczynski	Do not checkpoint tempdb
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#				Updated to use 'checkpoint all' syntax when doing all databases on a server
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.checkpoint.$DATETIME
+export SQLFILE=/tmp/sqlfile.$$
+export DBLIST=/tmp/dblist.$$
+
+> $LOGFILE
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# format sql to checkpoint each database
+#------------------------------------------------------------------------------
+> $SQLFILE
+
+if [ "$ONEDBNAME" ]
+then
+	echo "checkpoint $ONEDBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+else
+	echo "checkpoint all" >> $SQLFILE
+	echo "go" >> $SQLFILE
+fi
+
+#------------------------------------------------------------------------------
+# run the sql
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START checkpoint on $DBSERVER" >> $LOGFILE
+
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -e -w200 -i$SQLFILE | grep -v Password >> $LOGFILE
+
+echo "`date` END checkpoint on $DBSERVER" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# check output and exit
+#------------------------------------------------------------------------------
+checkSqlErr $LOGFILE
+if [ $? -eq 1 ]
+then
+	echo "Script FAILED - Review output in $LOGFILE\n"
+	exit 1
+else
+	exit 0
+fi

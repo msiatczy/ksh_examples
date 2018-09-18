@@ -1,0 +1,94 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: datestampFile.scr -F <filename> -mv|-cp
+#
+#  Description: move or copy a file to the same filename with DATETIME appended to the end
+#
+#  NOTE:  the chances of overwriting the same datetime stamped file are very slim, so no check is performed to see if the target file already exists
+#
+#     Location:	/sccm/dba/sybase/scripts/datestampFile.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<filename> - full path to filename
+#              	<mv> - move the file
+#              	<cp> - copy the file
+#
+#  Modification History:
+#	12/29/06 M. Siatczynski	Original script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+USAGE="ERROR - Usage: $0 -F <filname> -mv|-cp"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -F)     export FILENAME=$2;shift 2;;
+                        -mv)	export DOMOVE=1;shift 1;;
+                        -cp)	export DOCOPY=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$FILENAME" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+test ! "$DOMOVE" && export DOMOVE=0
+test ! "$DOCOPY" && export DOCOPY=0
+
+# make sure -mv or -cp is passed, but not both
+export SUMACTION=`expr $DOMOVE + $DOCOPY`
+
+if [ $SUMACTION -ne 1 ]
+then
+        echo $USAGE
+        echo "ERROR - mv or cp MUST be specified, but NOT both"
+        exit 1
+fi
+
+test $DOMOVE -eq 1 && export ACTION=mv || export ACTION="cp -p"
+
+#--------------------------------------------------------------------------
+#  Initialize and validate Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/datestampFile.$$.$DATETIME
+export NEWFILENAME=$FILENAME.$DATETIME
+
+#------------------------------------------------------------------------------------
+# perform the move or copy
+# check for errors
+# exit
+#------------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` - $ACTION $FILENAME $NEWFILENAME" >> $LOGFILE
+
+if [ ! -f $FILENAME ]
+then
+	echo "ERROR - $FILENAME does not exist" >> $LOGFILE
+	exit 1
+fi
+
+#perform the action
+$ACTION $FILENAME $NEWFILENAME
+
+if [ $? -eq 1 ]
+then
+	echo "$ACTION $FILENAME $NEWFILENAME FAILED" >> $LOGFILE
+        exit 1
+else
+	echo "$ACTION $FILENAME $NEWFILENAME SUCCESSFUL" >> $LOGFILE
+        exit 0
+fi

@@ -1,0 +1,136 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkAudits.scr -S DBSERVER {-D DBNAME}
+#
+#  Description: run sp_displayaudit on one or more databases
+#
+#     Location:	/sccm/dba/sybase/scripts/checkAudits.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#              	<DBNAME> - database name
+#
+#  Modification History:
+#	08/28/03 M. Siatczynski	Original script
+#	02/09/04 M. Siatczynski	Centralized script
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	10/12/06 M. Siatczynski	Remove echo on success status
+#	05/03/07 M. Siatczynski	Ignore offline databases (status2=16)
+#	05/29/09 M. Siatczynski	Updated to call getDbList function, change OUTFILE to RPTFILE
+#	02/25/11 M. Siatczynski	Update profile source block
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <DBNAME>}"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)		export DBSERVER=$2;shift 2;;
+                        -D)		export DBNAME=$2;shift 2;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+export RPTFILE=$RPTDIR/audit/$DBSERVER/$DBSERVER.checkAudits.$DATETIME
+export SQLFILE=/tmp/sql.$$
+export DBLIST=/tmp/dblist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+#--------------------------------------------------------------------------
+if [ "$DBNAME" ]
+then
+        echo $DBNAME > $DBLIST
+else
+	getDbList -S $DBSERVER -user -system > $DBLIST
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - Getting list of databases for $DBSERVER"
+		exit 1
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# Format the sql to display the audits
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "print 'GENERAL AUDIT SETTINGS'" >> $SQLFILE
+echo "exec sp_displayaudit" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "print 'AUDITED DATABASES:'" >> $SQLFILE
+echo "select @@servername,name,audflags from master..sysdatabases where audflags is not null and audflags <> 0" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "print 'AUDITED LOGINS:'" >> $SQLFILE
+echo "select @@servername,name,audflags from master..syslogins where audflags is not null and audflags <> 0" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "print 'DATABASE-SPECIFIC AUDITS:'" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $DBLIST |
+while read DB
+do
+	export DB
+	echo "print \"  Checking $DB...\"" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "use $DB" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "select @@servername,db_name(),convert(char(50),name),type,audflags from sysobjects where audflags is not null and audflags <> 0 order by type,name" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#------------------------------------------------------------------------------
+# pipe in the sql
+#------------------------------------------------------------------------------
+> $RPTFILE
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w500 -b -i$SQLFILE | grep -v Password >> $RPTFILE
+
+#------------------------------------------------------------------------------
+# check for errors
+#------------------------------------------------------------------------------
+checkSqlErr $RPTFILE
+if [ $? -eq 1 ]
+then
+	echo "\nScript FAILED"
+	echo "Review output in $RPTFILE\n"
+	exit 1
+else
+	exit 0
+fi

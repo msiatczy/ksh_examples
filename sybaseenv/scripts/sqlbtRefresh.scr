@@ -1,0 +1,367 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sqlbtRefresh.scr -S <SOURCE DBSERVER> -T <TARGET DBSERVER> -D <DBNAME>|-L <CTL LIST> {-noprompt -full -fmtonly -tasks <n> -pid <n> -pagedone <pagedest> -no_online -quiet}
+#
+#  Description: Refresh one database or list of databases from source dbserver to target dbserver.
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  NOTE:  THIS SCRIPT MUST BE RUN FROM THE HOST WHERE THE SOURCE_DBSERVER RESIDES.
+# 		Recovery options are as of the last full or the most recent tran dump.
+# 		True point in time recovery is not possible with this script.
+# 		-pagedone currently only pages if an actual recovery is performed
+#
+#  Modification History:
+#	01/30/03 M. Siatczynski	Initial Script
+#	02/13/03 M. Siatczynski	Add PID parm and ability to rerun for a pid
+#	03/10/03 M. Siatczynski	Still try to fix the users even if the refresh fails - do not exit
+#	05/08/03 M. Siatczynski	Changed OUTFILE to log to central log dir rather than local
+#	07/10/03 M. Siatczynski	Cleanup control directories older than 7 days
+#				Remove an existing control directory if it already exists
+#	02/19/04 M. Siatczynski	Call killConn.scr from new central location
+#	03/16/04 M. Siatczynski	Grab 6 lines for level 0 dumps (sqlbt 4.6 format)
+#	05/26/04 M. Siatczynski	Get new user/perm DDL before refreshing database, call new syncUsers.scr
+#	05/28/04 M. Siatczynski	Centralize script, add -pagedone parm
+#	07/09/04 M. Siatczynski	Add -noprompt parm to killConn.scr
+#	01/25/05 M. Siatczynski	Change output format
+#	02/01/05 M. Siatczynski	Update to allow empty control list
+#	03/08/05 M. Siatczynski	Add -quiet option so status messages are logged but don't show on console
+#				Changed OUTFILE to LOGFILE
+#	03/09/05 M. Siatczynski	Remove blank output line
+#	06/15/05 M. Siatczynski	Add -no_online parameter and code to bring databases online (accommodates differing ASE versions)
+#				Implement SQLBT_CTLSTRING to specify directory or single database
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	03/01/06 M. Siatczynski	Missed the getPass implementation on dtsrecover, removed {} around $TARGET_DBSERVER
+#	03/15/06 M. Siatczynski	Replace hardcoded sbackups.physical with $DT_PHYSICAL (std env variable)
+#	08/14/06 M. Siatczynski	Grab 7 lines for level 0 dumps (sqlbt 5.6 format)
+#	09/19/06 M. Siatczynski	Perform refresh as sybadmin rather than sa--sa has been locked
+#	11/06/06 M. Siatczynski	Add PID ($$) to LOGFILE name
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <SOURCE DBSERVER> -T <TARGET DBSERVER> -D <DBNAME|-L <CONTROL LIST> {-noprompt -full -fmtonly -tasks <n> -pid <n> -pagedone <pagedest> -no_online -quiet}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)		export SOURCE_DBSERVER=$2;shift 2;;
+                        -T)		export TARGET_DBSERVER=$2;shift 2;;
+                        -D)		export ONEDBNAME=$2;shift 2;;
+                        -L)		export CTLLIST=$2;shift 2;;
+                        -noprompt)	export PROMPT=0;shift 1;;
+                        -full)  	export FULL=1;shift 1;;
+                        -fmtonly)  	export FMT=1;shift 1;;
+                        -tasks)  	export TASKS=$2;shift 2;;
+                        -pid)	  	export PID=$2;shift 2;;
+                        -pagedone)	export PAGEDONE=$2;shift 2;;
+                        -no_online)	export ONLINE=0;shift 1;;
+                        -quiet)		export QUIET=1;shift 1;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables and verify parameters
+#--------------------------------------------------------------------------
+test ! "$PROMPT" && export PROMPT=1
+test ! "$FULL" && export FULL=0
+test ! "$FMT" && export FMT=0
+test ! "$TASKS" && export TASKS=3
+test ! "$ONLINE" && export ONLINE=1
+test ! "$QUIET" && export QUIET=0
+
+if [ ! "$SOURCE_DBSERVER" -a ! "$TARGET_DBSERVER" ]
+then
+	echo "$USAGE"
+	exit 1
+else
+	if [ ! "$ONEDBNAME" -a ! "$CTLLIST" ]
+	then
+		echo "$USAGE"
+		echo "ERROR - DBNAME or CTL FILE must be passed"
+		exit 1
+	fi
+fi
+
+if [ "$ONEDBNAME" -a "$CTLLIST" ]
+then
+	echo "$USAGE"
+	echo "ERROR - DBNAME and CTL FILE are mutually exclusive"
+	exit 1
+fi
+
+if [ "$CTLLIST" -a ! -f "$CTLLIST" ]
+then
+	echo "$CALLED"
+	echo "ERROR - CTL FILE does not exist"
+	exit 1
+fi
+
+if [ "$SOURCE_DBSERVER" = "$TARGET_DBSERVER" ]
+then
+	echo "$CALLED"
+	echo "ERROR - SOURCE DBSERVER and TARGET DBSERVER can not be the same"
+	exit 1
+fi
+
+# set the proper environment for the source DBserver
+export SETDBSERVER=$SOURCE_DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+export OLDCTLDIR=$DT_PHYSICAL/$SOURCE_DBSERVER
+test "$PID" && export NEWCTLDIR=$DT_PHYSICAL/$TARGET_DBSERVER$PID || export NEWCTLDIR=$DT_PHYSICAL/$TARGET_DBSERVER$$
+export LOGFILE=$LOGDIR/backup/$SOURCE_DBSERVER/sqlbtRefresh.$SOURCE_DBSERVER.to.$TARGET_DBSERVER.$$.$DATETIME
+export DBLIST=/tmp/dblist.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export ONLINESQL=/tmp/onlinesql.$$
+export SQLOUT=/tmp/sqlout.$$
+export SQLBT_CTLSTRING=""
+export HIGHRC=0
+# if quiet mode, then redirect output to LOGFILE, otherwise, display on screen
+test $QUIET -eq 1 && export OUTDEST=$LOGFILE || export OUTDEST=
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+	test -f $ONLINESQL && \rm -f $ONLINESQL
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Cleanup restore control directories older than 7 days
+#--------------------------------------------------------------------------
+find $DT_PHYSICAL -name "$TARGET_DBSERVER*" -type d -mtime +7 -exec \rm -r {} \;
+
+#--------------------------------------------------------------------------
+# Create a new control directory for the target server
+# If one already exists, remove it
+#--------------------------------------------------------------------------
+if [ ! -d $OLDCTLDIR ]
+then
+	echo "ERROR - $OLDCTLDIR does not exist on this host"
+	exit 1
+fi
+
+if [ ! "$PID" ]
+then
+	test -d $NEWCTLDIR && \rm -r $NEWCTLDIR
+	mkdir $NEWCTLDIR
+	cp -p $OLDCTLDIR/.dtoptions $NEWCTLDIR/.dtoptions
+fi
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+#--------------------------------------------------------------------------
+if [ "$ONEDBNAME" ]
+then
+	echo $ONEDBNAME > $DBLIST
+	export TASKS=1
+	export SQLBT_CTLSTRING=$NEWCTLDIR/$ONEDBNAME
+else
+	if [ -s $CTLLIST ]
+	then
+		cat $CTLLIST > $DBLIST
+		export SQLBT_CTLSTRING=$NEWCTLDIR
+	else
+		echo "No databases listed in $CTLLIST...exiting"
+		exit 0
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# Create a new control file for each database
+# Do not format if a pid is passed
+#--------------------------------------------------------------------------
+if [ ! "$PID" ]
+then
+	cat $DBLIST |
+	while read DBNAME
+	do
+		> $NEWCTLDIR/$DBNAME
+#--------------------------------------------------------------------------
+# Grab the 'options' section from the control file
+#--------------------------------------------------------------------------
+		head -`grep -n 'end options' $OLDCTLDIR/$DBNAME | cut -d":" -f1` $OLDCTLDIR/$DBNAME >> $NEWCTLDIR/$DBNAME
+#--------------------------------------------------------------------------
+# Grab the dump section
+# if FULL=1, get only last level 0
+# else get last level 0 plus all tran dumps
+#--------------------------------------------------------------------------
+		if [ $FULL -eq 1 ]
+		then
+			tail +`grep -n 'dump=0' $OLDCTLDIR/$DBNAME | tail -1 | cut -d":" -f1` $OLDCTLDIR/$DBNAME | head -7 >> $NEWCTLDIR/$DBNAME
+		else
+			tail +`grep -n 'dump=0' $OLDCTLDIR/$DBNAME | tail -1 | cut -d":" -f1` $OLDCTLDIR/$DBNAME >> $NEWCTLDIR/$DBNAME
+		fi
+
+#--------------------------------------------------------------------------
+# Verify the last line of the new control file ends with 'end dump'
+#--------------------------------------------------------------------------
+		if [ "`tail -1 $NEWCTLDIR/$DBNAME`" != "end dump" ]
+		then
+			echo "ERROR - $NEWCTLDIR/$DBNAME dump section is not properly formatted"
+			exit 1
+		fi
+	done
+
+#--------------------------------------------------------------------------
+#  STOP HERE IF THIS WAS A FORMAT-ONLY OPERATION
+#--------------------------------------------------------------------------
+	if [ $FMT -eq 1 ]
+	then
+		echo "FORMAT COMPLETE"
+		echo "Use the following control directory for recovery:"
+		echo "$NEWCTLDIR"
+		exit 0
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  PROMPT TO CONTINUE
+#--------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+	echo "\nThe following databases will be refreshed from $SOURCE_DBSERVER to $TARGET_DBSERVER:\n"
+	cat $DBLIST
+	echo ""
+	export CONTINUE=""
+	while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+	do
+	        echo "DO YOU WISH TO CONTINUE? {y/n}"
+	        read CONTINUE
+	done
+
+	if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+	then
+	        echo "\nExiting - No action taken on $TARGET_DBSERVER\n"
+	        exit 0
+	fi
+fi
+
+> $LOGFILE
+#--------------------------------------------------------------------------
+#  Save current user/perm DDL for each database in dblist
+#  Drop and kill all users of the target database(s)
+#--------------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+	echo "\nGetting user/perm DDL for $TARGET_DBSERVER:$DBNAME..." >> $OUTDEST
+	/sccm/dba/sybase/scripts/getUserInfo.scr -S $TARGET_DBSERVER -D $DBNAME
+
+	echo "Dropping users in $TARGET_DBSERVER:$DBNAME..." >> $OUTDEST
+	/sccm/dba/sybase/scripts/syncUsers.scr -S $TARGET_DBSERVER -D $DBNAME -droponly
+
+	echo "Killing connections to $TARGET_DBSERVER:$DBNAME..." >> $OUTDEST
+	/sccm/dba/sybase/scripts/killConn.scr -S $TARGET_DBSERVER -D $DBNAME -noprompt
+done
+
+#--------------------------------------------------------------------------
+#  Recover the database(s)
+#--------------------------------------------------------------------------
+test "$ONLINE" -eq 0 && export ONLINESPEC="-no_online" || export ONLINESPEC=""
+
+echo "\nRefreshing $SOURCE_DBSERVER to $TARGET_DBSERVER $ONEDBNAME using file(s) under $NEWCTLDIR..." >> $OUTDEST
+
+$DT_SBACKTRACK_HOME/bin/dtsrecover $SQLBT_CTLSTRING -server $TARGET_DBSERVER -copyover -verbose $ONLINESPEC -tasks $TASKS -user $ADMINLOGIN -password `getPass $TARGET_DBSERVER $ADMINLOGIN` >> $LOGFILE
+export RC=$?
+
+test $HIGHRC -lt $RC && export HIGHRC=$RC
+
+if [ $RC -ne 0 ]
+then
+	echo "ERROR - SQLBT RECOVERY $SOURCE_DBSERVER to $TARGET_DBSERVER FAILED.  Review errors in $LOGFILE" >> $OUTDEST
+	export HIGHRC=1
+else	
+	echo "SQLBT RECOVERY $SOURCE_DBSERVER to $TARGET_DBSERVER SUCCESSFUL" >> $OUTDEST
+fi
+
+#--------------------------------------------------------------------------
+# If -no_online was specified:
+# Format sql to bring databases online
+# Run sql to manually bring databases online
+# Check for errors
+#--------------------------------------------------------------------------
+if [ $ONLINE -eq 0 ]
+then
+	echo "\nManually onlining database(s) on $TARGET_DBSERVER..." >> $OUTDEST
+
+	> $ONLINESQL
+	> $SQLOUT
+	cat $DBLIST |
+	while read DBNAME
+	do
+		echo "online database $DBNAME" >> $ONLINESQL
+		echo "go" >> $ONLINESQL
+	done
+
+	getPass $TARGET_DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$TARGET_DBSERVER -w200 -e -i$ONLINESQL | grep -v Password >> $SQLOUT
+
+	cat $SQLOUT >> $LOGFILE
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+	        echo "ERROR - executing online SQL against $TARGET_DBSERVER.  Review errors in $LOGFILE" >> $OUTDEST
+		export HIGHRC=1
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  Regardless of recovery status, resync the users using the current DDL
+#  This way, if only one of x databases failed on recovery, the others will get their users resynced.
+#--------------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+	echo "Resyncing users in $TARGET_DBSERVER:$DBNAME..." >> $OUTDEST
+	/sccm/dba/sybase/scripts/syncUsers.scr -S $TARGET_DBSERVER -D $DBNAME
+	export RC=$?
+	test $HIGHRC -lt $RC && export HIGHRC=$RC
+done
+
+#--------------------------------------------------------------------------
+#  Exit based on the highest return code
+#--------------------------------------------------------------------------
+if [ $HIGHRC -ne 0 ]
+then
+	echo "\nERROR - REFRESH $SOURCE_DBSERVER to $TARGET_DBSERVER FAILED\n" >> $OUTDEST
+	if [ "$PAGEDONE" ]
+	then
+		export PAGEDEST=$PAGEDONE
+		echo "Refresh $SOURCE_DBSERVER to $TARGET_DBSERVER FAILED" > $PAGEMSG	
+		sendPage
+	fi
+	exit 1
+else
+	echo "\nREFRESH $SOURCE_DBSERVER to $TARGET_DBSERVER SUCCESSFUL\n" >> $OUTDEST
+	if [ "$PAGEDONE" ]
+	then
+		export PAGEDEST=$PAGEDONE
+		echo "Refresh $SOURCE_DBSERVER to $TARGET_DBSERVER SUCCESSFUL" > $PAGEMSG	
+		sendPage
+	fi
+	exit 0
+fi

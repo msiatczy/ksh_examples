@@ -1,0 +1,181 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: companionLoad.scr -S DBSERVER (-D <DBNAME>|<DBLIST>) {-full_only -noprompt -m <maildest> -pagefail <pagedest>}
+#
+#  Description: Load one or more databases on the companion ASE(s) for DBSERVER
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#              	<DBNAME> - database name or list of databases
+#
+#  Modification History:
+#	01/26/11 M. Siatczynski	Original script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> (-D <DBNAME>|<DBLIST>) {-full_only -noprompt -m <maildest> -pagefail <pagedest>}"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 2
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)		export DBSERVER=$2;shift 2;;
+                        -D)		export DBSPEC=$2;shift 2;;
+                        -m)		export MAILDEST=$2;shift 2;;
+                        -pagefail)	export PAGEFAIL=$2;shift 2;;
+                        -full_only)	export FULLSPEC="-full_only";shift 1;;
+                        -noprompt)	export PROMPTSPEC="-noprompt";shift 1;;
+                        -*)		echo $USAGE;exit 2;;
+                        *)		echo $USAGE;exit 2;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBSPEC" ]
+then
+	echo $USAGE
+	exit 2
+fi
+
+export ERRORFLAG=0
+export EXITRC=0
+export COMPLIST=/tmp/complist.$$
+export DBLIST=/tmp/dblist.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export LOGFILE=$LOGDIR/backup/$DBSERVER/$DBSERVER.companionLoad.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $COMPLIST && \rm -f $COMPLIST
+	test $DBLIST && \rm -f $DBLIST
+	test $MAILFILE && \rm -f $MAILFILE
+	test $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` SCRIPT START" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# format list of companion ASEs
+#--------------------------------------------------------------------------
+getCompanionAse -S $DBSERVER -syncdb > $COMPLIST
+if [ $? -ne 0 ]
+then
+	cat $COMPLIST >> $LOGFILE
+	echo "ERROR - getting companion ASE(s) for $DBSERVER" >> $LOGFILE
+	exit 2
+fi
+
+if [ ! -s $COMPLIST ]
+then
+	echo "ERROR - no companion ASE(s) defined for $DBSERVER" >> $LOGFILE
+	exit 2
+fi
+
+#------------------------------------------------------------------------------------
+# format list of databases
+# if a file is passed, make sure it's > 0 bytes
+# if it's not clearly a file, make sure it's not an invalid filename
+# otherwise, assume it's a single database name
+#------------------------------------------------------------------------------------
+> $DBLIST
+# make sure file exists and has entries
+if [ -f $DBSPEC ]
+then
+        if [ -s $DBSPEC ]
+        then
+                cat $DBSPEC > $DBLIST
+        else
+                echo "ERROR - $DBSPEC is 0 bytes" >> $LOGFILE
+                exit 2
+        fi
+else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+        echo $DBSPEC | grep '/' > /dev/null
+        if [ $? -eq 0 ]
+        then
+                echo "ERROR - $DBSPEC is not valid--possible invalid filename?" >> $LOGFILE
+                exit 2
+        else
+                echo $DBSPEC > $DBLIST
+        fi
+fi
+
+#------------------------------------------------------------------------------
+# Execute load(s) for each companion
+#------------------------------------------------------------------------------
+echo "\nThe following ASE(s) are companion(s) to $DBSERVER:" >> $LOGFILE
+cat $COMPLIST >> $LOGFILE
+echo "\nThe following databases will be backed up on EACH companion ASE listed above:" >> $LOGFILE
+cat $DBLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+cat $COMPLIST |
+while read COMPASE
+do
+	export COMPASE
+
+	echo "`date` Loading database(s) on $COMPASE..." >> $LOGFILE
+
+	$SCRDIR/nativeLoad.scr -S $DBSERVER -T $COMPASE -L $DBLIST $FULLSPEC $PROMPTSPEC
+
+        if [ $? -ne 0 ]
+        then
+                export ERRORFLAG=1
+		echo "`date` $COMPASE load FAILED" >> $LOGFILE
+	else
+		echo "`date` $COMPASE load SUCCESSFUL" >> $LOGFILE
+        fi
+done
+
+#--------------------------------------------------------------------------
+# If there were any failures, send email
+# If PAGEFAIL set, send page
+# Set page status and final exit
+#--------------------------------------------------------------------------
+if [ $ERRORFLAG -eq 1 ]
+then
+	> $MAILFILE
+        echo "\nNOTE: Check $LOGFILE for further details.\n" >> $MAILFILE
+        export MAILSUBJECT="$DBSERVER companion load FAILED"
+        sendMail
+
+	if [ "$PAGEFAIL" ]
+	then
+		echo "`date` $DBSERVER companion load FAILED" > $PAGEMSG
+		export PAGEDEST=$PAGEFAIL
+		sendPage
+	fi
+
+	export EXITRC=2
+	echo "\n`date` SCRIPT END - OVERALL STATUS:  FAILED" >> $LOGFILE
+else
+	export EXITRC=0
+	echo "\n`date` SCRIPT END - OVERALL STATUS:  SUCCESS" >> $LOGFILE
+fi
+
+#--------------------------------------------------------------------------
+#  Exit
+#--------------------------------------------------------------------------
+exit $EXITRC

@@ -1,0 +1,114 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sendQueuedPages.scr {-noprompt -m <maildest> -p <pagedest>}
+#
+#  Description: Check for queued pages and send mail and page if there are any.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	06/22/04 M. Siatczynski	Initial Script
+#	02/09/11 M. Siatczynski	Add hostname to page so we can see where this is coming from
+#	02/15/11 M. Siatczynski	Profile source accommodates AMG East
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: {-noprompt -m <maildest> -p <pagedest>}"
+export CALLED="$0 $*"
+
+#if [ $# -eq 0 ]
+#then
+#        echo $USAGE
+#        exit 1
+#else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -noprompt)     export PROMPT=0;shift 1;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -p)     export PAGEDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+#fi
+
+test ! "$PROMPT" && export PROMPT=1
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export PAGEMSG=/tmp/pagemsg.$$
+export RPTFILE=$RPTDIR/misc/sendQueuedPageLog.$MMYYYY
+export NUMQUEUED=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Confirm action for server specified
+#------------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+        echo "\nThis script will send a page to $PAGEDEST if there are queued pages and clear the page queue\n"
+        CONTINUE=""
+        while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+        do
+                echo "DO YOU WISH TO CONTINUE? {y/n}"
+                read CONTINUE
+        done
+ 
+        if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+        then
+                echo "\nScript exiting - no action taken.\n"
+                exit 0
+        fi
+fi
+
+#--------------------------------------------------------------------------
+#  If the page queue contains rows, send a page and email
+#  Clear then queue
+#--------------------------------------------------------------------------
+if [ -s $PAGEQUEUE ]
+then
+	export NUMQUEUED=`wc -l < $PAGEQUEUE`
+	export FIRSTPAGE=`head -1 $PAGEQUEUE | cut -d" " -f1-4`
+	export LASTPAGE=`tail -1 $PAGEQUEUE | cut -d" " -f1-4`
+
+	export MAILSUBJECT="QUEUED Sybase pages"
+	export MAILFILE=$PAGEQUEUE
+	sendMail
+	echo "`hostname` - $NUMQUEUED Sybase page(s) queued between $FIRSTPAGE and $LASTPAGE - check email for details" > $PAGEMSG
+	sendPage
+	echo "`date` $NUMQUEUED queued Sybase pages - clearing page queue" >> $RPTFILE
+	> $PAGEQUEUE
+else
+	echo "`date` No queued Sybase pages" >> $RPTFILE
+fi
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+exit 0

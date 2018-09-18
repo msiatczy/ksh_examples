@@ -1,0 +1,128 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: fmtDboAudit.scr -S <DBSERVER> {-D <dbname>} -on|-off
+#
+#  Description: Format sp_audit statements to set auditing for dbo-specific functions (see NOTE)
+#
+#     Location:	/sccm/dba/sybase/scripts/fmtLoginAudit.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - short description of parm if not obvious
+#              	<-on -off> - turn auditing on or off
+#
+#  NOTE:  This only configures auditing for create, drop, and truncate in specific databases.
+#
+#  Modification History:
+#	02/09/04 M. Siatczynski	Initial Script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>} -on|-off"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -on)    export ON=1;shift 1;;
+                        -off)   export OFF=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$ON" && export ON=0
+test ! "$OFF" && export OFF=0
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+elif [ $ON -eq 0 -a $OFF -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ $ON -eq 1 -a $OFF -eq 1 ]
+then
+	echo "ERROR - -on and -off are mutually exclusive"
+	exit 1
+fi
+
+test $ON -eq 1 && export STATUS=on || export STATUS=off
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/dblist.$$
+export SQLFILE=$SQLDIR/$DBSERVER/$DBSERVER.dboAudit.$STATUS.$DATETIME.sql
+export DBOCMDS="create drop truncate"
+
+> $SQLFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+# Exclude system dbs if generating full list
+#--------------------------------------------------------------------------
+if [ "$DBNAME" ]
+then
+	echo $DBNAME > $DBLIST
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases
+	where name not like 'tempdb%' and
+	name not like 'dbcc%' and
+	name not like 'sybsecurity%' and
+	name not like 'sybsystem%' and
+	name not in ('master','model')
+	order by name
+	go
+	!
+fi
+
+#--------------------------------------------------------------------------
+#  Format sp_audit statements to audit dbo actions against a database
+#--------------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	for OPTION in `echo $DBOCMDS`
+	do
+		export OPTION
+		echo "exec sp_audit \"$OPTION\",\"all\",\"$DBNAME\",\"$STATUS\"" >> $SQLFILE
+	done
+	echo "go" >> $SQLFILE
+done
+
+#--------------------------------------------------------------------------
+#  Write trailers
+#--------------------------------------------------------------------------
+echo "\nThe following SQL file has been created:  $SQLFILE\n"

@@ -1,0 +1,230 @@
+#!/bin/ksh
+
+# 8/25/04 M. Siatczynski Removed termed associates (ghowe mhaseman) from mail list and add khess while I'm on maternity leave
+# 2/10/04 M. Siatczynski Removed khess, svivekan from mail list
+# 9/22/05 M. Siatczynski Changed USER to LOGIN
+# 9/28/05 M. Siatczynski Remove mnelso from the email list
+# 2/17/06 M. Siatczynski Implement ISQLEXE
+
+. /sccm/dba/sybase/.dbaSybProfile
+
+export DBSERVER=IDTPROD1
+export LOGIN=stl_monkey
+export LOGINPWD=monkey
+export FILE_ROOT=$PERFDIR/dtc/performance_ui
+# NOTE:  DATETIME includes HHMMSS, so file name uniqueness depends on seconds
+export SQLOUT=${FILE_ROOT}_${DATETIME}.out
+export TXTFILE=${FILE_ROOT}_${DATETIME}.txt
+export ARCHIVE_DIR=$PERFDIR/dtc_archive
+export AGE=8
+export MAILLIST="nlorman msiatczy rpokala"
+
+# Clean up
+find $PERFDIR/dtc -name "performance_ui*" \! -name "performance_ui*.gz" -mtime +${AGE} -exec gzip {} \;
+find $PERFDIR/dtc -name "performance_ui*.gz" -mtime +${AGE} -exec mv {} ${ARCHIVE_DIR}/. \;
+
+> $SQLOUT
+> $TXTFILE
+
+export PRECALL=`date +"%D %T"`
+
+$ISQLEXE -U$LOGIN -S$DBSERVER -w600 <<-! >> $SQLOUT
+$LOGINPWD
+exec sp_uwho_active
+go
+exec sp_lock_what
+go
+use dtc
+go
+
+declare @date1 datetime,
+@date2 datetime,
+@date3 datetime,
+@postdate char(17),
+@connect int,
+@q1dur int,
+@q2dur int,
+@totsql int
+
+-- Calc connect time
+select @date1 = getdate()
+select @connect = datediff(ms,'$PRECALL',@date1)
+set statistics io,time on
+
+-- QUERY #1
+create table #trnsHdr (acct_no int NOT NULL,
+	cusip varchar(12) NULL,
+	Ticker varchar(32) NULL,
+	trans_date datetime NOT NULL,
+	seq_no int NOT NULL,
+	st_exec_broker int NULL,
+	unit_price float NULL,
+	orig_face float  NULL,
+	cancel_date datetime NULL,
+	sequence_no int NULL,
+	multi_broker int NOT NULL,
+	bs_code char(2) NULL,
+	commission_type char(1) NULL,
+	interest float NULL,
+	principle float NULL,
+	sec_fees float NULL,
+	taxes float NULL,
+	commission float NULL,
+	net float NULL,
+	affirm_status char(1) NULL )
+
+--lets insert information into the temp table.
+insert into #trnsHdr
+select acct_no,
+       cusip,
+       ' ',
+       trans_date,
+       seq_no,
+       st_exec_broker,
+       unit_price,
+       orig_face,
+       cancel_date,
+       sequence_no,
+       multi_broker,
+       trans_code,
+       commission_type,
+       interest,
+       principle,
+       sec_fees,
+       taxes,
+       commission,
+       0,
+       null
+from dtc..da_transactions trn
+where trans_date > '11/21/2003'
+  and cusip = '119848109'
+  and acct_no = 11
+update #trnsHdr
+set Ticker = isnull(stx2.sec_code, 'Unknow Security')
+from #trnsHdr trn,
+     settle..ss_security_type_xref stx2,
+     settle..ss_security_type_xref stx1
+where trn.cusip = stx1.sec_code  and
+      stx1.sec_type = 1  and
+      stx1.sec_id = stx2.sec_id and
+      stx2.sec_type =2
+
+update #trnsHdr
+set net = principle + interest - sec_fees - taxes
+where   commission_type = 'N'
+
+update #trnsHdr
+set net = principle + interest - sec_fees - taxes + commission
+where commission_type != 'N'
+  and (bs_code = 'B' or bs_code = 'V')
+
+update #trnsHdr
+set net = principle + interest - sec_fees - taxes - commission
+where commission_type != 'N'
+  and (bs_code = 'S' or bs_code = 'H' )
+
+update #trnsHdr
+set affirm_status = isnull(cm.status_code, ' ')
+from #trnsHdr trn,
+     dtc..da_confirm cm
+where trn.sequence_no = cm.sequence_no
+
+update #trnsHdr
+set affirm_status = 'C'
+where cancel_date is not null
+  and affirm_status is null
+
+
+--here the main select statement.
+select acct_no as Account,
+       cusip as CUSIP,
+       Ticker,
+       convert(char(12), trans_date,101) as 'Trn Date',
+       seq_no as 'Tag/Seq',
+       st_exec_broker as 'Exec Broker',
+       unit_price as 'Price',
+       orig_face as 'Quantity',
+       isnull(convert(char(12), cancel_date, 101),'') as 'Cancel Date',
+       isnull(convert(char(15), sequence_no), 'UNMATCHED') as 'Sequence_No',
+       multi_broker as 'MB',
+       bs_code as 'B/S',
+       net as 'Net Amount',
+       affirm_status as Status
+from #trnsHdr
+order by acct_no, cusip, trans_date
+drop table #trnsHdr
+
+-- Calc time for first query
+set statistics io,time off
+select @date2 = getdate()
+select @q1dur = datediff(ms,@date1,@date2)
+set statistics io,time on
+
+-- QUERY #2
+select dtc_control_no as 'DTC CTRL',
+       criticality as CRT,
+       convert(char(11),
+       confirm_date,101) as Date,
+       status_code as S,
+       type_code as T,
+       confm1.affirming_party as A,
+       confm1.matched_ind as 'Matched Ind',
+       cusip as CUSIP,
+       description as Description,
+       trade_side_code as 'B/S',
+       quantity as Quantity,
+       price as Price,
+       match_acct_no as 'Matched Acct',
+       dt.dtc_name as 'Broker Name',
+       confm.sequence_no as Seq_no
+from dtc.dbo.da_confirm confm,
+     dtc.dbo.da_confirm_1 confm1, dtc..da_dtc_ids dt,
+ settle..ss_security_type_xref stx1,
+ settle..ss_security_type_xref stx2
+where confm.confirm_date > '11/24/2003'
+ and stx1.sec_type = 2
+ and stx1.sec_code = '031162100'
+ and stx2.sec_type = 1
+ and stx2.sec_code = confm.cusip
+ and stx1.sec_id = stx2.sec_id
+  and confm.sequence_no = confm1.sequence_no
+  and confm.broker_dtc_id *=dt.dtc_id
+  and dt.id_type = 'B'
+order by dtc_control_no, confm.confirm_date, cusip, price, match_acct_no
+
+-- Calc time for second query, calc total
+set statistics io,time off
+select @date3 = getdate()
+select @q2dur = datediff(ms,@date2,@date3)
+select @totsql = datediff(ms,'$PRECALL',@date3)
+select @postdate = convert(char(8),@date3,1)+' '+convert(char(8),@date3,8)
+print "DURATION(ms)|$PRECALL|connect|%1!|query1|%2!|query2|%3!|totsql|%4!|%5!",@connect,@q1dur,@q2dur,@totsql,@postdate
+go
+!
+
+export POSTCALL=`date +"%D %T"`
+
+echo "Start  : $PRECALL" >> $TXTFILE
+egrep '(DURATION|Msg)' $SQLOUT >> $TXTFILE
+echo "Finish : $POSTCALL" >> $TXTFILE
+
+export SECONDS_START=`head -1 $TXTFILE | cut -d":" -f4`
+export SECONDS_FINISH=`tail -1 $TXTFILE | cut -d":" -f4`
+
+export MINUTES_START=`head -1 $TXTFILE | cut -d":" -f3`
+export MINUTES_FINISH=`tail -1 $TXTFILE | cut -d":" -f3`
+
+export MINUTES_SECONDS_START=`expr $MINUTES_START \* 60`
+export MINUTES_SECONDS_FINISH=`expr $MINUTES_FINISH \* 60`
+
+export SECONDS_DIFF=`expr $MINUTES_SECONDS_FINISH + $SECONDS_FINISH - $MINUTES_SECONDS_START - $SECONDS_START`
+
+echo "Elapsed(sec): $SECONDS_DIFF" >> $TXTFILE
+
+if [ `tail -1 $TXTFILE | cut -d":" -f2` -ge 10 ]
+then
+	mailx -s "dtc UI Performance Delay Threshold Exceeded!" $MAILLIST < $TXTFILE
+	exit 1
+else
+	exit 0
+fi

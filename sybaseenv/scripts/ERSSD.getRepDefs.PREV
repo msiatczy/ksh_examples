@@ -1,0 +1,86 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getRepDefs.scr -RS <REPSERVER> -ERSSD <ERSSD> {-quiet}
+#
+#  Description: Get list of all replication definitions
+#		Use quiet mode for batch execution.
+#
+#     Location:	/sccm/dba/sybase/scripts/getRepDefs.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<REPSERVER> - repserver
+#		<ERSSD> - ERSSD
+#
+#
+#  Modification History:
+#	07/29/05 M. Siatczynski	Initial Script
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	10/21/08 M. Siatczynski	Updates for ERSSD
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -RS <REPSERVER> -ERSSD <ERSSD> {-quiet}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -RS)		export REPSERVER=$2;shift 2;;
+	                -ERSSD)		export ERSSD=$2;shift 2;;
+	                -quiet)		export QUIET=1;shift 1;;
+	                -*)		echo $USAGE;exit 1;;
+	                *)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$REPSERVER" -o ! "$ERSSD" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$QUIET" && export QUIET=0
+
+# generate output file
+export OUTFILE=$RPTDIR/replication/repDefs/$REPSERVER/$REPSERVER.$ERSSD.repDefs.$DATETIME
+
+#-----------------------------------------------------------------------
+# Run the SQL
+# If generating a control file, remove leading space and convert multiple spaces to single space
+# Connection to ASA doesn't like -X on isql string, so go plain isql call
+#-----------------------------------------------------------------------
+> $OUTFILE
+$OCSBIN/isql -U$ADMINLOGIN -S$ERSSD -w200 -e <<-! | grep -v Password >> $OUTFILE
+`getPass $ERSSD $ADMINLOGIN`
+rs_helprep
+go
+rcl_repdefs
+go
+!
+
+checkSqlErr $OUTFILE
+if [ $? -ne 0 ]
+then
+        echo "\nGeneration of $OUTFILE FAILED"
+        echo "Review errors in $OUTFILE\n"
+        exit 1
+else
+	test $QUIET -eq 0 && echo "\nOutput file created: $OUTFILE\n"
+fi
+
+#-----------------------------------------------------------------------
+# Exit with 0
+#-----------------------------------------------------------------------
+exit 0

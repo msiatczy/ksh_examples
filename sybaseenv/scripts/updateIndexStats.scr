@@ -1,0 +1,341 @@
+#!/bin/ksh 
+#--------------------------------------------------------------------------
+#        Usage: updateIndexStats.scr -S <DBSERVER> {-D <dbname>|<dblist> -T <tablename>|<tablelist> -I <indexname|all> -m <maildest> -p <pagedest> -values <n>}
+#
+#  Description: Run update index statistics on one or more databases on a server
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	DBSERVER - database server
+#              	DBSPEC - database name or list of databases
+#              	TABLESPEC - table name or list of tables (only valid with -D)
+#              	MAILDEST - override default maildest of dba
+#              	PAGEDEST - page destination/flag
+#              	VALUES - number of step values
+#
+#  Modification History:
+#	10/16/07 M. Siatczynski	New scripts for update index stats (based on updateStats.scr)
+#	10/19/07 M. Siatczynski	Update handling of lists so extra commands can be specified with table/index name
+#	10/26/07 M. Siatczynski	Add new exclude file to exclude specific tables rather than entire databases
+#	10/19/09 M. Siatczynski	Add optional parm to specify step values
+#	10/21/10 M. Siatczynski	Combine -L and -D into single parm, allow -T to be single table or list, remove dbname from LOGFILE for single database, exit 2=error, 1=warning
+#	02/23/11 M. Siatczynski	Add parm to specify one or all indexes for table (default all)
+#	02/25/11 M. Siatczynski	Update code block to source profile
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>|<dblist> -T <tablename>|<tablelist> -I <indexname|all> -m <maildest> -p <pagedest> -values <n>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 2
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBSPEC=$2;shift 2;;
+                        -T)     export TABLESPEC=$2;shift 2;;
+                        -I)     export INDEXSPEC=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -p)     export PAGEDEST=$2;shift 2;;
+                        -values)     export VALUES=$2;shift 2;;
+                        -*)     echo $USAGE;exit 2;;
+                        *)      echo $USAGE;exit 2;;
+                esac
+        done
+fi
+
+# DBSERVER MUST be passed
+if [ ! "$DBSERVER" ]
+then
+    echo $USAGE
+    exit 2
+fi
+
+# TABLESPEC is only valid with DBSPEC
+if [ "$TABLESPEC" -a ! "$DBSPEC" ]
+then
+	echo "$USAGE"
+	echo "ERROR - TABLESPEC is only valid with a DBSPEC"
+	exit 2
+fi
+
+# if INDEXSPEC is all, then set variable to null so all no specific value will be passed in isql and all indexes for table will be done
+test "$INDEXSPEC" = "all"  && export INDEXSPEC=""
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+# standard exlude list
+export XDBLIST=$CTLDIR/$DBSERVER/$DBSERVER.statsExclude.lst
+export XTABLIST=$CTLDIR/$DBSERVER/$DBSERVER.statsTableExclude.lst
+export STATSQL=/tmp/statsql.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBLIST=/tmp/dblist.$$
+export SORTDBLIST=/tmp/sortdblist.$$
+export SORTDBTABLIST=/tmp/sortdbtablist.$$
+export TMPXLIST=/tmp/xlist.$$
+export TABLELIST=/tmp/tablelist.$$
+export DBTABLELIST=/tmp/dbtablelist.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+
+export LOGFILE=$LOGDIR/stats/$DBSERVER/$DBSERVER.updateIndexStats.$DATETIME
+
+# set parm for number of step values
+test "$VALUES" && export STEPSPEC="using $VALUES values" || export STEPSPEC=""
+
+export HIGHRC=0
+> $LOGFILE
+> $MAILFILE
+
+echo "`date` SCRIPT START" >> $LOGFILE
+echo "Executed: $CALLED" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $STATSQL && \rm -f $STATSQL
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SORTDBLIST && \rm -f $SORTDBLIST
+	test -f $SORTDBTABLIST && \rm -f $SORTDBTABLIST
+	test -f $TMPXLIST && \rm -f $TMPXLIST
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+	test -f $TABLELIST && \rm -f $TABLELIST
+	test -f $DBTABLELIST && \rm -f $DBTABLELIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------------
+# format list of databases
+# if a file is passed, make sure it's > 0 bytes
+# if it's not clearly a file, make sure it's not an invalid filename
+# output from this block is final list of databases to process:  DBLIST
+#------------------------------------------------------------------------------------
+> $DBLIST
+if [ "$DBSPEC" ]
+then
+# make sure control file exists and has entries
+        if [ -f $DBSPEC ]
+        then
+                if [ -s $DBSPEC ]
+                then
+                        cat $DBSPEC > $DBLIST
+                else
+                        echo "WARNING - $DBSPEC is 0 bytes" >> $LOGFILE
+                        exit 1
+                fi
+        else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+                echo $DBSPEC | grep '/' > /dev/null
+                if [ $? -eq 0 ]
+                then
+                        echo "ERROR - $DBSPEC is not valid--possible invalid filename?"
+                        exit 2
+                else
+# single dbname was passed
+                        echo $DBSPEC > $DBLIST
+                fi
+        fi
+else
+# DBSPEC not specified--get all databases and xref against exclusion list
+        getDbList -S $DBSERVER -user -system -xreadonly | sort > $SORTDBLIST
+        if [ $? -ne 0 ]
+        then
+                echo "ERROR - getting list of databases from $DBSERVER" | tee -a $LOGFILE
+                cat $SORTDBLIST | tee -a $LOGFILE
+                exit 2
+	else
+#--------------------------------------------------------------------------
+#  Exclude database in the exclusion list
+#  Exclusion list only processes when DBSPEC is not supplied
+#--------------------------------------------------------------------------
+		if [ -s $XDBLIST ]
+		then
+			sort $XDBLIST > $TMPXLIST
+			comm -23 $SORTDBLIST $TMPXLIST > $DBLIST
+	
+			echo "The following databases are excluded from update index statistics:\n" >> $LOGFILE
+			cat $TMPXLIST >> $LOGFILE
+			echo "" >> $LOGFILE
+		else
+			cat $SORTDBLIST > $DBLIST
+		fi
+        fi
+fi
+
+#------------------------------------------------------------------------------------
+# format list of tables
+# if a file is passed, make sure it's > 0 bytes
+# if it's not clearly a file, make sure it's not an invalid filename
+# output from this block is final list of databaes and tables to process:  DBTABLELIST
+#------------------------------------------------------------------------------------
+> $TABLELIST
+> $DBTABLELIST
+if [ "$TABLESPEC" ]
+then
+# make sure control file exists and has entries
+        if [ -f $TABLESPEC ]
+        then
+                if [ -s $TABLESPEC ]
+                then
+                        cat $TABLESPEC > $TABLELIST
+                else
+                        echo "WARNING - $TABLESPEC is 0 bytes" >> $LOGFILE
+                        exit 1
+                fi
+        else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+                echo $TABLESPEC | grep '/' > /dev/null
+                if [ $? -eq 0 ]
+                then
+                        echo "ERROR - $TABLESPEC is not valid--possible invalid filename?"
+                        exit 2
+                else
+# single tablename was passed
+			echo $TABLESPEC > $TABLELIST
+                fi
+        fi
+
+#merge DBLIST and TABLELIST here
+	for DBNAME in `cat $DBLIST`
+	do
+		export DBNAME
+		for TABLENAME in `cat $TABLELIST`
+		do
+			export TABLENAME
+			echo "$DBNAME $TABLENAME" >> $DBTABLELIST
+		done
+	done
+else
+# TABLESPEC not specified--so we need all tables for each database in DBLIST
+	> $SORTDBTABLIST
+	for DBNAME in `cat $DBLIST`
+	do
+		export DBNAME
+		> $SQLOUT
+		$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password | sed -e 's/^ //g' -e 's/  *$//g' | sort >> $SQLOUT
+		`getPass $DBSERVER $ADMINLOGIN`
+		set nocount on
+		go
+		use $DBNAME
+		go
+		if db_name() = 'master'
+			select "$DBNAME "+user_name(uid)+"."+name from sysobjects
+			where type = 'U'
+			and name not like 'mon[A-Z]%'
+			order by name
+		else
+		if db_name() = 'lookjack'		
+			select "$DBNAME "+user_name(uid)+"."+name from sysobjects
+			where type = 'U'
+			and sysstat2&1024<>1024
+			and sysstat2&2048<>2048
+			order by name
+		else
+			select "$DBNAME "+user_name(uid)+"."+name from sysobjects
+			where type = 'U'
+			order by name
+		go
+		!
+
+		checkSqlErr $SQLOUT
+		if [ $? -eq 1 ]
+		then
+			cat $SQLOUT >> $LOGFILE
+			echo "ERROR - unable to obtain list of tables for $DBNAME on $DBSERVER"
+			echo "Review output in $LOGFILE"
+			echo "Continuing to process other databases" >> $LOGFILE
+			export HIGHRC=2
+		else
+# the next statement continually merges/sorts the working list so the final result is a sorted list
+			sort -o $SORTDBTABLIST $SQLOUT $SORTDBTABLIST
+		fi
+	done
+
+#--------------------------------------------------------------------------
+#  Exclude specific tables in the exclusion list
+#  Exclusion list only processes when TABLESPEC is not supplied
+#--------------------------------------------------------------------------
+	if [ -s $XTABLIST ]
+	then
+# sort the list of tables to be excluded
+		sort $XTABLIST > $TMPXLIST
+		comm -23 $SORTDBTABLIST $TMPXLIST >> $DBTABLELIST
+
+		echo "The following tables are excluded from update index statistics:\n" >> $LOGFILE
+		cat $TMPXLIST >> $LOGFILE
+		echo "" >> $LOGFILE
+	else
+		cat $SORTDBTABLIST >> $DBTABLELIST
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  Execute update index statistics for each table
+#--------------------------------------------------------------------------
+if [ -s $DBTABLELIST ]
+then
+	cat $DBTABLELIST |
+	while read DBTABLELINE
+	do
+		export DBNAME=`echo $DBTABLELINE | cut -d" " -f1`
+		export TABLENAME=`echo $DBTABLELINE | cut -d" " -f2-`
+		> $STATSQL
+		echo "use $DBNAME" >> $STATSQL
+		echo "go" >> $STATSQL
+		echo "update index statistics $TABLENAME $INDEXSPEC $STEPSPEC" >> $STATSQL
+		echo "go" >> $STATSQL
+		$SCRDIR/sqlTimer.scr -S $DBSERVER -i $STATSQL -o $LOGFILE -m $MAILFILE
+		if [ $? -ne 0 ]
+		then
+			export HIGHRC=2
+		fi
+	done
+else
+	echo "No tables to process" >> $LOGFILE
+fi
+
+#--------------------------------------------------------------------------
+# If there were any failures, send email
+# If a page destination is set, then send a page
+#--------------------------------------------------------------------------
+echo "`date` SCRIPT END" >> $LOGFILE
+if [ $HIGHRC -ne 0 ]
+then
+	echo "\nNOTE: Check $LOGFILE for further details.\n" >> $MAILFILE
+	export MAILSUBJECT="$DBSERVER UPDATE INDEX STATS FAILED"
+	sendMail
+
+	if [ "$PAGEDEST" ]
+	then
+		echo "`date` $DBSERVER UPDATE INDEX STATS FAILED" > $PAGEMSG
+		sendPage
+	fi
+	exit $HIGHRC
+else
+	exit 0
+fi

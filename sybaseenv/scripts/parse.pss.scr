@@ -1,0 +1,103 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+# temp script to parse connection timing files
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -d <mmddyy> {-t <hhmmss>"
+export CALLED="$0 $*"
+
+export SORT=0
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -d)     export DATE=$2;shift 2;;
+                        -t)     export TIME=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DATE" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+if [ "$TIME" ]
+then
+	export FILE=$PERFDIR/uwhoInfo/$DBSERVER/$DBSERVER.dbccpss.$DATE.$TIME*
+else
+	export FILE=$PERFDIR/uwhoInfo/$DBSERVER/$DBSERVER.dbccpss.$DATE.*
+fi
+
+export TEMPFILE=/tmp/pssinfo.$$
+export SQLFILE=/tmp/sql.$$
+export SUIDLIST=/tmp/suids.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TEMPFILE && \rm -f $TEMPFILE
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SUIDLIST && \rm -f $SUIDLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Parse the file
+#--------------------------------------------------------------------------
+egrep '(^PSS \(any state\) for suid|ptdsversion=)' $FILE | paste -s -d"\0\n" - | sed 's/  */ /g' | cut -d" " -f5,6,13 | egrep -v '(ptdsversion=0|ptdsversion=5)' | sort | uniq -c | sort -n +2 | sed 's/^  *//g' > $TEMPFILE
+
+if [ -s $TEMPFILE ]
+then
+	echo "\nLIST OF SUIDs USING PRE-TDS5 VERSION:\n(first column is count)\n"
+	cat $TEMPFILE
+	echo "\nCORRESPONDING SERVER USERNAMES:\n"
+
+#--------------------------------------------------------------------------
+# Get list of suids
+#--------------------------------------------------------------------------
+	cut -d" " -f3 $TEMPFILE > $SUIDLIST
+
+#--------------------------------------------------------------------------
+# format SQL
+#--------------------------------------------------------------------------
+	> $SQLFILE
+	echo "set nocount on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	cat $SUIDLIST |
+	while read SUID
+	do
+		export SUID
+		echo "select \"suid($SUID)=\"+suser_name($SUID)" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+
+#--------------------------------------------------------------------------
+# execute the sql
+#--------------------------------------------------------------------------
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password
+else
+	echo "\nNo processes are using pre-TDS5 version\n"
+fi
+
+echo ""
+exit 0

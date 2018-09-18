@@ -1,0 +1,81 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: compareNfsFile.scr -T <remote host> -f <file>
+#
+#  Description: Compare files on different NFS systems
+#
+#     Location:	/sccm/dba/sybase/scripts/getTransparencyData.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	01/11/07 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -T <remote host> -f <file>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -T)     export REMOTEHOST=$2;shift 2;;
+                        -f)     export FILESPEC=$2;shift 2;;
+                        -all)   export ALL=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$REMOTEHOST" -o ! "$FILESPEC" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOCALFILE=/tmp/local.$$
+export REMOTEFILE=/tmp/remote.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $LOCALFILE && \rm -f $LOCALFILE
+	test -f $REMOTEFILE && \rm -f $REMOTEFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Make a copy of the local file
+#--------------------------------------------------------------------------
+cp -p $FILESPEC $LOCALFILE
+
+#--------------------------------------------------------------------------
+#  Get the file from the remote host
+#--------------------------------------------------------------------------
+/usr/local/bin/scp -p $REMOTEHOST:$FILESPEC $REMOTEFILE
+
+#--------------------------------------------------------------------------
+#  compare the files
+#--------------------------------------------------------------------------
+echo "$FILESPEC vs. $REMOTEHOST:$FILESPEC"
+diff $LOCALFILE $REMOTEFILE

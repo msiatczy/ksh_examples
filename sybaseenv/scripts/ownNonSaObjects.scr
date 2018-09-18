@@ -1,0 +1,146 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: ownNonSaObjects.scr -S <DBSERVER> {-D <DBNAME> -m <maildest>}
+#
+#  Description: Change ownership to default (NULL) for objects owned by login other than sa.
+#
+#     Location:	/sccm/dba/sybase/scripts/ownNonSaObject.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - Database server
+#              	<DBNAME> - Database name
+#              	<maildest> - override default maildest
+#
+#
+#  Modification History:
+#	02/11/03 M. Siatczynski	Initial Script
+#	06/25/04 M. Siatczynski	Centralized script
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <DBNAME> -m <maildest>}"
+ 
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBLIST=/tmp/dblist.$$
+export OUTFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.ownNonSaObjects.$DATETIME
+
+> $OUTFILE
+echo "`date` Owning non-sa objects on $DBSERVER" >> $OUTFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+#--------------------------------------------------------------------------
+if [ "$ONEDBNAME" ]
+then
+        echo $ONEDBNAME > $DBLIST
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases where name <> 'tempdb' order by name
+	go
+	!
+fi
+
+checkSqlErr $DBLIST
+if [ $? -eq 1 ]
+then
+	echo "ERROR - getting list of databases for $DBSERVER" | tee -a $OUTFILE
+	cat $DBLIST >> $OUTFILE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  format sql
+#  query database(s) for objects owned by non-sa login
+#  exclude tempdb
+#  exclude system objects and objects that start with 'SQR_%'
+#  check for errors
+#--------------------------------------------------------------------------
+> $SQLFILE
+echo "sp_configure 'allow updates',1" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	echo "use $DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "select convert(char(12),@@servername),convert(char(20),db_name()),convert(char(30),name)"OBJECT",type,convert(char(20),loginame),crdate from $DBNAME..sysobjects where loginame <> NULL and type <> 'S' and name not like 'SQR_%' order by crdate" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "update $DBNAME..sysobjects set loginame = NULL where loginame <> NULL and type <> 'S' and name not like 'SQR_%'" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+echo "sp_configure 'allow updates',0" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#--------------------------------------------------------------------------
+# execute the sql
+# check for errors
+# mail the output file
+# exit
+#--------------------------------------------------------------------------
+> $SQLOUT
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -e -w200 -b -i$SQLFILE | grep -v Password >> $SQLOUT
+
+cat $SQLOUT >> $OUTFILE
+export MAILSUBJECT="sa ownership report $DBSERVER $DBNAME"
+export MAILFILE=$OUTFILE
+sendMail
+
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	echo "ERROR - owning objects on $DBSERVER" | tee -a $OUTFILE
+	exit 1
+else
+	exit 0
+fi

@@ -1,0 +1,125 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: noradArchive.scr -SAM <sam name> {-quiet}
+#
+#  Description: Create an archive of a SAM configuration. 
+#
+#     Location:	/sccm/dba/sybase/scripts/noradArchive.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#
+#  Modification History:
+#	03/10/09 J. Aspenleiter	Initial Script
+#	08/04/09 M. Siatczynski	Add -quiet parm so status messages are logged but don't show on console
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.norad
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+#USAGE="ERROR - Usage: $0 -SAM <sam name> {-quiet}"
+
+#if [ $# -eq 0 ]
+#then
+#	echo $USAGE
+#	exit 1
+#else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-SAM)		export SAMNAME=$2;shift 2;;
+			-quiet)		export QUIET=1;shift 1;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+#fi
+
+# user and environment must be passed
+if [ ! "$SAMNAME" ]
+then
+	export SAMNAME=$MYSAM
+fi
+
+test ! "$QUIET" && export QUIET=0
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export OUTFILE=$LOGDIR/backup/central/$SAMNAME.noradArchive.$DATETIME
+export SAMARCH=/sccm/syb_30day/full/NORAD/$SAMNAME.noradArchive.$DATETIME.tar
+
+# if running in quiet mode, then use OUTDEST to send WARNING messages to log rather than console
+# NOTE:  eval MUST be used when specifying OUTDEST
+test $QUIET -eq 1 && export OUTDEST=" >> $OUTFILE" || export OUTDEST="| tee -a $OUTFILE"
+
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $OUTFILE
+echo "`date` $SAMNAME ARCHIVE BEGIN..." >> $OUTFILE
+
+###############################################################################
+###############################################################################
+# Reset Entity function. Connects to a Surveillance Server (SAM) and 
+# either enables, or disables the Entity.  
+#
+# Syntax: ResetEntity SAMNAME ENTITY RESETBIT
+#
+# SAMNAME	is SAM name of where the entity is running.
+#
+# ENTITY	is the ASE name that is to be disabled.
+#
+# RESETBIT	is the bit that says to enable, or disable the entity.
+#		0 = disable
+#		1 = enable
+#
+# Note: "target ." means to send commands to the connected SAM.
+#
+###############################################################################
+#
+function ArchiveSam {
+cd $NSM_HOME/cfg
+../bin/nsmcopy --export=$SAMARCH
+
+return 0
+}
+###############################################################################
+#
+################################################################################
+#
+#	MAIN
+#
+################################################################################
+#   
+# Archive
+
+if [ $? -eq 0 ]
+then
+	ArchiveSam >> $OUTFILE
+else
+	echo "ERROR OCCURRED....."
+	exit 1
+fi
+#
+################################################################################
+#------------------------------------------------------------------------------
+# Check for errors
+# Exit
+#------------------------------------------------------------------------------
+checkNoradErr $OUTFILE
+if [ $? -ne 0 ]
+then
+	eval echo "ERROR - error occured while trying to archive $SAMNAME" | tee -a $OUTFILE
+	echo "Review $OUTFILE"
+	exit 1
+else
+	eval echo "Archive file $SAMARCH created successfully for SAM $SAMNAME" $OUTDEST
+	exit 0
+fi

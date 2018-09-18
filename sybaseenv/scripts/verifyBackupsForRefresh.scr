@@ -1,0 +1,155 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: verifyBackupsForRefresh.scr -S <SOURCE DBSERVER> -T <TARGET DBSERVER> {-D <dbname>|<DB list>}
+#
+#  Description: Verify backup files exist for a refresh in Tempe
+#
+#  NOTE:  This script MUST run from the TARGET DBSERVER and MUST be run after fmtSqlbtForRefresh.scr
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#
+#  Modification History:
+#	02/15/08 M. Siatczynski	Initial Script (copied from fmtSqlbtForRefresh.scr)
+#------------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <SOURCE DBSERVER> -T <TARGET DBSERVER> {-D <dbname>|<DB list>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 2
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export SOURCE_DBSERVER=$2;shift 2;;
+                        -T)     export TARGET_DBSERVER=$2;shift 2;;
+                        -D)     export DBSPEC=$2;shift 2;;
+                        -*)     echo $USAGE;exit 2;;
+                        *)      echo $USAGE;exit 2;;
+                esac
+        done
+fi
+
+if [ ! "$SOURCE_DBSERVER" -o ! "$TARGET_DBSERVER" ]
+then
+        echo $USAGE
+        exit 2
+fi
+
+# set environment after setting SETDBSERVER
+export SETDBSERVER=$TARGET_DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/backup/$TARGET_DBSERVER/$TARGET_DBSERVER.$SOURCE_DBSERVER.verifyBackupsForRefresh.$DATETIME
+export SQLBTCTLDIR=$DT_PHYSICAL/$SOURCE_DBSERVER
+
+export FILELIST=/tmp/filelist.$$
+export DBLIST=/tmp/dblist.$$
+
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $FILELIST && \rm -f $FILELIST
+	test $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TEM
+
+
+> $LOGFILE
+echo "`date` Checking for missing backups" >> $LOGFILE
+
+#------------------------------------------------------------------------------------
+# format list of databases
+# if a file is passed, make sure it's > 0 bytes 
+# if it's not clearly a file, make sure it's not an invalid filename
+# if no spec is passed, gen list of all databases based on control dir
+#------------------------------------------------------------------------------------
+if [ "$DBSPEC" ]
+then
+# make sure control file exists and has entries
+	if [ -f $DBSPEC ]
+	then
+		if [ -s $DBSPEC ]
+		then
+			cat $DBSPEC > $DBLIST
+		else
+			echo "WARNING - $DBSPEC is 0 bytes"
+			exit 1
+		fi
+	else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+		echo $DBSPEC | grep '/' > /dev/null
+		if [ $? -eq 0 ]
+		then
+			echo "ERROR - $DBSPEC is not valid--possible invalid filename?"
+			exit 2
+		else
+			echo $DBSPEC > $DBLIST
+		fi
+	fi
+else
+	ls $SQLBTCTLDIR > $DBLIST
+fi
+
+#------------------------------------------------------------------------------------
+# For each database, modify and copy the control file to the control directory
+#------------------------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+
+	export SQLBTCTLFILE=$SQLBTCTLDIR/$DBNAME
+
+#------------------------------------------------------------------------------------
+# Parse control file and validate that each backup file (full or tran) exists
+#------------------------------------------------------------------------------------
+	> $FILELIST
+	grep 'file=disk:' $SQLBTCTLFILE | sed -e 's/file=disk:[0-9A-Za-z_]*\//\//g' -e 's/<1>$/-0/g' > $FILELIST
+
+	cat $FILELIST |
+	while read FILENAME
+	do
+		export FILENAME
+		if [ ! -s $FILENAME ]
+		then
+			echo "$DBNAME : $FILENAME MISSING" | tee -a $LOGFILE
+#			echo "$DBNAME : $FILENAME MISSING" >> $LOGFILE
+			export HIGHRC=1
+		else
+			echo "$DBNAME : $FILENAME exists" >> $LOGFILE
+		fi
+	done
+done
+
+#------------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------------
+if [ $HIGHRC -ne 0 ]
+then
+	echo "\nERROR - One or more backup files are missing" | tee -a $LOGFILE
+	echo "`date` Check complete" >> $LOGFILE
+	echo "\nReview details in $LOGFILE"
+	exit 2
+else
+	echo "`date` Check complete" >> $LOGFILE
+	exit 0
+fi

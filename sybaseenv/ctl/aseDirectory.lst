@@ -1,0 +1,3 @@
+# FILE FORMAT:
+# (1)DBSERVER (2)service-name (3)SYBASE (4)ASEDIR (5)status(prod/nonprod) (6)storage(SAN/DAS) (7)diskgroup (8)port (9)pageRangeStart (10)pageRangeEnd (11)primary rep group (12)LOB
+PREDWOOD p-syb-redwood /dbms/syb/PREDWOOD/sybase15 /dbms/syb/PREDWOOD/sybase15/ASE-15_0 prod SAN p-syb-redwood-dg 4107 0000 2359 PREDWOOD WDAI

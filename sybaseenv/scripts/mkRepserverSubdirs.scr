@@ -1,0 +1,108 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: mkRepserverSubdirs.scr {-d <directory path>} | {-S <REPSERVER>}
+#
+#  Description: Make REPSERVER subdirectories under a designated directory IF directory path is passed
+#		OR Make REPSERVER subdirectory under each standard directory if a REPSERVER is passed
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	DIRPATH - full directory path under which to make the subdirectories
+#
+#  Modification History:
+#	01/24/07 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 {-d <directory path>} | {-S <REPSERVER>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -d)     export DIRPATH=$2;shift 2;;
+                        -S)     export ONEREPSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+#--------------------------------------------------------------------------
+# validate parms
+#--------------------------------------------------------------------------
+export STDSUBDIRS=$CTLDIR/stdRepserverSubdirs.lst
+
+if [ "$DIRPATH" -a "$ONEREPSERVER" ]
+then
+	echo "ERROR - DIRPATH and REPSERVER are mutually exclusive--can only pass one parm"
+	exit 1
+fi
+
+# if a directory path is passed, it MUST be in the standard list AND it MUST physically exist
+if [ "$DIRPATH" ]
+then
+	grep ^${DIRPATH}$ $STDSUBDIRS > /dev/null
+	export GREPRC=$?
+	if [ $GREPRC -eq 0 ]
+	then
+# exists in standard list--make sure it physically exists
+		if [ ! -d $DIRPATH ]
+		then
+			echo "ERROR - $DIRPATH does not exist"
+			exit 1
+		fi
+	else
+# doesn't exist in standard list
+		echo "ERROR - $DIRPATH does not exist in $STDSUBDIRS"
+		echo "Add the path to $STDSUBDIRS and rerun this script"
+		exit 1
+	fi
+fi
+
+export REPSERVERLIST=/tmp/dbserver.lst.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $REPSERVERLIST && \rm -f $REPSERVERLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Format list of REPSERVERS
+#--------------------------------------------------------------------------
+test "$ONEREPSERVER" && echo $ONEREPSERVER > $REPSERVERLIST || getAseList > $REPSERVERLIST
+
+#--------------------------------------------------------------------------
+#  Make a REPSERVER subdirectory for each REPSERVER in $ASEDIRLIST
+#--------------------------------------------------------------------------
+cat $REPSERVERLIST |
+while read REPSERVER
+do
+	cat $STDSUBDIRS |
+	while read SUBDIR
+	do
+		if [ -d $SUBDIR/$REPSERVER ]
+		then
+			echo "$SUBDIR/$REPSERVER already exists"
+		else
+			echo "Making directory $SUBDIR/$REPSERVER..."
+			mkdir $SUBDIR/$REPSERVER
+		fi
+	done
+done

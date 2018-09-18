@@ -1,0 +1,86 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: rollAsaLogs.scr -RS <REPSERVER> {-G <generations>}
+#
+#  Description: Rotate the errorlogs for ASA
+#		keeping n generations (default 8 generations).
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	-RS <REPSERVER> - database server
+#		-G <generations> - number of generations to keep
+#
+#  Modification History:
+#	10/22/08 M. Siatczynski	Initial Script - copied from rollAseLogs.scr
+#--------------------------------------------------------------------------
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -RS <REPSERVER> {-G <generations>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -RS)	export REPSERVER=$2;shift 2;;
+	                -G)	export GENERATIONS=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$REPSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# NOTE:  SETREPSERVER must be set AFTER case statement and .dbaSybProfile must be sourced AFTER case statement
+export SETREPSERVER=$REPSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.miscfunctions
+
+test ! "$GENERATIONS" && export GENERATIONS=8
+
+#-----------------------------------------------------------------------
+# Get ERSSD based on REPSERVER
+# Make sure it is set to something
+#-----------------------------------------------------------------------
+grep "^$REPSERVER " $REPDIRLIST | cut -d" " -f9 | read ERSSD
+if [ ! "$ERSSD" ]
+then
+        echo "ERROR - ERSSD not properly set"
+        exit 1
+fi
+
+export ASALOG=$SYBASE/$SYBASE_REP/errorlog/errorlog_${ERSSD}
+
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# If there is not a current log file, then the environment is probably not set correctly.
+# Roll the ASA errorlogs and clear the current one.
+# If any generation cannot be copied of moved, exit the script with non-0 RC.
+#--------------------------------------------------------------------------
+if [ -f $ASALOG ]
+then
+	rollGenerations $ASALOG $GENERATIONS
+else
+	echo "$ASALOG does not exist--check variables in SYBASE.ksh for $REPSERVER"	
+	export HIGHRC=1
+fi
+
+#--------------------------------------------------------------------------
+# Exit with 0 if all above commands were successful
+#--------------------------------------------------------------------------
+exit $HIGHRC

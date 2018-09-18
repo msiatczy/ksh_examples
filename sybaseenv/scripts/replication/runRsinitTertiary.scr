@@ -1,0 +1,134 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: runRsinitTertiary.scr -L <control list> -RS <repserver> | -D <dbname> -RS <repserver>
+#
+#  Description: Typically a third connection for MSA, can be used for more connections as Multiple Warm Standby
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<control list> - input list of databases to be replicated
+#              	<repserver> - replication server
+#              	<dbname> - database 
+# 
+#   NOTE:  -L <control list> and other parameters are mutually exclusive.
+#
+#  Modification History:
+#	10/15/2010 K. Sawant	Initial Script
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+#  Initialize Parameters
+#--------------------------------------------------------------------------
+export USAGE="\nERROR - Usage: $0 -L <control list> -RS <rep server> | -D <dbname> -RS <rep server>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -L)     export LISTFILE=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -RS)    export REPSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+# MUST source .dbaprofile AFTER SETREPSERVER is set so appropriate environment is set
+export SETREPSERVER=$REPSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+export TEMPFILE=/tmp/tempfile.$$
+export TEMPOUT=/tmp/tempout.$$
+export OUTFILE=$LOGDIR/replication/$REPSERVER/$REPSERVER.rsinitTertiary.$DATETIME
+
+#--------------------------------------------------------------------------
+#  Verify Parameters
+#--------------------------------------------------------------------------
+if [ "$LISTFILE" ]
+then
+
+#LISTFILE cannot be passed with any other parameters
+	if [ "$DBNAME" ]
+	then
+		echo "$USAGE"
+		echo "\ncontrol list and other parameters are mutually exclusive\n"
+		exit 1
+	fi
+
+#REPSERVER must be passed if LISTFILE is valid
+	if [ ! "$REPSERVER" ]
+	then
+		echo "$USAGE"
+		echo "\nRep server must be specified with control list\n"
+		exit 1
+	fi
+
+#LISTFILE must exist under central control directory
+	CTLFILE=$CTLDIR/replication/$LISTFILE
+	if [ ! -s $CTLFILE ]
+	then
+	        echo "\nERROR - $CALLED"
+	        echo "\n$CTLFILE does not exist or is 0 bytes\n"
+	        exit 1
+	fi
+else
+#if LISTFILE wasn't passed, all other parameters must be passed
+	if [ ! "$DBNAME" -o ! "$REPSERVER" ]
+	then
+		echo "$USAGE"
+		echo "\nIf control list is not passed, ALL other parameters MUST be passed."
+		exit 1
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TEMPFILE && \rm -f $TEMPFILE
+	test -f $TEMPOUT && \rm -f $TEMPOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  run rs_init to add the tertiary connection
+#--------------------------------------------------------------------------
+
+> $OUTFILE
+
+if [ "$LISTFILE" ]
+then
+	cat $CTLFILE > $TEMPFILE
+else
+	echo "dummy $DBNAME dummy dummy dummy dummy" > $TEMPFILE
+fi
+
+cat $TEMPFILE |
+while read dummy DBNAME dummy dummy dummy dummy
+do
+	export dummy DBNAME dummy dummy dummy dummy
+        export RSFILE_TERTIARY=$SQLDIR/replication/$REPSERVER.$DBNAME.tertiary.rs
+	echo "*** $DBNAME rs_init tertiary START" >> $OUTFILE
+	echo "*** $DBNAME"
+
+	$SYBASE/$SYBASE_REP/install/rs_init -r $RSFILE_TERTIARY > $TEMPOUT
+        grep 'Configuration' $TEMPOUT
+        cat $TEMPOUT >> $OUTFILE
+
+	echo "*** $DBNAME rs_init tertiary COMPLETE" >> $OUTFILE
+done 
+
+echo "\nReview output in $OUTFILE\n"
+exit 0

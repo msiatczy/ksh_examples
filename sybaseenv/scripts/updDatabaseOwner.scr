@@ -1,0 +1,153 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: updDatabaseOwner.scr -S <DBSERVER> -D <dbname|all> -dbowner <login>
+#
+#  Description: Change database owner to login specified.
+#
+#     Location:	/sccm/dba/sybase/scripts/updDatabaseOwner.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - ASE
+#		<dbname> - database name
+#		<dbowner> - override default maildest of dba
+#
+#  Modification History:
+#       03/22/05 M. Siatczynski Initial script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <database|all -dbowner <login>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export DBSERVER=$2;shift 2;;
+			-D)		export ONEDBNAME=$2;shift 2;;
+			-dbowner)	export DBOWNER=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$DBSERVER" -o ! "$ONEDBNAME" -o ! "$DBOWNER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export SQLFILE=/tmp/usersql.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBLIST=/tmp/dblist.$$
+export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.updDatabaseOwner.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create a working dblist
+# Exclude tempdbs and read-only databases (status=1024)
+#------------------------------------------------------------------------------
+if [ "$ONEDBNAME" = "all" ]
+then
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases where
+	name not like 'tempdb%'
+	and status&1024 <> 1024
+	and suser_name(suid) <> "$DBOWNER"
+	order by name
+	go
+	!
+
+	checkSqlErr $DBLIST
+	if [ $? -eq 1 ]
+	then
+	        echo "ERROR - getting list of database names from $DBSERVER" | tee -a $LOGFILE
+	        cat $DBLIST >> $LOGFILE
+	        exit 1
+	fi
+else
+	echo $ONEDBNAME > $DBLIST
+fi
+
+#------------------------------------------------------------------------------
+# Format the SQL
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	echo "use $DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "if exists (select * from master..sysdatabases where name = \"$DBNAME\" and suser_name(suid) = \"$DBOWNER\")" >> $SQLFILE
+	echo "print \"$DBNAME: Owner is already set to $DBOWNER\"" >> $SQLFILE
+	echo "else" >> $SQLFILE
+	echo "begin" >> $SQLFILE
+	echo "if db_name() = \"$DBNAME\"" >> $SQLFILE
+	echo "begin" >> $SQLFILE
+	echo "print \"$DBNAME: Updating database owner to $DBOWNER\"" >> $SQLFILE
+	echo "exec sp_changedbowner $DBOWNER" >> $SQLFILE
+	echo "end" >> $SQLFILE
+	echo "else" >> $SQLFILE
+	echo "print \"NOT IN THE CORRECT DATABASE!\"" >> $SQLFILE
+	echo "end" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# Append the output to the logfile
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` $DBSERVER: Updating database owner(s)" >> $LOGFILE
+
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 -i$SQLFILE | grep -v Password > $SQLOUT
+
+cat $SQLOUT >> $LOGFILE
+#------------------------------------------------------------------------------
+# Check for errors
+#------------------------------------------------------------------------------
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	export HIGHRC=1
+	echo "`date` $DBSERVER: Update database owner FAILED" >> $LOGFILE
+else
+	echo "`date` $DBSERVER: Update database owner SUCCESSFUL" >> $LOGFILE
+fi
+
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+test $HIGHRC -eq 1 && exit 1 || exit 0

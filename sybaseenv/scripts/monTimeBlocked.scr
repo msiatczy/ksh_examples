@@ -1,0 +1,123 @@
+#!/bin/ksh 
+#--------------------------------------------------------------------------
+#        Usage: monTimeBlocked.scr.scr -S <dbserver> -T <seconds blocked> {-p <pagedest>}
+#
+#  Description: Check for processes blocked more than n seconds
+#		Workaround process in lieu of Bradmark Surveillance
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<dbserver> - dbserver
+#              	<pagedest> - Pass this parm to receive pages
+#
+#
+#  Modification History:
+#	03/09/10 M. Siatczynski Original script
+#	02/22/11 M. Siatczynski Add error checking of SQL output
+#--------------------------------------------------------------------------
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+USAGE="ERROR - Usage: $0 -S <DBSERVER> -T <seconds blocked> {-p <pagedest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)		export DBSERVER=$2;shift 2;;
+	                -p)		export PAGEDEST=$2;shift 2;;
+	                -T)		export SECSBLOCKED=$2;shift 2;;
+	                -*)		echo $USAGE;exit 1;;
+	                *)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" -o ! "$SECSBLOCKED" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+export LOGFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.monTimeBlocked.$DATETIME
+export TEMPFILE=/tmp/processes.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export MAILFILE=/tmp/mailfile.$$
+
+echo "`date +'%b %e %H:%M:%S'` $DBSERVER: Process(es) blocked longer than $SECSBLOCKED seconds" > $PAGEMSG
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $TEMPFILE && \rm -f $TEMPFILE
+	test $PAGEMSG && \rm -f $PAGEMSG
+	test $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# write headers
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Checking for blocking on $DBSERVER..." >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# query sysprocesses for SQL-BackTrack connections 30 minutes old or older
+#--------------------------------------------------------------------------
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 <<-! | grep -v Password > $TEMPFILE
+`getPass $DBSERVER $ADMINLOGIN`
+if exists 
+(select 1 from sysprocesses where time_blocked >= $SECSBLOCKED)
+begin
+	print "$DBSERVER: ONE OR MORE PROCESSES BLOCKED LONGER THAN $SECSBLOCKED SECONDS:"
+	print ""
+	select spid,blocked,time_blocked from sysprocesses where time_blocked >= $SECSBLOCKED
+	execute sp_uwho
+end
+go
+!
+
+#--------------------------------------------------------------------------
+#  First check for errors
+#  If none found and the file is not empty, email contents
+#  Only page if PAGEDEST is set
+#--------------------------------------------------------------------------
+checkSqlErr $TEMPFILE
+if [ $? -eq 1 ]
+then
+	echo "ERROR - checking blocking on $DBSERVER" >> $LOGFILE
+	cat $TEMPFILE >> $LOGFILE
+	exit 1
+else
+	if [ -s $TEMPFILE ]
+	then
+		> $MAILFILE
+		echo "Start of report: `date`\n" >> $MAILFILE
+	        echo "$0 executed by user $LOGNAME on `hostname`\n" >> $MAILFILE
+		cat $TEMPFILE >> $MAILFILE
+		echo "\nEnd of report: `date`" >> $MAILFILE
+
+		echo "See $LOGFILE for complete details." >> $MAILFILE
+		export MAILSUBJECT="$DBSERVER: Process(es) blocked longer than $SECSBLOCKED seconds"
+		sendMail
+
+		test "$PAGEDEST" && sendPage
+	else
+		echo "No blocking found" >> $LOGFILE
+	fi
+	exit 0
+fi

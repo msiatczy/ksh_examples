@@ -1,0 +1,220 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dropLogin.scr -U <user> -login <user to be dropped>|-L <login list> -S <DBSERVER>|<LOB>|all {-dropuser}
+#
+#  Description: Drop one user or a list of users from one or all databases on a dbserver
+#
+#     Location:	/sccm/dba/sybase/scripts/dropLogin.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<user> - login of the user running the drop
+#		<login> - login to be dropped
+#		<login list> - list of logins to be dropped
+#
+#  Modification History:
+#       07/25/05 M. Siatczynski Initial script
+#       09/22/05 M. Siatczynski Changed USER to EXEUSER (USER is a unix env variable)
+#       02/07/06 M. Siatczynski Add all option to -S parm, allow script to be run by non-sa user, use EXEISQL call
+#       08/27/06 M. Siatczynski Add code to detect when login can't be dropped because it is currently active
+#       12/11/06 M. Siatczynski Remove the login from dba..locked_logins, if it exists
+#       05/13/10 M. Siatczynski Skip execute of sp_delete_locked_login if proc does not exist (accommodated evg ASEs)
+#       09/13/10 M. Siatczynski add -dropuser parm to allow call to dropUser.scr
+#       04/26/11 M. Siatczynski Update code to accommodate LOB designation for ASE
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -U <user> -login <user to be dropped>|-L <login list> -S <DBSERVER>|<LOB>|all {-dropuser}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-U)		export EXEUSER=$2;shift 2;;
+			-login)		export ONELOGIN=$2;shift 2;;
+			-L)		export INPUTLIST=$2;shift 2;;
+			-S)		export ONEDBSERVER=$2;shift 2;;
+			-dropuser)	export DROPUSER=1;shift 1;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$EXEUSER" -o ! "$ONEDBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# either login name or list must be passed
+if [ ! "$ONELOGIN" -a ! "$INPUTLIST" ]
+then
+	echo $USAGE
+	echo "ERROR - login name or list of logins MUST be passed"
+	exit 1
+fi
+
+# default DROPUSER flag to 0 if not passed
+test ! "$DROPUSER" && export DROPUSER=0
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export SQLFILE=/tmp/usersql.$$
+export SQLOUT=/tmp/sqlout.$$
+export LOGINLIST=/tmp/loginlist.$$
+export LOGFILE=$LOGDIR/useradmin/central/dropLogin.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $LOGINLIST && \rm -f $LOGINLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create a working login list
+#------------------------------------------------------------------------------
+if [ "$INPUTLIST" ]
+then
+	if [ ! -s $INPUTLIST ]
+	then
+		echo "ERROR - $INPUTLIST does not exist or is 0 bytes"
+		exit 1
+	else
+		cat $INPUTLIST > $LOGINLIST
+	fi
+else
+	echo $ONELOGIN > $LOGINLIST
+fi
+
+#------------------------------------------------------------------------------
+# Create working list of ASEs
+# If a LOB is passed, get the list for that LOB, if all, then all, else single ASE
+#------------------------------------------------------------------------------
+validateLob $ONEDBSERVER
+if [ $? -eq 0 ]
+then
+	getAseList $ONEDBSERVER > $DBSERVERLIST
+else
+	if [ "$ONEDBSERVER" = "all" ]
+	then
+		getAseList > $DBSERVERLIST
+	else
+		echo $ONEDBSERVER > $DBSERVERLIST
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# Format the SQL
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "use master" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $LOGINLIST |
+while read LOGIN
+do
+	echo "if exists (select name from master..syslogins where name = \"$LOGIN\")" >> $SQLFILE
+	echo "begin" >> $SQLFILE
+	echo "print \"Dropping LOGIN ($LOGIN) from %1!\",@@servername" >> $SQLFILE
+	echo "execute sp_droplogin $LOGIN" >> $SQLFILE
+	echo "end" >> $SQLFILE
+	echo "else" >> $SQLFILE
+	echo "print \"LOGIN ($LOGIN) doesn't exist on %1!\",@@servername" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	echo "if not exists (select name from master..syslogins where name = \"$LOGIN\")" >> $SQLFILE
+	echo "begin" >> $SQLFILE
+	echo "if exists (select name from sybsystemprocs..sysobjects where name = \"sp_delete_locked_login\")" >> $SQLFILE
+	echo "begin" >> $SQLFILE
+	echo "execute sp_delete_locked_login $LOGIN" >> $SQLFILE
+	echo "end" >> $SQLFILE
+	echo "else" >> $SQLFILE
+	echo "print \"Custom password procs do not exist on %1!\",@@servername" >> $SQLFILE
+	echo "end" >> $SQLFILE
+	echo "else" >> $SQLFILE
+	echo "print \"LOGIN ($LOGIN) still exists on %1!\",@@servername" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# append the output to the logfile
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Login drop" >> $LOGFILE
+echo "The following logins will be dropped:" >> $LOGFILE
+cat $LOGINLIST >> $LOGFILE
+
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	if [ $DROPUSER -eq 1 ]
+	then
+		$SCRDIR/dropUser.scr -U $ADMINLOGIN -D all -S $DBSERVER -L $LOGINLIST | tee -a $LOGFILE
+		test $? -ne 0 && export HIGHRC=1
+	fi
+
+	echo "Dropping logins on $DBSERVER..." >> $LOGFILE
+	getPass $DBSERVER $EXEUSER | $ISQLEXE -U$EXEUSER -S$DBSERVER -w200 -e -i$SQLFILE > $SQLOUT
+
+	cat $SQLOUT >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# check output
+# Report on logins that were dropped
+# Check for errors
+# If no errors, check to see if account is still active (not reported as Msg:)
+#------------------------------------------------------------------------------
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "LOGIN drop FAILED for $DBSERVER" | tee -a $LOGFILE
+	else
+		export INACTIVE=1
+		grep 'account is currently active' $SQLOUT > /dev/null
+		export INACTIVE=$?
+		if [ $INACTIVE -eq 1 ]
+		then
+			echo "LOGIN drop SUCCESSFUL for $DBSERVER" | tee -a $LOGFILE
+		else
+			export HIGHRC=1
+			echo "LOGIN drop FAILED for $DBSERVER - Account still active" | tee -a $LOGFILE
+		fi
+	fi
+done
+
+echo "`date` END Login drop" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+        echo "DROP LOGIN script FAILED - output in $LOGFILE\n"
+        exit 1
+else
+        echo "DROP LOGIN script SUCCESSFUL - output in $LOGFILE\n"
+        exit 0
+fi

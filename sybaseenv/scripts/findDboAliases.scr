@@ -1,0 +1,124 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findDboAlias.scr -S <DBSERVER> -D <database>
+#
+#  Description: Find dbo aliases in all databases or specific database
+#
+#     Location:	/sccm/dba/sybase/scripts/findDboAlias.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	-S DBSERVER
+#              	-D dbname
+#
+#
+#  Modification History:
+#	12/30/02 M. Siatczynski	Initial Script
+#	04/15/03 M. Siatczynski	Remove local DATETIME variable - use global
+#	02/05/04 M. Siatczynski	Centralized script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -D)	export DBNAME=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQL1 && \rm -f $SQL1
+	test $DBNAMELIST && \rm -f $DBNAMELIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Use this to describe major sections of code
+#--------------------------------------------------------------------------
+export DBNAMELIST=/tmp/dbnamelist.$$
+export SQL1=/tmp/dboalias.sql1.$$
+
+#--------------------------------------------------------------------------
+# If a single dbname is passed, put it in the list, otherwise
+# generate a list of all DBs on the server (excluding tempdb)
+# Also set OUTFILE, depending on DBNAME
+#--------------------------------------------------------------------------
+> $DBNAMELIST
+if [ "$DBNAME" ]
+then
+	echo $DBNAME >> $DBNAMELIST
+	export OUTFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.$DBNAME.findDboAlias.$DATETIME
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password >> $DBNAMELIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from sysdatabases where name <> 'tempdb' order by name
+	go
+	!
+	export OUTFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.findDboAlias.$DATETIME
+fi
+
+#--------------------------------------------------------------------------
+# Format the sql statements to query sysalternates
+#--------------------------------------------------------------------------
+> $SQL1
+for DBNAME in `cat $DBNAMELIST`
+do
+	export DBNAME
+	echo "use $DBNAME" >> $SQL1
+	echo "go" >> $SQL1
+	echo "set nocount on" >> $SQL1
+	echo "go" >> $SQL1
+	echo "select @@servername+\" \"+db_name()+\" \"+suser_name(suid) from sysalternates where altsuid = 1" >> $SQL1
+	echo "go" >> $SQL1
+
+done
+
+#--------------------------------------------------------------------------
+# Pipe in the sql to query sysalternates
+#--------------------------------------------------------------------------
+> $OUTFILE
+
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQL1 | grep -v Password | sed -e 's/^ //g' -e 's/  *$//g' >> $OUTFILE
+
+#------------------------------------------------------------------------------
+# check for SQL errors
+#------------------------------------------------------------------------------
+checkSqlErr $OUTFILE
+if [ $? -eq 1 ]
+then
+	echo "\nScript FAILED"
+	echo "Review output in $OUTFILE\n"
+	exit 1
+else
+	echo "\nScript SUCCESSFUL"
+	if [ -s $OUTFILE ]
+	then
+		echo "Review output in $OUTFILE\n"
+	else
+		echo "No DBO aliases in any databases on $DBSERVER\n"
+	fi
+	exit 0
+fi

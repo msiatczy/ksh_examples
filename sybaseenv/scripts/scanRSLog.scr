@@ -1,0 +1,288 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: scanRSLog.scr -S <dbserver> {-m <maildest> -p <pagedest> -pagerange -restart}
+#
+#  Description: Scan the RS errorlog. Always send an email, send page if parm is passed.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	12/31/01 M. Siatczynski	Commented out 'Error' and 'Invalid' since these are part of table names that show up in the errorlog
+#				Any valid errors (lines starting with 'E.') contain 'ERROR'
+#	01/17/03 M. Siatczynski	Commented out 'shutdown' - any errors associated with a shutdown should be picked up on another line
+#	04/02/03 M. Siatczynski	Added ERROR #14082 to page exceptions list
+#	07/09/03 M. Siatczynski	Added code to detect a fatal shutdown error and attempt a restart
+#	08/03/04 M. Siatczynski	Call startRS.scr from new central scripts location
+#	08/18/04 M. Siatczynski	Centralized script - converted to same format and logig as scanAseLog.scr
+#				Added '^E\. ' to list of worries
+#	03/22/05 M. Siatczynski Added "WARNING #6047" and "SQM_ADD_SEGMENT" to list of worries
+#				Added "WARNING #6089,6090" and "WARNING: Stable Storage Use" to list of worries
+#	10/08/08 M. Siatczynski Add checks for specific SySAM messages
+
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <REPSERVER> {-m <maildest> -p <pagedest> -pagerange -restart}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)		export REPSERVER=$2;shift 2;;
+                        -m)		export MAILTO=$2;shift 2;;
+                        -p)		export PAGETO=$2;shift 2;;
+                        -pagerange)     export PAGERANGE=1;shift 1;;
+			-restart)	export RESTART=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$REPSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$PAGERANGE" && export PAGERANGE=0
+test ! "$RESTART" && export RESTART=0
+
+# profile must be sourced after setting REPSERVER
+export SETREPSERVER=$REPSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+## reset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+## reset the centrally-set MAILDEST variable if a different maildest was passed
+test "$PAGETO" && export PAGEDEST=$PAGETO || unset PAGEDEST
+test "$MAILTO" && export MAILDEST=$MAILTO
+
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export RSLOG=$SYBASE/$SYBASE_REP/install/errorlog_${REPSERVER}
+export STARTCTL=$CTLDIR/$REPSERVER/$REPSERVER.scanRSLog.startline
+export LASTLINECTL=$CTLDIR/$REPSERVER/$REPSERVER.scanRSLog.lastline
+export TEMPLASTLINE=/tmp/lastline.$$
+export TEMPLOG=/tmp/templog.$$
+export FERR_FILE=/tmp/filtered_errors.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export TEMPPAGEMSG=/tmp/temp.pagemsg.$$
+export WORRIES=/tmp/worries.$$
+export IGNORE=/tmp/ignore.$$
+export PAGE_EXCEPT=/tmp/page_except.$$
+export SCANLOG=$LOGDIR/misc/$REPSERVER/$REPSERVER.scanRSLog.$MMYYYY
+export EXIT_ERROR=/tmp/RS.fatal_error.$$
+export EXIT_FILE=/tmp/RS.fatalmsg.$$
+
+if [ ! -f $RSLOG ]
+then
+	echo $CALLED
+	echo "ERROR - $RSLOG does not exist on `hostname`"
+	exit 1
+fi
+
+# If a startline control file does not exist, create one and initialize with line 1
+if [ ! -f $STARTCTL ]
+then
+	echo 1 > $STARTCTL
+fi
+
+# If a lastline control file does not exist, create one
+if [ ! -f $LASTLINECTL ]
+then
+	> $LASTLINECTL
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TEMPLASTLINE && \rm -f $TEMPLASTLINE
+	test -f $TEMPLOG && \rm -f $TEMPLOG
+	test -f $FERR_FILE && \rm -f $FERR_FILE
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+	test -f $TEMPPAGEMSG && \rm -f $TEMPPAGEMSG
+	test -f $WORRIES && \rm -f $WORRIES
+	test -f $IGNORE && \rm -f $IGNORE
+	test -f $PAGE_EXCEPT && \rm -f $PAGE_EXCEPT
+	test -f $EXIT_ERROR && \rm -f $EXIT_ERROR
+	test -f $EXIT_FILE && \rm -f $EXIT_FILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#---------------------------------------------------------------------------------------
+# Define worries
+#---------------------------------------------------------------------------------------
+> $WORRIES
+
+print "^E\. " >> $WORRIES
+print "ERROR" >> $WORRIES
+print "Msg" >> $WORRIES
+print "stack trace" >> $WORRIES
+print "fatal" >> $WORRIES
+print "Failed" >> $WORRIES
+print "sddone"  >> $WORRIES
+print "Unable" >> $WORRIES
+print "denied" >> $WORRIES
+print "infected" >> $WORRIES
+print "I/O error" >> $WORRIES
+print "Bad file number" >> $WORRIES
+print "parallel transaction" >> $WORRIES
+print "kernel" >> $WORRIES
+print "WARNING #6047" >> $WORRIES
+print "SQM_ADD_SEGMENT" >> $WORRIES
+print "WARNING #6089" >> $WORRIES
+print "WARNING #6090" >> $WORRIES
+print "WARNING: Stable Storage Use" >> $WORRIES
+print "SySAM: WARNING:" >> $WORRIES
+print "SySAM: Checked out license" >> $WORRIES
+
+#---------------------------------------------------------------------------------------
+# Define worries that can be ignored (more detailed text)
+# Currently nothing for repserver, but keep to be consistent with scanAseLog.scr - may use in future
+#---------------------------------------------------------------------------------------
+> $IGNORE
+
+#---------------------------------------------------------------------------------------
+# Define paging exceptions
+#---------------------------------------------------------------------------------------
+> $PAGE_EXCEPT
+print "parallel transaction" >> $PAGE_EXCEPT
+print "ERROR #14082" >> $PAGE_EXCEPT
+print "WARNING #6047" >> $PAGE_EXCEPT
+print "SQM_ADD_SEGMENT" >> $PAGE_EXCEPT
+
+#---------------------------------------------------------------------------------------
+# Define fatal error for which a restart should be attempted
+#---------------------------------------------------------------------------------------
+> $EXIT_ERROR
+print "^T\. .* Exiting due to a fatal error" >> $EXIT_ERROR
+
+#---------------------------------------------------------------------------------------
+# Compare the last line of the current errorlog with the last line previously scanned
+# If the lines are identical, then there are no new messages to scan
+#---------------------------------------------------------------------------------------
+export CONTINUESCAN=1
+tail -1 $RSLOG > $TEMPLASTLINE
+cmp -s $LASTLINECTL $TEMPLASTLINE && export CONTINUESCAN=0 || export CONTINUESCAN=1
+
+# the entries to SCANLOG are somewhat informational so we can verify that the new script is working properly
+if [ $CONTINUESCAN -eq 0 ]
+then
+        echo "`date +'%D %T'` : No new entries in $RSLOG" >> $SCANLOG
+	exit 0
+else
+        echo "`date +'%D %T'` : Scanning $RSLOG" >> $SCANLOG
+fi
+
+#---------------------------------------------------------------------------------------
+# Grab all messages in the errorlog since the last scan
+# wc -l < filename will print only the linecount and not filename
+#---------------------------------------------------------------------------------------
+export STARTLINE=`cat $STARTCTL`
+test ! "$STARTLINE" && export STARTLINE=1
+
+# get the total number of lines in the current errorlog
+# If STARTLINE > TOTALLINES then the errorlog has been rolled--restart at the begining of the log
+export TOTALLINES=`wc -l < $RSLOG`
+test $STARTLINE -gt $TOTALLINES && export STARTLINE=1
+
+# Grab all lines from the errorlog, starting with STARTLINE to the end of the file
+tail +$STARTLINE $RSLOG > $TEMPLOG
+
+# store new starting point
+export NUMLINES=`wc -l < $TEMPLOG`
+export NEWSTARTLINE=`expr $STARTLINE + $NUMLINES`
+echo $NEWSTARTLINE > $STARTCTL
+tail -1 $TEMPLOG > $LASTLINECTL
+
+#---------------------------------------------------------------------------------------
+# If a valid templog was created, search for worries in the temp log.
+# grep out the ignore messages (if there are any)
+#---------------------------------------------------------------------------------------
+if [ ! -f $TEMPLOG ]
+then
+	echo "ERROR - Unable to scan $REPSERVER:$RSLOG"
+	exit 1
+else
+	if [ -f $WORRIES -a -f $TEMPLOG ]
+	then
+		if [ -s $IGNORE ]
+		then
+			egrep -f $WORRIES $TEMPLOG | egrep -vf $IGNORE > $FERR_FILE
+		else
+			egrep -f $WORRIES $TEMPLOG > $FERR_FILE
+		fi
+	fi
+fi
+
+#---------------------------------------------------------------------------------------
+# If the filtered error file is not empty then there are valid errors
+# MAIL all messages in the temp error file
+#---------------------------------------------------------------------------------------
+if [ -s $FERR_FILE ]
+then
+	> $MAILFILE
+	print $REPSERVER >> $MAILFILE
+	cat $FERR_FILE >> $MAILFILE
+	export MAILSUBJECT="SCAN LOG: Check $REPSERVER"
+	sendMail
+
+#---------------------------------------------------------------------------------------
+# if PAGEDEST is set, then filter page exceptions and send PAGE
+# NOTE:  the parm order on egrep must be -vf NOT -fv (the filename must immediately follow the 'f')
+# Do not strip any fields of the errorlog format from the page message
+# REPSERVER is passed to sendPage so pagerange can be validated if -pagerange parm is passed
+#---------------------------------------------------------------------------------------
+	if [ "$PAGEDEST" ]
+	then
+		> $PAGEMSG
+		> $TEMPPAGEMSG
+		print -n "$REPSERVER:" >> $PAGEMSG
+		egrep -vf $PAGE_EXCEPT $FERR_FILE >> $TEMPPAGEMSG
+
+		if [ -s $TEMPPAGEMSG ]
+		then
+			cat $TEMPPAGEMSG >> $PAGEMSG
+			sendPage $REPSERVER
+		fi
+	fi
+
+#---------------------------------------------------------------------------------------
+# Check for the exit error
+# If a fatal error occurred and restart flag is passed, call script to restart repserver
+#---------------------------------------------------------------------------------------
+	egrep -f $EXIT_ERROR $FERR_FILE > $EXIT_FILE
+	if [ -s $EXIT_FILE -a $RESTART -eq 1 ]
+	then
+		if [ "$PAGEDEST" ]
+		then
+			$SCRDIR/startRS.scr -S $REPSERVER -m $MAILDEST -p $PAGEDEST
+		else
+			$SCRDIR/startRS.scr -S $REPSERVER -m $MAILDEST
+		fi
+	fi
+fi	
+#---------------------------------------------------------------------------------------
+# Exit
+#---------------------------------------------------------------------------------------
+exit 0

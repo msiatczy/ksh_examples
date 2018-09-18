@@ -1,0 +1,163 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: estStatSteps.scr -S <DBSERVER> {-D <dbname>|<DB list>}
+#
+#  Description: Estimate number of steps needed for tables in one or more databases on an ASE.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER>
+#              	<DBSPEC> - single database or list of databases
+#
+#  Modification History:
+#	07/20/09 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>|<DB list>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 2
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBSPEC=$2;shift 2;;
+                        -*)     echo $USAGE;exit 2;;
+                        *)      echo $USAGE;exit 2;;
+                esac
+        done
+fi
+
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 2
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/dblist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export HIGHRC=0
+
+export LOGFILE=$LOGDIR/stats/$DBSERVER/$DBSERVER.estStatSteps.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` $DBSERVER: BEGIN Estimate statistical steps required for each table" >> $LOGFILE
+
+#------------------------------------------------------------------------------------
+# format list of databases
+# if a file is passed, make sure it's > 0 bytes
+# if it's not clearly a file, make sure it's not an invalid filename
+#------------------------------------------------------------------------------------
+if [ "$DBSPEC" ]
+then
+# make sure control file exists and has entries
+	if [ -f $DBSPEC ]
+	then
+		if [ -s $DBSPEC ]
+		then
+			cat $DBSPEC > $DBLIST
+		else
+			echo "WARNING - $DBSPEC is 0 bytes" | tee -a $LOGFILE
+			exit 1
+		fi
+	else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+		echo $DBSPEC | grep '/' > /dev/null
+		if [ $? -eq 0 ]
+		then
+			echo "ERROR - $DBSPEC is not valid--possible invalid filename?"
+			exit 2
+		else
+			echo $DBSPEC > $DBLIST
+		fi
+	fi
+else
+	getDbList -S $DBSERVER -user > $DBLIST
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - getting list of databases from $DBSERVER" | tee -a $LOGFILE
+		cat $DBLIST | tee -a $LOGFILE
+		exit 2
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# Format SQL
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+
+	echo "use $DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	echo "if db_name() = \"$DBNAME\"" >> $SQLFILE
+	echo "begin" >> $SQLFILE
+
+	echo "select @@servername,db_name(),convert(char(40),name),'numsteps'=" >> $SQLFILE
+	echo "case when (data_pages(db_id(),id)/10000) < 20 then 20" >> $SQLFILE
+	echo "when (data_pages(db_id(),id)/10000) > 2000 then 2000" >> $SQLFILE
+	echo "else (data_pages(db_id(),id)/10000)" >> $SQLFILE
+	echo "end" >> $SQLFILE
+	echo "from sysobjects where type = 'U' order by numsteps" >> $SQLFILE
+
+	echo "end" >> $SQLFILE
+
+	echo "go" >> $SQLFILE
+done
+
+#------------------------------------------------------------------------------
+# Execute SQL
+# Check for errors
+# Exit with return code
+#------------------------------------------------------------------------------
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i $SQLFILE | grep -v Password > $SQLOUT
+
+
+checkSqlErr $SQLOUT
+if [ $? -eq 0 ]
+then
+	echo "SUCCESSFUL - Output in $LOGFILE"
+	cat $SQLOUT >> $LOGFILE
+	exit 0
+else
+	echo "ERROR - Executing SQL against $DBSERVER" | tee -a $LOGFILE
+	cat $SQLOUT >> $LOGFILE
+	exit 2
+fi

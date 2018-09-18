@@ -1,0 +1,120 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: xrefSysusersCorporate.scr -S <DBSERVER> {-D <dbname>}
+#
+#  Description: Compare sysusers in one more more databases to corporate..g_employee
+#
+#     Location:	/sccm/dba/sybase/scripts/xrefSysusersCorporate.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server name
+#              	<dbname> - database name
+#
+#
+#  Modification History:
+#	02/10/04 M. Siatczynski	Initial Script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/dblist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export OUTFILE=$RPTDIR/useradmin/$DBSERVER/$DBSERVER.xrefSysusersCorporate.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+#--------------------------------------------------------------------------
+if [ "$DBNAME" ]
+then
+	echo $DBNAME > $DBLIST
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases order by name
+	go
+	!
+fi
+
+#--------------------------------------------------------------------------
+# Format SQL
+#--------------------------------------------------------------------------
+> $SQLFILE
+
+cat $DBLIST |
+while read DB
+do
+	export DB
+	echo "use $DB" >> $SQLFILE	
+	echo "go" >> $SQLFILE
+	echo "select dbserver_database=convert(char(25),@@servername+' '+db_name()),sysusers_name=u.name,corp_login=c.login_name,corp_name=convert(char(30),c.first_name+' '+c.last_name),"status"=c.status_code" >> $SQLFILE
+	echo "from sysusers u, corporate..g_employee c" >> $SQLFILE
+	echo "where charindex(c.login_name,u.name) > 0" >> $SQLFILE
+	echo "order by sysusers_name" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#------------------------------------------------------------------------------
+# pipe in the sql
+#------------------------------------------------------------------------------
+> $OUTFILE
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -i$SQLFILE | grep -v Password >> $OUTFILE
+
+#------------------------------------------------------------------------------
+# check for errors
+#------------------------------------------------------------------------------
+checkSqlErr $OUTFILE
+if [ $? -eq 1 ]
+then
+	echo "\nScript FAILED"
+	echo "Review output in $OUTFILE\n"
+	exit 1
+else
+	echo "\nScript SUCCESSFUL"
+	echo "Review output in $OUTFILE\n"
+	exit 0
+fi

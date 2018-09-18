@@ -1,0 +1,524 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getTransparencyData.scr -S <DBSERVER> | -all
+#
+#  Description: Gather Sybase data needed for IT Transparency project
+#
+#     Location:	/sccm/dba/sybase/scripts/getTransparencyData.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  NOTE1:  Predefined compression factor is .30
+#  NOTE2:  THIS SCRIPT STILL NEEDS ERROR CHECKING.
+#
+#
+#  Modification History:
+#	12/09/03 M. Siatczynski	Initial Script
+#	12/15/03 M. Siatczynski	add chmod 777 to XML files so they can be opened from NT side
+#	01/13/04 M. Siatczynski	Changed grep of service-names to look for HN at beginning of line (^)
+#	01/23/04 M. Siatczynski	Use rsh to obtain hostname for service name if not available from service-names files
+#	01/26/04 M. Siatczynski	Account for databases that have dumps on disk AND tape
+#				Add exclusion list processing
+#	01/29/04 M. Siatczynski	cd to service-names directory within variable setting
+#	02/13/04 M. Siatczynski	Change code to allow for 900 level errors when running sp_dbfull_transparency
+#	05/06/04 M. Siatczynski	Redo calcuations to account for weekly dev/test backups
+#	06/03/04 M. Siatczynski	Add logic to account for empty exclude list
+#	06/21/04 M. Siatczynski	Added grep to ignore header in ASEDIRLIST
+#				Use ASEDIRLIST rather than aseStatus.lst
+#	12/29/04 M. Siatczynski	Changed rsh to ssh
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	01/02/07 M. Siatczynski	Code to handle $RPTDIR on multiple NAS locations
+#				Add LOGFILE to log progress
+#				Add HIGHRC
+#	03/09/07 M. Siatczynski	Change grep of SN to correctly identify SN as the only thing on the line
+#	06/15/10 M. Siatczynski	Get host name via ssn to service name, do not rely on service name files (not up to date)
+#	01/21/11 M. Siatczynski	Direct stderr from ssh to /dev/null to avoid capture of WARNING (/etc/banner) introduced with latest OS patch
+#	02/18/11 M. Siatczynski	Direct stderr from scp to /dev/null to avoid capture of WARNING (/etc/banner) introduced with latest OS patch
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> | -all"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -all)   export ALL=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$ALL" && export ALL=0
+
+if [ "$ONEDBSERVER" -a $ALL -eq 1 ]
+then
+        echo $USAGE
+        echo "ERROR - DBSERVER and -all are mutually exclusive"
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SQLFILE=/tmp/sqlfile.$$
+export DBSERVERLIST=/tmp/list.$$
+export SPACEINFO=/tmp/spaceinfo.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBDETAIL=/tmp/dbdetail.$$
+export DGLIST=/tmp/dglist.$$
+export TODAY=`date +"%d-%b-%Y`
+export DATASERVER_SEDFILE=/tmp/ds.sedfile.$$
+export DBSCHEMA_SEDFILE=/tmp/db.sedfile.$$
+export DATASERVER_TEMPLATE=$CTLDIR/transparencyDataserverXml.template
+export DBSCHEMA_TEMPLATE=$CTLDIR/transparencyDbschemaXml.template
+export DATASERVER_XML=/sccm/transparency/dba/syb_ds_`date +%Y%m%d`.xml
+export DBSCHEMA_XML=/sccm/transparency/dba/syb_db_`date +%Y%m%d`.xml
+export EXCLUDE_LIST=$CTLDIR/transparencyExclude.lst
+export LOGFILE=$LOGDIR/central/getTransparencyData.$DATETIME
+export HIGHRC=0
+
+# these will go away - leave for debugging for now
+export DATASERVER_DATA=$ADHOCDIR/sybase_dataserver.data
+export DBSCHEMA_DATA=$ADHOCDIR/sybase_dbschema.data
+
+> $DATASERVER_DATA
+echo "DBSERVER^SN^HN^TODAY^STATUS^Y^sybase^USERDB^FREE^OH^CAPACITY^NASBACKUP^SUMTAPEBACKUP" >> $DATASERVER_DATA
+> $DBSCHEMA_DATA
+echo "DBSERVER^SN^HN^TODAY^DBSCHEMA^Y^DBALLOC^DBUSED^DBNASBACKUP^DBTAPEBACKUP^GENERATIONS^NUMNASDAYS^COMPRATIO^AVGDAILYNASMB^NUMTAPEWIWEEK" >> $DBSCHEMA_DATA
+
+echo "<data_server>" > $DATASERVER_XML
+echo "<dbschema>" > $DBSCHEMA_XML
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $SPACEINFO && \rm -f $SPACEINFO
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $DBDETAIL && \rm -f $DBDETAIL
+	test -f $DATASERVER_SEDFILE && \rm -f $DATASERVER_SEDFILE
+	test -f $DBSCHEMA_SEDFILE && \rm -f $DBSCHEM_SEDFILE
+	test -f $DGLIST && \rm -f $DGLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Write log headers
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START - Get transparency data" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+#  Format SQL file to get disk info
+#--------------------------------------------------------------------------
+echo "`date` Format SQL to get disk info" >> $LOGFILE
+
+> $SQLFILE
+
+# get user and system db allocated
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+echo "select" >> $SQLFILE
+echo "'dbname'=db_name(dbid)," >> $SQLFILE
+echo "'dbclass'=" >> $SQLFILE
+echo "case" >> $SQLFILE
+echo "when" >> $SQLFILE
+echo "	db_name(dbid) in ('master','model','sybsystemprocs','sybsystemdb','dba') or" >> $SQLFILE
+echo "	db_name(dbid) like 'dbcc%' or" >> $SQLFILE
+echo "	db_name(dbid) like 'sybsecurity%' or" >> $SQLFILE
+echo "	db_name(dbid) like 'tempdb%'" >> $SQLFILE
+echo "then 'SystemDB'" >> $SQLFILE
+echo "else 'UserDB'" >> $SQLFILE
+echo "end" >> $SQLFILE
+echo ",'mballoc'=sum(size)/512" >> $SQLFILE
+echo "into #dballoc" >> $SQLFILE
+echo "from master..sysusages" >> $SQLFILE
+echo "group by db_name(dbid)" >> $SQLFILE
+
+echo "select @@servername+' '+dbclass+' '+convert(char,(sum(mballoc))) from #dballoc group by dbclass" >> $SQLFILE
+
+echo "drop table #dballoc" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+# total disk inited (capacity)
+echo "select @@servername+' DiskInit '+convert(char,(sum(((high+1)-low)/512))) from master..sysdevices where cntrltype = 0" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+# mirrored devices (if any)
+echo "select @@servername+' Mirrored '+convert(char,(sum(((high+1)-low)/512))) from master..sysdevices where cntrltype = 0 and mirrorname is not null" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#--------------------------------------------------------------------------
+#  Generate list of servers to process
+#--------------------------------------------------------------------------
+echo "`date` Generate list of ASEs" >> $LOGFILE
+
+if [ "$ONEDBSERVER" ]
+then
+	grep "^${ONEDBSERVER} " $ASEDIRLIST | cut -d" " -f1-3 > $DBSERVERLIST
+else
+	test -s $EXCLUDE_LIST && grep -v '^#' $ASEDIRLIST | cut -d" " -f1-3 | egrep -vf $EXCLUDE_LIST > $DBSERVERLIST || grep -v '^#' $ASEDIRLIST | cut -d" " -f1-3 > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+#  Process each server in the list
+#--------------------------------------------------------------------------
+echo "`date` Process the following ASEs:" >> $LOGFILE
+cat $DBSERVERLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+cat $DBSERVERLIST |
+while read DBSERVER SN SYBDIR
+do
+	export DBSERVER SN SYBDIR
+
+	echo "`date` Getting data for $DBSERVER on $SN" >> $LOGFILE
+
+	export NASBACKUP=0
+	export TAPEBACKUP=0
+
+# sum variables
+	export SUMNASBACKUP=0
+	export SUMTAPEBACKUP=0
+	export INCSIZE=0
+
+# get the software disk alloc, send stderr (WARNING message) to /dev/null
+	export SOFTKB=`/usr/local/bin/ssh -n $SN df -k $SYBDIR 2>/dev/null | grep -v '^Filesystem' | sed 's/  */ /g' | cut -d" " -f2`
+	export SOFTMB=`echo $SOFTKB | awk '{print $1 * 1024 / 1048576}'`
+
+# query the service-names files for the hostname
+# 6/2010 - service-names files have not been maintained, ultimately need to use /apps/OSscripts/srvnamesLOC
+# For now, ssh to service name to get host, since this logic was already in script
+# match beginning end of line to account for "2" instances
+	unset HN
+# next 5 lines commented out 6/15/2010
+#	cd /sccm/cfig/sysinfo/service-names
+#	if [ -f * ]
+#	then
+#		export HN=`grep "^${SN}$" * | cut -d":" -f1`
+#	fi
+# if HN not set, try ssh to get the hostname
+	if [ ! "$HN" ]
+	then
+# ssh to service name to get the hostname, send stderr (WARNING message) to /dev/null
+        	export HN=`/usr/local/bin/ssh -n $SN 'hostname' 2>/dev/null`
+
+	fi
+# if HN still not set, default to service name and print error message
+	if [ ! "$HN" ]
+	then
+		echo "ERROR - unable to obtain hostname for service name $SN - defaulting to service name" | tee -a $LOGFILE
+		export HN=$SN
+	fi
+
+# get prod/nonprod status
+	export ST=`grep "^${DBSERVER} " $ASEDIRLIST | cut -d" " -f5`
+	test "$ST" = "prod" && export STATUS=Y || export STATUS=N
+
+# get SAN/DAS indicator
+	export STORAGETYPE=`grep "^${DBSERVER} " $ASEDIRLIST | cut -d" " -f6`
+	if [ "$STORAGETYPE" != "SAN" -a "$STORAGETYPE" != "DAS" ]
+	then
+		echo "ERROR - $DBSERVER storage type must be SAN or DAS" | tee -a $LOGFILE
+		echo "Check storage type in $ASEDIRLIST" | tee -a $LOGFILE
+		echo "Skipping data collection for $DBSERVER" | tee -a $LOGFILE
+		export HIGHRC=1
+		continue
+	fi
+
+# get disk group name and total MB allocated to disk group
+	export DG=`grep "^${DBSERVER} " $ASEDIRLIST | cut -d" " -f7`
+	if [ ! "$DG" ]
+	then
+		echo "ERROR - $DBSERVER disk group is invalid" | tee -a $LOGFILE
+		echo "Check disk group name in $ASEDIRLIST" | tee -a $LOGFILE
+		echo "Skipping data collection for $DBSERVER" | tee -a $LOGFILE
+		export HIGHRC=1
+		continue
+	else
+		export SUMDGPG=0
+# send stderr (WARNING message) to /dev/null
+		/usr/local/bin/ssh -n $SN /usr/sbin/vxprint -d -g $DG 2>/dev/null | grep '^dm' | sed 's/  */ /g' | cut -d" " -f5 > $DGLIST
+		cat $DGLIST |
+		while read SIZE
+		do
+			export SUMDGPG=`echo $SUMDGPG $SIZE | awk '{print $1 + $2}'`	
+		done
+	fi
+	
+	export SUMDGMB=`echo $SUMDGPG | awk '{print $1 / 2048}'`	
+
+# get disk inited, user db alloc, systemdb alloc
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password | sed 's/^ //g' > $SPACEINFO
+
+# Check for sql errors
+	checkSqlErr $SPACEINFO
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - Unable to obtain data from $DBSERVER" | tee -a $LOGFILE
+		echo "Skipping data collection for $DBSERVER" | tee -a $LOGFILE
+		export HIGHRC=1
+		continue
+	fi
+
+	export USERDB=`grep "^${DBSERVER} UserDB" $SPACEINFO | cut -d" " -f3`
+	export SYSTEMDB=`grep "^${DBSERVER} SystemDB" $SPACEINFO | cut -d" " -f3`
+	export DISKINIT=`grep "^${DBSERVER} DiskInit" $SPACEINFO | cut -d" " -f3`
+	export FREE=`echo $DISKINIT $USERDB $SYSTEMDB | awk '{print $1 - $2 - $3}'`
+
+# CAPACITY is the total of all disk assigned to this dataserver
+	export CAPACITY=`echo $SOFTMB $SUMDGMB | awk '{print $1 + $2}'`
+
+# OH is CAPACITY - USERDB (space allocated to user dbschemas) - FREE (should not include space available to user DBs)
+	export OH=`echo $CAPACITY $USERDB $FREE | awk '{print $1 - $2 - $3}'`
+
+#--------------------------------------------------------------------------
+# Get the backup space utilization for each dbserver
+# NOTE:  BACKUP_DATAFILE MUST be set to same path/file as set in $SCRDIR/getTransparencyBackupSpace.scr
+# Dbschemas which go directly to tape will have NASBACKUP=0
+# ALWAYS bring the backup space report back to the NAS of the calling server, so this process continues to run from a single central call
+# RPTDIR NEEDS to resolve to the same path on all servers in order for this to work
+#--------------------------------------------------------------------------
+	export BACKUP_DATAFILE=$RPTDIR/backup/$DBSERVER/$DBSERVER.transparencyBackupSpace
+# initialize BACKUP_DATAFILE to avoid looking at last run's data
+	> $BACKUP_DATAFILE
+	/usr/local/bin/ssh -n $SN $SCRDIR/getTransparencyBackupSpace.scr -S $DBSERVER 2>/dev/null
+	if [ ! -s $BACKUP_DATAFILE ]
+	then
+# If BACKUP_DATAFILE is empty, then maybe it was created on the remote NAS instead of the local NAS
+# Get the value of the local NAS and the remote NAS and compare
+		export LOCALNAS=`df $RPTDIR | cut -d"(" -f2 | cut -d")" -f1 | cut -d":" -f1`
+		export REMOTENAS=`/usr/local/bin/ssh -n $SN df $RPTDIR 2>/dev/null | cut -d"(" -f2 | cut -d")" -f1 | cut -d":" -f1`
+# If LOCALNAS <> REMOTENAS, then copy the report from the remote NAS to the local NAS
+		if [ "$LOCALNAS" != "$REMOTENAS" ]
+		then
+			echo "`date` Copying $BACKUP_DATAFILE from $REMOTENAS(REMOTENAS) to $LOCALNAS(LOCALNAS)" >> $LOGFILE
+			/usr/local/bin/scp -p $SN:$BACKUP_DATAFILE $BACKUP_DATAFILE >> $LOGFILE 2>&1
+# If the report is still empty, then there was a problem collecting the data and continue with the next ASE
+			if [ ! -s $BACKUP_DATAFILE ]
+			then	
+				echo "ERROR - $DBSERVER backup info was not collected" | tee -a $LOGFILE
+				echo "Skipping backup space collection for $DBSERVER" | tee -a $LOGFILE
+				export HIGHRC=1
+				continue
+			fi
+		else
+			echo "ERROR - $DBSERVER backup info was not collected" | tee -a $LOGFILE
+			echo "Skipping backup space collection for $DBSERVER" | tee -a $LOGFILE
+			export HIGHRC=1
+			continue
+		fi
+	fi
+	export NASBACKUP=`grep "^$DBSERVER GRANDTOTAL" $BACKUP_DATAFILE | cut -d"=" -f2`
+
+#--------------------------------------------------------------------------
+# get detailed dbschema information for the dbserver
+#--------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $SQLOUT
+		`getPass $DBSERVER $ADMINLOGIN`
+		set nocount on
+		go
+		execute sp_dbfull_transparency
+		go
+		!
+
+# Check for sql errors
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - sp_dbfull_transparency failed on $DBSERVER" | tee -a $LOGFILE
+# debug line
+cat $SQLOUT
+# continue processing DBSERVER if there are ONLY 900 level errors (one or more databases unavailable)
+# otherwise, skip to the next DBSERVER
+		export MSGCOUNT=`grep -c 'Msg ' $SQLOUT`
+		export MSG900COUNT=`grep -c 'Msg 9[0-9][0-9]' $SQLOUT`
+		if [ $MSGCOUNT -eq $MSG900COUNT ]
+		then
+			echo "Only 900 level errors--continuing to process $DBSERVER" | tee -a $LOGFILE
+		else
+			echo "Errors other than 900 level errors--skipping further processing of $DBSERVER" | tee -a $LOGFILE
+			export HIGHRC=1
+			continue
+		fi
+	fi
+
+# parse the needed info out of the sql results
+	grep "^ ${DBSERVER} " $SQLOUT | sed -e 's/^ //g' -e 's/  */ /g' | cut -d" " -f1-4 > $DBDETAIL
+
+#--------------------------------------------------------------------------
+# Get the backup space utilization for each dbschema
+# SERVER is read, but not utilized--use DBSERVER from outer loop
+#--------------------------------------------------------------------------
+	cat $DBDETAIL |
+	while read SERVER DBSCHEMA DBALLOC DBUSED
+	do
+		export SERVER DBSCHEMA DBALLOC DBUSED
+		export DBNASBACKUP=0
+		export DBTAPEBACKUP=0
+		export AVGDAILYNASMB=0
+		export NUMTAPEWIWEEK=0
+
+# get GENERATIONS for calculation
+		export GENERATIONS=`grep "^$DBSERVER|$DBSCHEMA|" $BACKUP_DATAFILE | cut -d"|" -f3`
+		test ! "$GENERATIONS" && export GENERATIONS=0
+
+# get NUMNASDAYS for compression calculation
+		export NUMNASDAYS=`grep "^$DBSERVER|$DBSCHEMA|" $BACKUP_DATAFILE | cut -d"|" -f5`
+		test ! "$NUMNASDAYS" && export NUMNASDAYS=0
+
+# get the total NAS backup for the dbschema
+		export DBNASBACKUP=`grep "^$DBSERVER|$DBSCHEMA|" $BACKUP_DATAFILE | cut -d"|" -f4`
+		test ! "$DBNASBACKUP" && export DBNASBACKUP=0
+
+# get the number of backups for the dbschema
+		export NUMTAPEWIWEEK=`grep "^$DBSERVER|$DBSCHEMA|" $BACKUP_DATAFILE | cut -d"|" -f7`
+		test ! "$NUMTAPEWIWEEK" && export NUMTAPEWIWEEK=0
+
+# Calculate tape backup using compression ratio (.3 average)
+# this calc accounts for databases that have dumps on disk AND tape
+# If number of tape backups within week is 0 then tapebackup = nasbackup
+# MUST use awk to check value, ksh if can not handle decimals
+		export DBTAPEBACKUP=0
+		export DBTAPEBACKUP=`echo $DBNASBACKUP $DBUSED $NUMTAPEWIWEEK | awk '{if ( $3 != 0 ) {print $2 * .3 * $3 + $1} else {print $1}}'`
+
+# calculate the average daily size of a dbschema's backup set on NAS
+# It is possible for a database to have dumps on disk and dumps on tape - therefore, NUMNASDAYS must be > 0 in order to calculate daily NAS
+		export AVGDAILYNASMB=`grep "^$DBSERVER|$DBSCHEMA|" $BACKUP_DATAFILE | cut -d"|" -f10`
+		test ! "$AVGDAILYNASMB" && export AVGDAILYNASMB=0
+
+# calculate the incremental tape backup total
+# Add this to DBTAPEBACKUP to achieve the following formula:  (full nas + (incremental nas * 6))
+		export INCSIZE=`echo $AVGDAILYNASMB | awk '{print $1 * 6}'`
+		export DBTAPEBACKUP=`echo $DBTAPEBACKUP $INCSIZE | awk '{print $1 + $2}'`
+
+# sum variables
+		export SUMNASBACKUP=`echo $SUMNASBACKUP $DBNASBACKUP | awk '{print $1 + $2}'`
+		export SUMTAPEBACKUP=`echo $SUMTAPEBACKUP $DBTAPEBACKUP | awk '{print $1 + $2}'`
+
+# calc compression ratio - this will eventually be used to generate more accurate "direct to tape" numbers by dbschema
+# in order to calc COMPRATIO accurately, we really need to get the size of a level 0 dump and compare that to DBUSED -- NASBACKUP included tran log dumps which will result in a COMPRATIO value that is higher than it should be
+#		export COMPRATIO=`echo $DBNASBACKUP $GENERATIONS $DBUSED | awk '{if ( $1 > 0 && $2 > 0 ) {print $1 / $2 / $3} else {print 0}}'`
+		export AVGFULLNASMB=`grep "^$DBSERVER|$DBSCHEMA|" $BACKUP_DATAFILE | cut -d"|" -f9`
+		test ! "$AVGFULLNASMB" && export AVGFULLNASMB=0
+		export COMPRATIO=`echo $AVGFULLNASMB $DBUSED | awk '{if ( $1 > 0 ) {print $1 / $2 } else {print 0}}'`
+
+# print all values for sr_dbschema
+# THIS LINE IS WRITTEN TO THE DATA FILE FOR DEBUG PURPOSES
+	echo "$DBSERVER^$SN^$HN^$TODAY^$DBSCHEMA^Y^$DBALLOC^$DBUSED^$DBNASBACKUP^$DBTAPEBACKUP^$GENERATIONS^$NUMNASDAYS^$COMPRATIO^$AVGDAILYNASMB^$NUMTAPEWIWEEK" >> $DBSCHEMA_DATA
+#--------------------------------------------------------------------------
+# Format the sed files used to format the XML files
+# Do the replacements
+#--------------------------------------------------------------------------
+		> $DBSCHEMA_SEDFILE
+		echo "s/SUBDBSERVER/$DBSERVER/g" >> $DBSCHEMA_SEDFILE
+		echo "s/SUBSN/$SN/g" >> $DBSCHEMA_SEDFILE
+		echo "s/SUBHN/$HN/g" >> $DBSCHEMA_SEDFILE
+		echo "s/SUBDATE/$TODAY/g" >> $DBSCHEMA_SEDFILE
+		echo "s/SUBDBSCHEMA/$DBSCHEMA/g" >> $DBSCHEMA_SEDFILE
+		if [ "$STORAGETYPE" = "SAN" ]
+		then
+			echo "s/SUBSANALLOC/$DBALLOC/g" >> $DBSCHEMA_SEDFILE
+			echo "s/SUBSANUSED/$DBUSED/g" >> $DBSCHEMA_SEDFILE
+			echo "s/SUBDASALLOC/0/g" >> $DBSCHEMA_SEDFILE
+			echo "s/SUBDASUSED/0/g" >> $DBSCHEMA_SEDFILE
+		elif [ "$STORAGETYPE" = "DAS" ]
+		then
+			echo "s/SUBSANALLOC/0/g" >> $DBSCHEMA_SEDFILE
+			echo "s/SUBSANUSED/0/g" >> $DBSCHEMA_SEDFILE
+			echo "s/SUBDASALLOC/$DBALLOC/g" >> $DBSCHEMA_SEDFILE
+			echo "s/SUBDASUSED/$DBUSED/g" >> $DBSCHEMA_SEDFILE
+		else
+			echo "ERROR - $DBSERVER invalid storage type $STORAGETYPE" | tee -a $LOGFILE
+			echo "Check storage type in $ASEDIRLIST" | tee -a $LOGFILE
+			echo "Skipping data collection for $DBSERVER" | tee -a $LOGFILE
+			export HIGHRC=1
+			continue
+		fi
+		echo "s/SUBNASBACKUP/$DBNASBACKUP/g" >> $DBSCHEMA_SEDFILE
+		echo "s/SUBTAPEBACKUP/$DBTAPEBACKUP/g" >> $DBSCHEMA_SEDFILE
+
+		sed -f $DBSCHEMA_SEDFILE $DBSCHEMA_TEMPLATE >> $DBSCHEMA_XML
+	done
+
+# print all values for sr_data_server
+# THIS LINE IS WRITTEN TO THE DATA FILE FOR DEBUG PURPOSES
+	echo "$DBSERVER^$SN^$HN^$TODAY^$STATUS^Y^sybase^$USERDB^$FREE^$OH^$CAPACITY^$NASBACKUP^$SUMTAPEBACKUP" >> $DATASERVER_DATA
+#--------------------------------------------------------------------------
+# Format the sed files used to format the XML files
+# Do the replacements
+#--------------------------------------------------------------------------
+	> $DATASERVER_SEDFILE
+	echo "s/SUBDBSERVER/$DBSERVER/g" >> $DATASERVER_SEDFILE
+	echo "s/SUBSN/$SN/g" >> $DATASERVER_SEDFILE
+	echo "s/SUBHN/$HN/g" >> $DATASERVER_SEDFILE
+	echo "s/SUBDATE/$TODAY/g" >> $DATASERVER_SEDFILE
+	echo "s/SUBPRODIND/$STATUS/g" >> $DATASERVER_SEDFILE
+	if [ "$STORAGETYPE" = "SAN" ]
+	then
+		echo "s/SUBSANALLOC/$USERDB/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBSANFREE/$FREE/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBSANOH/$OH/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBSANCAP/$CAPACITY/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBDASALLOC/0/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBDASFREE/0/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBDASOH/0/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBDASCAP/0/g" >> $DATASERVER_SEDFILE
+	elif [ "$STORAGETYPE" = "DAS" ]
+	then
+		echo "s/SUBSANALLOC/0/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBSANFREE/0/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBSANOH/0/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBSANCAP/0/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBDASALLOC/$USERDB/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBDASFREE/$FREE/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBDASOH/$OH/g" >> $DATASERVER_SEDFILE
+		echo "s/SUBDASCAP/$CAPACITY/g" >> $DATASERVER_SEDFILE
+	else
+		echo "ERROR - $DBSERVER invalid storage type $STORAGETYPE" | tee -a $LOGFILE
+		echo "Check storage type in $ASEDIRLIST" | tee -a $LOGFILE
+		echo "Skipping data collection for $DBSERVER" | tee -a $LOGFILE
+		export HIGHRC=1
+		continue
+	fi
+	echo "s/SUBNASBACKUP/$NASBACKUP/g" >> $DATASERVER_SEDFILE
+	echo "s/SUBTAPEBACKUP/$SUMTAPEBACKUP/g" >> $DATASERVER_SEDFILE
+
+	sed -f $DATASERVER_SEDFILE $DATASERVER_TEMPLATE >> $DATASERVER_XML
+
+done
+
+echo "</data_server>" >> $DATASERVER_XML
+echo "</dbschema>" >> $DBSCHEMA_XML
+
+# chmod the file so it can be opened on the NT side
+chmod 777 $DATASERVER_XML
+chmod 777 $DBSCHEMA_XML
+
+#--------------------------------------------------------------------------
+# Write trailers
+# Exit the script
+#--------------------------------------------------------------------------
+echo "`date` END - Get transparency data" >> $LOGFILE
+
+test $HIGHRC -eq 1 && exit 1 || exit 0

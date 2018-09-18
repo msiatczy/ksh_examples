@@ -1,0 +1,157 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getDrDbDDL.scr -S <DBSERVER> {-D <dbname> -forload}
+#
+#  Description: Format DDL to create databases.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	04/14/04 M. Siatczynski	Initial Script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname> -forload}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -forload)    export FORLOAD=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$FORLOAD" && export FORLOAD=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBALLOCLIST=/tmp/dballoc.$$
+export DDLFILE=$SYBDRDIR/$DBSERVER/$DBSERVER.db.ddl
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $DBALLOCLIST && \rm -f $DBALLOCLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Format SQL statement
+#--------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+if [ "$DBNAME" ]
+then
+	echo "exec sp_dballoc $DBNAME" >> $SQLFILE
+else
+	echo "exec sp_dballoc" >> $SQLFILE
+fi
+echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# pipe in the sql
+# check for errors
+#------------------------------------------------------------------------------
+> $SQLOUT
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password >> $SQLOUT
+
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	echo "ERROR - getting dballoc information for $DBSERVER"
+	exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Strip out extra spaces from the output
+# Remove leading and trailing space(s)
+#------------------------------------------------------------------------------
+grep -v 'return status' $SQLOUT | sed -e 's/  */ /g' -e 's/^ //g' -e 's/ *$//g' > $DBALLOCLIST
+
+#------------------------------------------------------------------------------
+# format the create db statements
+#------------------------------------------------------------------------------
+> $DDLFILE
+export PREVDBNAME=""
+export PREVSEG=""
+export PREVMB=""
+export PREVDEV=""
+export FIRSTPASS=1
+
+cat $DBALLOCLIST |
+while read DBNAME SEG MB DEV
+do
+	export DBNAME SEG MB DEV
+	if [ "$PREVDBNAME" != "$DBNAME" ]
+	then
+		export FIRSTLOG=0
+		if [ $FIRSTPASS -eq 0 ]
+		then
+			test $FORLOAD -eq 1 && echo "for load\ngo" >> $DDLFILE || echo "go" >> $DDLFILE
+		fi
+		echo "create database $DBNAME on" >> $DDLFILE
+		echo "$DEV=$MB" >> $DDLFILE
+	else
+		if [ "$PREVSEG" = "$SEG" ]
+		then
+			echo ",$DEV=$MB" >> $DDLFILE
+		elif [ "$SEG" = "4" ]
+		then
+			echo "log on" >> $DDLFILE
+			echo "$DEV=$MB" >> $DDLFILE
+			export FIRSTLOG=1
+		elif [ $FIRSTLOG -eq 0 ]
+		then
+			echo ",$DEV=$MB" >> $DDLFILE
+		else
+			test $FORLOAD -eq 1 && echo "for load\ngo" >> $DDLFILE || echo "go" >> $DDLFILE
+			echo "alter database $DBNAME on"  >> $DDLFILE
+			echo "$DEV=$MB" >> $DDLFILE
+		fi	
+	fi
+	export PREVDBNAME=$DBNAME
+	export PREVSEG=$SEG
+	test $FIRSTPASS -eq 1 && export FIRSTPASS=0
+done
+test $FORLOAD -eq 1 && echo "for load\ngo" >> $DDLFILE || echo "go" >> $DDLFILE
+
+#------------------------------------------------------------------------------
+# final exit
+#------------------------------------------------------------------------------
+exit 0

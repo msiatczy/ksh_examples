@@ -1,0 +1,129 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: pushProc.scr -P <procname>|all -S <DBSERVER>|all
+#
+#  Description: Push one proc or all procs to one or all ASEs
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	05/02/02 M. Siatczynski	Initial Script
+#	04/20/04 M. Siatczynski	call function to get ASE list
+#	12/15/05 M. Siatczynski	Add parm for DBSERVER/all
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	08/03/06 M. Siatczynski	Change -all to a parm for -S
+#	10/24/06 M. Siatczynski	Add all parm to -P
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -P <proc>|all -S <DBSERVER>|all"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -P)	export ONEPROC=$2;shift 2;;
+	                -S)	export ONEDBSERVER=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$ONEPROC" -o ! "$ONEDBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# initialize variables
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/central/pushProc.$DATETIME
+export DBSERVERLIST=/tmp/dbserver.lst.$$
+export PROCLIST=/tmp/proc.lst.$$
+
+#--------------------------------------------------------------------------
+# format DBSERVER list
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# generate proc list
+# defaults to all files ending with .prc under $DISTDIR/procs
+#--------------------------------------------------------------------------
+if [ "$ONEPROC" = "all" ]
+then
+	cd $DISTDIR/procs
+	ls *.prc > $PROCLIST
+else
+	echo $ONEPROC > $PROCLIST
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $PROCLIST && \rm -f $PROCLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Add the new proc(s) to dbserver(s)
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Pushing procs" >> $LOGFILE
+
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	echo "\nCreating proc(s) on $DBSERVER..." | tee -a $LOGFILE
+	for PROC in `cat $PROCLIST`
+	do
+		echo "$PROC" | tee -a $LOGFILE
+		export PROCFILE=$DISTDIR/procs/$PROC
+		if [ ! -s $PROCFILE ]
+		then
+			echo "ERROR - $PROCFILE does not exist or is 0 bytes" | tee -a $LOGFILE
+			exit 1
+		fi
+		getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -i$PROCFILE -w200 | grep -v Password >> $LOGFILE
+	done
+done
+
+#--------------------------------------------------------------------------
+#  check SQL errors
+#  exit
+#--------------------------------------------------------------------------
+checkSqlErr $LOGFILE
+if [ $? -ne 0 ]
+then
+        echo "ERROR - creating proc(s)" | tee -a $LOGFILE
+        echo "Review $LOGFILE"
+        exit 1
+else
+        echo "proc(s) SUCCESSFULLY created" | tee -a $LOGFILE
+	exit 0
+fi

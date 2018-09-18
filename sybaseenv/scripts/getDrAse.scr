@@ -1,0 +1,161 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getDrAse.scr
+#
+#  Description: Make copies of SQL-BackTrack files necessary for disaster recovery
+#
+#     Location: /sccm/dba/sybase/scripts
+#
+#    Called by: AutoSys
+#
+#   Parameters: DBSERVER
+#
+#  Modification History:
+#       02/03/04 K. Hess        Initial script
+#       02/17/04 K. Hess        Updated to test for files, then copy
+#       03/04/04 K. Hess        Added sp_dballoc and sp_servermap output; added
+#				code to remove old SQLOUT files; update report
+#				output
+#       06/04/04 K. Hess        Updated ddlgen location due to ASE 12.5.2 having
+#				binary in a different location
+#       06/12/04 M. Siatczynski Get PORT and SN from ASEDIRLIST
+#       02/13/06 M. Siatczynski Implement ISQLEXE, getPass, ADMINLOGIN
+#       02/21/06 M. Siatczynski Implement getPass, ADMINLOGIN for ddlgen calls
+#       06/20/06 M. Siatczynski Always call ddlgen from ASEP/bin dir
+#       02/04/08 M. Siatczynski Do not overwrite cfg, RUNserver, or interfaces files if 0 bytes
+#       10/17/08 M. Siatczynski Change RPTFILE to LOGFILE and change from $RPTDIR to $LOGDIR
+#				Change LOGDIR filename to include script name and $DATETIME stamp
+#----------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Parameters:  Database server
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>"
+ 
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+ 
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export SETDBSERVER=$DBSERVER
+
+. /sccm/dba/sybase/.dbaSybProfile
+ 
+export LOGFILE=$LOGDIR/dr/$DBSERVER/$DBSERVER.getDrAse.$DATETIME
+export SQLOUT=$DBSERVER_DRDIR/$DBSERVER.dballoc.$MMDDYYYY
+export LOCLOG=$DBSERVER_DRDIR/$DBSERVER.location.log
+
+#--------------------------------------------------------------------------
+# Get the service name and port for this dbserver - needed for ddlgen
+# Verify the service name is active on this host--script MUST run on service name host
+#--------------------------------------------------------------------------
+export SN=`grep "^$DBSERVER " $ASEDIRLIST | cut -d" " -f2`
+export PORT=`grep "^$DBSERVER " $ASEDIRLIST | cut -d" " -f8`
+
+#----------------------------------------------------------------------------
+#  Verify dr directory exists; if not, create the directory
+#----------------------------------------------------------------------------
+test ! -d $DBSERVER_DRDIR && mkdir $DBSERVER_DRDIR
+
+#--------------------------------------------------------------------------
+#  Initialize LOGFILE
+#  Header for DR Report
+#--------------------------------------------------------------------------
+echo "--ASE DR REPORT for $DBSERVER on $DATETIME" > $LOGFILE
+
+#----------------------------------------------------------------------------
+# Save copy of .cfg and RUN_server files
+#----------------------------------------------------------------------------
+export ASEDIR=`grep "^${DBSERVER} " $ASEDIRLIST | cut -d" " -f4`
+
+# Copy ASE files 
+if [ -s $ASEDIR/$DBSERVER.cfg ]
+	then
+	cp -p $ASEDIR/$DBSERVER.cfg $DBSERVER_DRDIR/. 
+	else
+	echo "--$DBSERVER.cfg not found or 0 bytes" >> $LOGFILE
+fi
+
+if [ -s $ASEDIR/install/RUN_${DBSERVER} ]
+	then
+	cp -p $ASEDIR/install/RUN_${DBSERVER} $DBSERVER_DRDIR/. 
+	else
+	echo "--RUN_$DBSERVER file not found or 0 bytes" >> $LOGFILE
+fi
+
+if [ -s $ASEDIR/install/RUN_${DBSERVER}_BACKUP ]
+	then
+	cp -p $ASEDIR/install/RUN_${DBSERVER}_BACKUP $DBSERVER_DRDIR/. 
+	else
+	echo "--RUN_${DBSERVER}_BACKUP file not found or 0 bytes" >> $LOGFILE
+fi
+
+#----------------------------------------------------------------------------
+# Isql and run stored procs to gather database/server information
+#----------------------------------------------------------------------------
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password >> $SQLOUT
+`getPass $DBSERVER $ADMINLOGIN`
+set nocount on
+go
+use master
+go
+print ""
+go
+print "--Database allocation output for ${DBSERVER}"
+go
+print "sp_dballoc"
+go
+sp_dballoc
+go
+print "sp_servermap"
+go
+sp_servermap
+go
+!
+
+#----------------------------------------------------------------------------
+# Run ddlgen to extract login and device information for the database server
+# NOTE:  -P MUST be specified on the command line for ddlgen--it can't handle it passed via pipe
+#----------------------------------------------------------------------------
+export DDLGEN=$SYBASE/ASEP/bin/ddlgen
+
+$DDLGEN -U$ADMINLOGIN -S$SN:$PORT -TL -N% -O$DBSERVER_DRDIR/$DBSERVER.logins.ddl -P`getPass $DBSERVER $ADMINLOGIN` >> $LOGFILE
+$DDLGEN -U$ADMINLOGIN -S$SN:$PORT -TDBD -N% -O$DBSERVER_DRDIR/$DBSERVER.device.ddl -P`getPass $DBSERVER $ADMINLOGIN` >> $LOGFILE
+
+#----------------------------------------------------------------------------
+# Save copy of interfaces file
+#----------------------------------------------------------------------------
+if [ -s $SYBASE/interfaces ]
+        then
+        cp -p $SYBASE/interfaces $DBSERVER_DRDIR/.
+        else
+        echo "--$SYBASE/interfaces file not found or 0 bytes" >> $LOGFILE
+fi
+
+#----------------------------------------------------------------------------
+# Get host name and shared mem setting for the database server
+#----------------------------------------------------------------------------
+echo "`date +'%D %T'` `hostname` `grep shmmax /etc/system|sed 's/set //g'`"  >> $LOCLOG
+
+#--------------------------------------------------------------------------
+#  Cleanup of old files
+#--------------------------------------------------------------------------
+find $DBSERVER_DRDIR -name $DBSERVER.dballoc.'*' -mtime +7 -print -exec rm {} \; >> $LOGFILE
+
+#--------------------------------------------------------------------------
+#  Exit with 0
+#--------------------------------------------------------------------------
+exit 0

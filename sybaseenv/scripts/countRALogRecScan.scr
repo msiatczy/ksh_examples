@@ -1,0 +1,85 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: scriptName  <parameter1> <parameter2> <parameterX>
+#
+#  Description: Short description for the use of this script. 
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	02/10/04 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -date <mmddyy>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -date)  export CHECKDATE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$CHECKDATE" ]
+then
+        echo $USAGE
+        exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export ALLCOUNT=/tmp/allcount.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $ALLCOUNT && \rm -f $ALLCOUNT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Grep for log records scanned in sysmon files, exclude any 0 lines
+#  Compress multiple spaces down to one and then strip out the count column
+#  Total all recs for a given day
+#--------------------------------------------------------------------------
+cd $PERFDIR/sysmon/$DBSERVER
+grep '^    Log Records Scanned    ' *$CHECKDATE* | grep -v 'n/a           n/a           0       n/a' | sed -e 's/  */ /g' | cut -d" " -f7 > $ALLCOUNT
+
+export COUNTSUM=0
+
+cat $ALLCOUNT |
+while read COUNTVAL
+do
+        export COUNTVAL
+        export COUNTSUM=`expr $COUNTSUM + $COUNTVAL`
+done
+
+echo "\nTotal Log Records Scanned for $DBSERVER on $CHECKDATE:  $COUNTSUM\n"
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+exit 0

@@ -1,0 +1,262 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: restrictStdByLogins.scr -S <DBSERVER> -restrict|-unrestrict {-L <login|login list> -xlist <exclude path/file> -xdba -noprompt}
+#
+#  Description: Configure login with a login trigger that will enable/disable a login trigger that restricts entry to a Stand By Server.
+#		2 logins are hardcoded to never be restricted by this process.
+#		sybadmin & norad
+#
+#     Location:	/sccm/dba/sybase/scripts/restrictStdByLogins.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - Database server name
+#		<restrict> - enables the login trigger
+#		<unrestrict> - disables the login trigger
+#		<xlist> - exclude list
+#		<noprompt> - do not prompt for confirmation
+#
+#  Modification History:
+#	07/11/09 J. Aspenleiter	Initial Script copied from lockLogins.scr
+#	05/03/10 M. Siatczynski	Updated name of LOGFILE - still had lockLogins in name
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> -restrict|-unrestrict {-L <login|login list> -xlist <exclude path/file> -xdba -noprompt}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)		export DBSERVER=$2;shift 2;;
+			-restrict)	export RESTRICT=1;shift 1;;
+			-unrestrict)	export RESTRICT=0;shift 1;;
+	                -L)		export LOGINSPEC=$2;shift 2;;
+	                -xlist)		export XLIST=$2;shift 2;;
+	                -xdba)		export XDBA=1;shift 1;;
+	                -noprompt)	export PROMPT=0;shift 1;;
+	                -*)		echo $USAGE;exit 1;;
+	                *)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" -o ! "$RESTRICT" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+test ! "$XDBA" && export XDBA=0
+test ! "$PROMPT" && export PROMPT=1
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.restrictStdByLogins.$DATETIME
+export XDBALIST=$CTLDIR/dbaExcludeLock.lst
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export TEMPLIST=/tmp/templist.$$
+export LOGINLIST=/tmp/loginlist.$$
+export XLISTSORT=/tmp/xlistsort.$$
+export NUMTORSTRCT=0
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+#  If the exclusion list was passed, and it exists, sort it
+#  If not passed, create an empty sorted exclude list for later generic code
+#--------------------------------------------------------------------------
+> $XLISTSORT
+
+test $XDBA -eq 1 && cat $XDBALIST >> $XLISTSORT
+
+if [ "$XLIST" ]
+then
+	if [ -f "$XLIST" ]
+	then
+		sort -u $XLIST $XLISTSORT -o $XLISTSORT
+	else
+		echo "ERROR - $XLIST does not exist"
+		exit 1
+	fi
+else
+	sort -u $XLISTSORT -o $XLISTSORT
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $TEMPLIST && \rm -f $TEMPLIST
+	test $SQLOUT && \rm -f $SQLOUT
+	test $LOGINLIST && \rm -f $LOGINLIST
+	test $XLISTSORT && \rm -f $XLISTSORT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# write logfile headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "$0 $*" >> $LOGFILE
+echo "`date` Restricting logins on $DBSERVER" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# format the where clause if -unrestrict flag was passed.  We only want to
+# process accounts that have the trigger enabled.  
+#------------------------------------------------------------------------------
+if [ "$RESTRICT" -eq 0 ] 
+then
+	export UNRESTRICT=" and object_name(procid, db_id(dbname)) = 'sp_RestrictStdByAccess'"
+	export ENABLE_VAR="DISABLE"
+	export RSTCT_VAR=""
+else
+	export UNRESTRICT=""
+	export ENABLE_VAR="ENABLE"
+	export RSTRCT_VAR=", sp_RestrictStdByAccess"
+fi
+#------------------------------------------------------------------------------
+# If LOGINSPEC is passed, validate and format list of logins
+# If LOGINSPEC is NOT passed, get list of logins from DBSERVER
+# EXCLUDE the following logins:
+# 1.  norad and sybadmin
+# 2.  logins in $XLISTSORT (generated above)
+# check for errors
+#------------------------------------------------------------------------------
+if [ "$LOGINSPEC" ]
+then
+# make sure control file exists and has entries
+	if [ -f $LOGINSPEC ]
+	then
+	        if [ -s $LOGINSPEC ]
+	        then
+	                cat $LOGINSPEC > $TEMPLIST
+	        else
+	                echo "WARNING - $LOGINSPEC is 0 bytes" | tee -a $LOGFILE
+	        fi
+	else
+# make sure the loginspec doesn't contain slashes--otherwise it may be an invalid file reference
+	        echo $LOGINSPEC | grep '/' > /dev/null
+	        if [ $? -eq 0 ]
+	        then
+	                echo "ERROR - $LOGINSPEC is not valid--possible invalid filename?"
+	                exit 1
+	        else
+	                echo $LOGINSPEC > $TEMPLIST
+	        fi
+	fi
+else
+# get the login list from the DBSERVER
+	> $SQLOUT
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $SQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..syslogins where name not in ("norad","$ADMINLOGIN","probe") $UNRESTRICT
+	go
+	!
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+	        echo "ERROR - getting list of logins for $DBSERVER" | tee -a $LOGFILE
+		cat $SQLOUT >> $LOGFILE
+	        exit 1
+	else
+		cat $SQLOUT > $TEMPLIST
+	fi
+fi
+
+# if there are logins to restrict, remove exclusions and count how many will be restricted
+if [ -s $TEMPLIST ]
+then
+	sed -e 's/  *//g' $TEMPLIST | sort | comm -23 - $XLISTSORT > $LOGINLIST
+	export NUMTORSTRCT=`wc -l < $LOGINLIST`
+else
+	echo "$ENABLE_VAR Login trigger will not be executed because there are no logins found to $ENABLE_VAR on $DBSERVER" | tee -a $LOGFILE
+	exit 0
+fi
+
+#------------------------------------------------------------------------------
+# Prompt for confirmation
+#------------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+        echo "\nYou are about to $ENABLE_VAR a login trigger that restricts access to $NUMTORSTRCT logins on $DBSERVER\n"
+        CONTINUE=""
+        while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+        do
+                echo "DO YOU WISH TO CONTINUE? {y/n}"
+                read CONTINUE
+        done
+
+        if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+        then
+                echo "\n`date` Script exiting - no action taken on $DBSERVER.\n" | tee -a $LOGFILE
+                exit 0
+        fi
+fi
+
+#------------------------------------------------------------------------------
+# Format the sql statements
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "use master" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $LOGINLIST |
+while read LOGIN
+do
+	export LOGIN
+	echo "exec sp_modifylogin $LOGIN, \"login script\"$RSTRCT_VAR" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+
+# summarize restricted status for all logins
+echo "set nocount on" >> $SQLFILE
+echo "select 'num accounts restricted',count(*)" >> $SQLFILE
+echo "from master..syslogins" >> $SQLFILE
+echo "where object_name(procid, db_id(dbname)) = \"sp_RestrictStdByAccess\"" >> $SQLFILE
+
+
+echo "select 'num accounts unrestricted',count(*)" >> $SQLFILE
+echo "from master..syslogins" >> $SQLFILE
+echo "where procid is null" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# EXECUTE enable login script
+# check for errors
+#------------------------------------------------------------------------------
+> $SQLOUT
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e -i $SQLFILE | grep -v Password > $SQLOUT
+
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+        echo "ERROR - enable login script sp_RestrictStdByAccess on $DBSERVER" | tee -a $LOGFILE
+        echo "Details in $LOGFILE"
+	cat $SQLOUT >> $LOGFILE
+        export HIGHRC=1
+else
+	cat $SQLOUT >> $LOGFILE
+fi
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+echo "`date` $ENABLE_VAR login trigger complete" >> $LOGFILE
+test $HIGHRC -eq 0 && exit 0 || exit 1

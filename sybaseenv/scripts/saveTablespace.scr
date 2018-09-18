@@ -1,0 +1,137 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: saveTablespace.scr -S DBSERVER {-D DBNAME}
+#
+#  Description: Save tablespace information for one or all databases in dba..tablespace
+#  NOTE:	Does not record info for system databases (master, model, tempdb%, sybsystem%, dbcc%)
+#
+#     Location:	/sccm/dba/sybase/scripts/saveTablespace.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#              	<DBNAME> - database name
+#
+#  Modification History:
+#	01/25/05 M. Siatczynski	Original script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <DBNAME>}"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)		export DBSERVER=$2;shift 2;;
+                        -D)		export DBNAME=$2;shift 2;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+export OUTFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.saveTablespace.$DATETIME
+export SQLFILE=/tmp/trunclog.sql.$$
+export DBLIST=/tmp/dblist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $OUTFILE
+echo "`date` START" >> $OUTFILE
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+# Ignore tempdb% databases and read only databases (status=1024)
+# Check for errors
+#--------------------------------------------------------------------------
+echo "Saving tablespace info for $DBSERVER $DBNAME:" >> $OUTFILE
+if [ "$DBNAME" ]
+then
+        echo $DBNAME > $DBLIST
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases
+	where name not like 'tempdb%'
+	and name not like 'sybsystem%'
+	and name not like 'sybsecurity%'
+	and name not like 'dbcc%'
+	and name <> 'master'
+	and name <> 'model'
+	order by name
+	go
+	!
+fi
+
+checkSqlErr $DBLIST
+if [ $? -eq 1 ]
+then
+	echo "ERROR - unable to obtain list of databases from $DBSERVER"
+	echo "Review output in $OUTFILE"
+	cat $DBLIST >> $OUTFILE
+	echo "`date` END" >> $OUTFILE
+	exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Format the sql to save tablespace information
+#------------------------------------------------------------------------------
+> $SQLFILE
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	echo "use $DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "if db_name() = \"$DBNAME\" exec sp_save_tablespace" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#------------------------------------------------------------------------------
+# pipe in the sql
+# check for errors
+# final exit
+#------------------------------------------------------------------------------
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e -i$SQLFILE | grep -v Password >> $OUTFILE
+
+checkSqlErr $OUTFILE
+if [ $? -eq 1 ]
+then
+	echo "ERROR - executing sp_save_tablespace on $DBSERVER"
+	echo "Review output in $OUTFILE"
+	echo "`date` END" >> $OUTFILE
+	exit 1
+else
+	echo "`date` END" >> $OUTFILE
+	exit 0
+fi

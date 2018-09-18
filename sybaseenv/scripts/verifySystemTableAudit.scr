@@ -1,0 +1,165 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: verifySystemTableAudit.scr -S <DBSERVER>|all -D <dbname|all> {-m <maildest>}
+#
+#  Description: Verify system tables are audited in databases (exclude tempdb)
+#
+#     Location:	/sccm/dba/sybase/scripts/verifySystemTableAudit.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - ASE
+#		<dbname> - database name
+#		<maildest> - override default maildest of dba
+#
+#  Modification History:
+#       03/09/05 M. Siatczynski Initial script
+#       06/02/06 M. Siatczynski Ignore offline databases (status2=16)
+#       08/21/07 K. Hess	Update formatSystemTableAudits.scr to formatSystemTableAudit.scr
+#       05/29/09 M. Siatczynski	Updated to call getDbList function
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER>|all -D <database|all {-m <maildest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export ONEDBSERVER=$2;shift 2;;
+			-D)		export ONEDBNAME=$2;shift 2;;
+			-m)		export MAILDEST=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$ONEDBSERVER" -o ! "$ONEDBNAME" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export SQLFILE=/tmp/usersql.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBLIST=/tmp/dblist.$$
+export MAILFILE=/tmp/mailfile.$$
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export LOGFILE=$LOGDIR/audit/central/verifySystemTableAudit.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $DBLIST && \rm -f $DBLIST
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create working list of ASEs
+#------------------------------------------------------------------------------
+test "$ONEDBSERVER" = "all" && getAseList > $DBSERVERLIST || echo $ONEDBSERVER > $DBSERVERLIST
+
+#------------------------------------------------------------------------------
+# Do the following for each ASE in DBSERVERLIST...
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Verify system table audits" >> $LOGFILE
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+
+#------------------------------------------------------------------------------
+# Create a working dblist
+# Exclude tempdbs, read-only databases (status=1024), and offline databases (status2=16)
+#------------------------------------------------------------------------------
+	if [ "$ONEDBNAME" = "all" ]
+	then
+		getDbList -S $DBSERVER -user -system -xreadonly > $DBLIST
+		if [ $? -eq 1 ]
+		then
+		        echo "ERROR - getting list of database names from $DBSERVER" | tee -a $LOGFILE
+		        cat $DBLIST >> $LOGFILE
+		        exit 1
+		fi
+	else
+		echo $ONEDBNAME > $DBLIST
+	fi
+
+#------------------------------------------------------------------------------
+# Format the SQL
+#------------------------------------------------------------------------------
+	> $SQLFILE
+	echo "set nocount on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	cat $DBLIST |
+	while read DBNAME
+	do
+		export DBNAME
+		echo "use $DBNAME" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "select @@servername,db_name(),name,audflags from $DBNAME..sysobjects where type = 'S' and audflags&207<>207 order by name" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# Append the output to the logfile
+#------------------------------------------------------------------------------
+	echo "\n`date` $DBSERVER: Verifying system table audits" >> $LOGFILE
+
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 -i$SQLFILE | grep -v Password: > $SQLOUT
+
+	cat $SQLOUT >> $LOGFILE
+#------------------------------------------------------------------------------
+# Check for errors
+#------------------------------------------------------------------------------
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "`date` $DBSERVER: SQL FAILED" >> $LOGFILE
+	else
+		if [ -s $SQLOUT ]
+		then
+			echo "`date` $DBSERVER: System table audits NOT properly configured" >> $LOGFILE
+			> $MAILFILE
+			echo "The following system tables are not being properly audited." >> $MAILFILE
+			echo "Use $SCRDIR/formatSystemTableAudit.scr to configure the audits." >> $MAILFILE
+			echo "See $LOGFILE for details of all ASEs.\n" >> $MAILFILE
+			cat $SQLOUT >> $MAILFILE
+			export MAILSUBJECT="$DBSERVER: System Table Audit Verification FAILED"
+			sendMail
+		else
+			echo "`date` $DBSERVER: System table audits properly configured" >> $LOGFILE
+		fi
+	fi
+done
+
+echo "\n`date` END Verify system table audits" >> $LOGFILE
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+test $HIGHRC -eq 1 && exit 1 || exit 0

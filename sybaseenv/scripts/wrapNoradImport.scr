@@ -1,0 +1,102 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: wrapNoradImport.scr -H <all|host>
+#
+#  Description: This script provides an automated way to ssh to a one or all norad hosts and import rules
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<login> - login
+#              	<host> - specific host
+#
+#  Modification History:
+#	07/30/09 M. Siatczynski	Original script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -H <host|all> -F <file path/name>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -H)		export ONEHOST=$2;shift 2;;
+                        -F)		export FILENAME=$2;shift 2;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEHOST" -o ! "$FILENAME" ]
+then
+        echo $USAGE
+        echo "ERROR - Host and file MUST be specified"
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#  hosts are translated to lowercase here
+#--------------------------------------------------------------------------
+export SAMDIRLIST=$CTLDIR/noradSamDirectory.lst
+export TMPHOSTLIST=/tmp/tmphostlist.$$
+export LOGFILE=$LOGDIR/norad/wrapNoradImport.$DATETIME
+
+if [ "$ONEHOST" = "all" ]
+then
+	getSamList | tr '[:upper:]' '[:lower:]' > $TMPHOSTLIST
+else
+	echo $ONEHOST | tr '[:upper:]' '[:lower:]' > $TMPHOSTLIST
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TMPHOSTLIST && \rm -f $TMPHOSTLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Write report headers
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Updating rules on the following hosts:\n" | tee -a $LOGFILE
+cat $TMPHOSTLIST | tee -a $LOGFILE
+echo "" | tee -a $LOGFILE
+
+#------------------------------------------------------------------------------
+# ssh to each host in the list
+# NOTE:  Do not use HOST as the variable--this is a system variable
+# host needs to be lowercase, but SAM needs to be uppercase
+#------------------------------------------------------------------------------
+for SSHHOST in `cat $TMPHOSTLIST`
+do
+	export SSHHOST
+	export SSHHOST_UPPER=`echo $SSHHOST | tr '[:lower:]' '[:upper:]'`
+	export SSHHOST_LOWER=`echo $SSHHOST | tr '[:upper:]' '[:lower:]'`
+	echo "SSHING to $SSHHOST_LOWER..." | tee -a $LOGFILE
+	/usr/local/bin/ssh -n ${SSHHOST_LOWER} "/sccm/dba/sybase/scripts/noradImport.scr -SAM ${SSHHOST_UPPER} -file $FILENAME -rules" | tee -a $LOGFILE
+	echo "" | tee -a $LOGFILE
+done
+
+#------------------------------------------------------------------------------
+# Exit with final status
+#------------------------------------------------------------------------------
+echo "\n\nSSH TO ALL HOSTS COMPLETE \n\n" | tee -a $LOGFILE
+
+exit 0

@@ -1,0 +1,148 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findNondefaultConfigs.scr -S <DBSERVER>|all
+#
+#  Description: Look for logins which do not have access to their default database
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	07/10/07 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|all"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export SQLOUT=/tmp/sqlout.$$
+export LOGFILE=$LOGDIR/misc/findNondefaultConfigs.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  For each ASE...
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START check non-default config values" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# Create a working dbserverlist
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# For each DBSERVER
+# execute sql
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+
+	echo "`date` Checking $DBSERVER..." >> $LOGFILE
+
+	> $SQLOUT
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 <<-! | grep -v Password >> $SQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	use master
+	go
+	set nocount on
+	go
+	select dbserver = convert(char(20),@@servername),
+	parm = convert(char(30), name),
+	dval = convert(char(12), space(12-char_length(convert(varchar(12), defvalue)))+ convert(varchar(12), defvalue)),
+	cval = convert(char(12), space(12-char_length(isnull(a.value2, convert(char(32), a.value)))) + isnull(a.value2, convert(char(32), a.value))),
+	rval = convert(char(12), space(12-char_length(isnull(b.value2, convert(char(32), b.value)))) + isnull(b.value2, convert(char(32), b.value)))
+	into #configs
+	from master.dbo.sysconfigures a,
+	master.dbo.syscurconfigs b
+	where 
+	a.config *= b.config
+	-- ignore config=19 (User Defined Cache)
+	and parent != 19
+	and a.config != 19
+	order by name
+	go
+	select DBSERVER=dbserver,Parameter=parm,DefaultVal=dval,CurrVal=cval,RunVal=rval from #configs where dval != cval
+	go
+	drop table #configs
+	go
+	!
+
+	cat $SQLOUT >> $LOGFILE
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+	        echo "$DBSERVER:  SQL FAILED" >> $LOGFILE
+	        export HIGHRC=1
+	        continue
+	else
+	        echo "$DBSERVER:  SQL SUCCESSFUL" >> $LOGFILE
+	fi
+done
+
+#--------------------------------------------------------------------------
+# Exit with final status
+#--------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+	echo "\nScript FAILED"
+	echo "Review output in $LOGFILE\n"
+	exit 1
+else
+	echo "\nScript SUCCESSFUL"
+	echo "Review output in $LOGFILE\n"
+	exit 0
+fi

@@ -1,0 +1,120 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkDbs.scr -S <DBSERVER> {-D <DBNAME>i -v <ASE version>}
+#
+#  Description: Check one or all databases on a server, looking for partitioned tables
+#
+#     Location:	/sccm/dba/sybase/adhoc/checkDbs.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	-S Database Server
+#              	-D Database
+#
+#
+#  Modification History:
+#	06/12/03 M. Siatczynski	Initial Script
+#	05/29/09 M. Siatczynski	Updated to call getDbList function
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>} -v <ASE version>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -D)	export DBNAME=$2;shift 2;;
+	                -v)	export ASEVERSION=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+test ! "$ASEVERSION" && export ASEVERSION=15
+
+export DBLIST=/tmp/dbnamelist.$$
+export SQL1=/tmp/tempsql.$$
+export OUTFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.findPartitionedTables.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQL1 && \rm -f $SQL1
+	test $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# If a single dbname is passed, put it in the list, otherwise
+# generate a list of all DBs on the server (excluding system dbs)
+# Also set OUTFILE, depending on DBNAME
+#--------------------------------------------------------------------------
+if [ "$DBNAME" ]
+then
+	echo $DBNAME>> $DBLIST
+else
+	getDbList -S $DBSERVER -user -system > $DBLIST
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - Getting list of databases on $DBSERVER"
+		exit 1
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# Format the sql to be run against each database
+#--------------------------------------------------------------------------
+> $SQL1
+echo "set nocount on" >> $SQL1
+echo "go" >> $SQL1
+
+for DBNAME in `cat $DBLIST`
+do
+	export DBNAME
+	echo "use $DBNAME" >> $SQL1
+	echo "go" >> $SQL1
+
+	if [ $ASEVERSION -eq 15 ]
+	then
+		echo "select object_name(id),count(*) from syspartitions where indid <= 1 group by object_name(id) having count(*) > 1" >> $SQL1
+	else
+		echo "select \"$DBNAME \"+user_name(o.uid)+\".\"+o.name,count(p.id) from sysobjects o, syspartitions p where p.id = o.id group by o.name order by o.name" >> $SQL1
+	fi
+	echo "go" >> $SQL1
+done
+
+#--------------------------------------------------------------------------
+# Pipe in the sql
+#--------------------------------------------------------------------------
+> $OUTFILE
+
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -i$SQL1 -b | grep -v Password: >> $OUTFILE
+
+#--------------------------------------------------------------------------
+# Check for errors
+#--------------------------------------------------------------------------
+checkSqlErr $OUTFILE
+if [ $? -eq 1 ]
+then
+        echo "$0 FAILED"
+	echo "Results in $OUTFILE"
+        exit 1
+else
+        echo "$0 SUCCESSFUL"
+	echo "Results in $OUTFILE"
+        exit 0
+fi

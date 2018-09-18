@@ -1,0 +1,153 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: addLogin.scr -U <user> -login <login to be added> -S <DBSERVER>,<DBSERVER>,etc -defdb <default database> -fullname <'full name'>
+#
+#  Description: Add a new login
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<user> - login of the user running the add
+#		<login> - login to be added
+#		<defdb> - default database
+#		<fullname> - full name of login/description
+#
+#  Modification History:
+#	03/12/03 M. Siatczynski	Initial Script
+#	02/21/07 M. Siatczynski	Write header with datetime to LOGFILE
+#	06/08/10 M. Siatczynski	Add default parm for password expiration
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -U <user> -login <login to be added> -S <DBSERVER>,<DBSERVER>,etc -defdb <default database> -fullname <'full name'>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-U)		export EXEUSER=$2;shift 2;;
+			-login)		export LOGIN=$2;shift 2;;
+			-S)		export DBSERVERSPEC=$2;shift 2;;
+			-defdb)		export DEFDB=$2;shift 2;;
+			-fullname)	export FULLNAME=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# user and login must be passed
+if [ ! "$EXEUSER" -o ! "$LOGIN" -o ! "$DBSERVERSPEC" -o ! "$DEFDB" -o ! "$FULLNAME" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export PWDEXP=60
+export LOGFILE=$LOGDIR/useradmin/central/addLogin.$DATETIME.$$
+export SQLFILE=/tmp/loginsql.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Format serverlist 
+#--------------------------------------------------------------------------
+export DBSERVERLIST=`echo $DBSERVERSPEC | sed -e 's/,/ /g'`
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Adding LOGIN $LOGIN to the following ASEs:" >> $LOGFILE
+echo $DBSERVERLIST >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Prompt for the password
+#------------------------------------------------------------------------------
+PWD1=""
+while [ "$PWD1" = "" ]
+do
+        echo "Enter password for $LOGIN:"
+        stty -echo
+        read PWD1
+        stty echo
+done
+
+PWD2=""
+while [ "$PWD2" = "" ]
+do
+        echo "Re-enter password for $LOGIN:"
+        stty -echo
+        read PWD2
+        stty echo
+done
+
+if [ "$PWD1" = "$PWD2" ]
+then
+        export PASSWORD=$PWD1
+else
+        echo "ERROR - Passwords entered do not match.  Exiting." | tee -a $LOGFILE
+        exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Format sql to add login
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "use master" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "print \"Adding LOGIN ($LOGIN) on %1!...\",@@servername" >> $SQLFILE
+echo "if not exists (select name from master..syslogins where name = \"$LOGIN\")" >> $SQLFILE
+echo "execute sp_addlogin $LOGIN,\"$PASSWORD\",$DEFDB,NULL,\"$FULLNAME\",$PWDEXP" >> $SQLFILE
+echo "else" >> $SQLFILE
+echo "print \"LOGIN ($LOGIN) already exists on %1!\",@@servername" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# run the sql to add the login on TEST server
+#------------------------------------------------------------------------------
+echo ""
+for DBSERVER in `echo $DBSERVERLIST`
+do
+	echo "$DBSERVER: Adding login ($LOGIN)" >> $LOGFILE
+	getPass $DBSERVER $EXEUSER | $ISQLEXE -U$EXEUSER -S$DBSERVER -w200 -i $SQLFILE >> $LOGFILE
+done
+
+#------------------------------------------------------------------------------
+# check output
+# Report on logins that already exist
+# Check for errors
+# Exit
+#------------------------------------------------------------------------------
+egrep '(^LOGIN |^Adding LOGIN )' $LOGFILE
+echo ""
+
+checkSqlErr $LOGFILE
+if [ $? -eq 1 ]
+then
+        echo "ERROR - adding login"
+        echo "Review $LOGFILE"
+        exit 1
+else
+        exit 0
+fi

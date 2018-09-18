@@ -1,0 +1,232 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: manageOpsLogin.scr -S <DBSERVER>|<LOB> {-login <Opsadm login> -fullname <Ops name> -role <role> -modify}
+#
+#  Description: Add one or all Ops logins to one or multiple ASEs and grant required roles
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	09/20/07 M. Siatczynski	Initial Script (copied from manageDbaLogin.scr)
+#	10/29/08 J. Aspenleiter Added the role TIGMF_ALL_NOEXPIRE
+#	03/18/09 J. Aspenleiter Do not force fullname to be provided if modify is passed
+#	07/03/09 M. Siatczynski Exclude sandboxes and PREDWOOD from aselist
+#	06/08/10 M. Siatczynski Change password expiration to 30
+#	04/13/11 M. Siatczynski Update code to accommodate ASEs by LOB, 'all' no longer an option
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|<LOB> {-login <Opsadm login> -fullname <Ops name> -role <role> -modify}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -login)   export ONELOGIN=$2;shift 2;;
+                        -fullname)   export ONEDBANAME=$2;shift 2;;
+                        -role)  export ONEROLE=$2;shift 2;;
+                        -modify)  export MODIFY=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$MODIFY" && export MODIFY=0
+
+if [ "$ONELOGIN" -a $MODIFY = 0 -a ! "$ONEDBANAME" ]
+then
+	echo "ERROR - fullname must be specified with specific login"
+	exit 1
+fi
+
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/useradmin/central/manageOpsLogin.$DATETIME
+export OPSLOGINLIST=$CTLDIR/opsLogin.lst
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export OPSLIST=/tmp/opslist.$$
+export ROLELIST=/tmp/rolelist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $OPSLIST && \rm -f $OPSLIST
+	test -f $ROLELIST && \rm -f $ROLELIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Create working lists
+#--------------------------------------------------------------------------
+validateLob $ONEDBSERVER
+test $? -eq 0 && getAseList $ONEDBSERVER > $DBSERVERLIST || echo $ONEDBSERVER > $DBSERVERLIST
+
+if [ "$ONELOGIN" ]
+then
+	echo "$ONELOGIN|$ONEDBANAME" > $OPSLIST
+else
+	grep -v '^#' $OPSLOGINLIST > $OPSLIST
+fi
+
+if [ "$ONEROLE" ]
+then
+	echo "$ONEROLE" > $ROLELIST
+else
+	> $ROLELIST
+	echo "sso_role" >> $ROLELIST
+	echo "TIGMF_ALL_NOEXPIRE" >> $ROLELIST
+fi
+
+#--------------------------------------------------------------------------
+# write log headers
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Managing the following Ops login(s):" >> $LOGFILE
+cat $OPSLIST >> $LOGFILE
+echo "On the following ASEs:" >> $LOGFILE
+cat $DBSERVERLIST >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Prompt for the password
+# this same password will be used for one or all accounts
+# If MODIFY=1, do not prompt for password
+# Default OPSPWD to NULL so sql syntax will be correct
+#------------------------------------------------------------------------------
+export OPSPWD=NULL
+if [ $MODIFY -eq 0 ]
+then
+	NEWPW1=""
+	while [ "$NEWPW1" = "" ]
+	do
+	        echo "Enter password for the Ops login(s):"
+	        stty -echo
+	        read NEWPW1
+	        stty echo
+	done
+
+	NEWPW2=""
+	while [ "$NEWPW2" = "" ]
+	do
+	        echo "Re-enter password for the Ops login(s):"
+	        stty -echo
+	        read NEWPW2
+	        stty echo
+	done
+
+	if [ "$NEWPW1" = "$NEWPW2" ]
+	then
+	        export OPSPWD=$NEWPW1
+	else
+	        echo "ERROR - Passwords entered for Ops login(s) do not match.  Exiting." | tee -a $LOGFILE
+	        exit 1
+	fi
+else
+	echo "MODIFY=1" >> $LOGFILE
+fi
+
+#--------------------------------------------------------------------------
+#  Format SQL FILE
+#  add roles, if they don't exist
+#  add the login if it doesn't exist
+#  password expiration is 30 days (privileged account)
+#--------------------------------------------------------------------------
+> $SQLFILE
+echo "use master" >> $SQLFILE
+echo "go" >> $SQLFILE
+cat $ROLELIST |
+while read ROLE
+do
+# Format SQL to create role if it doesn't exist
+        export ROLE
+        echo "if not exists (select name from syssrvroles where name = \"$ROLE\")" >> $SQLFILE
+        echo "create role \"$ROLE\"" >> $SQLFILE
+done
+
+cat $OPSLIST |
+while read OPSLINE
+do
+	export OPSLINE
+        export OPSLOGIN=`echo $OPSLINE | nawk -F"|" '{print $1}'`
+        export OPSNAME=`echo $OPSLINE | nawk -F"|" '{print $2}'`
+	echo "if exists (select * from master..syslogins where name = \"$OPSLOGIN\")" >> $SQLFILE
+	echo "execute sp_modifylogin $OPSLOGIN,'passwd expiration','30'" >> $SQLFILE
+	echo "else" >> $SQLFILE
+	echo "execute sp_addlogin $OPSLOGIN,$OPSPWD,master,null,\"$OPSNAME\",30" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	cat $ROLELIST |
+	while read ROLE
+	do
+		export ROLE
+#               echo "IF NOT EXISTS (select suid from sysloginroles where suser_name(suid) = '$OPSLOGIN' and role_name(srid) = '$ROLE')"
+		echo "grant role '$ROLE' to '$OPSLOGIN'" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "EXEC sp_modifylogin '$OPSLOGIN', 'add default role', '$ROLE'" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+done
+
+#------------------------------------------------------------------------------
+# Execute the SQL against each ASE in DBSERVERLIST
+# check for errors
+#------------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password > $SQLOUT
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - executing SQL against $DBSERVER" >> $LOGFILE
+		export HIGHRC=1
+	fi
+
+	cat $SQLOUT >> $LOGFILE
+done
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+	echo "\nScript FAILED"
+	echo "Review output in $LOGFILE\n"
+	exit 1
+else
+	echo "\nScript SUCCESSFUL"
+	exit 0
+fi

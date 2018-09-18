@@ -1,0 +1,156 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: verifyLockedLogins.scr -S <DBSERVER>|all {-m <maildest>}
+#
+#  Description: Report on logins which are permanently locked in dba..locked_logins, but not currently locked
+#		and logins which have an entry in dba..locked_logins but no entry in master..syslogins
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - login of the user running the drop
+#
+#  Modification History:
+#       06/10/10 M. Siatczynski Initial script
+#       06/30/10 M. Siatczynski Add code to detect entries in locked_logins without match in syslogins
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER>|all {-m <maildest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export ONEDBSERVER=$2;shift 2;;
+			-m)		export MAILDEST=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$ONEDBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/useradmin/verifyLockedLogins.$DATETIME
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export TEMPMAIL=/tmp/tempmail.$$
+export MAILFILE=/tmp/mailfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $SQLOUT && \rm -f $SQLOUT
+	test $MAILFILE && \rm -f $MAILFILE
+	test $TEMPMAIL && \rm -f $TEMPMAIL
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create working list of ASEs
+# Exclude Evergreen ASEs
+#------------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList | grep -v 'odydb01' > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# append the output to the logfile
+#------------------------------------------------------------------------------
+> $LOGFILE
+> $TEMPMAIL
+echo "`date` START Verify locked logins" >> $LOGFILE
+
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	echo "`date` Checking dba..locked_logins on $DBSERVER..." >> $LOGFILE
+
+	> $SQLOUT
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password: >> $SQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+
+	if exists (select 1 from dba..locked_logins d, master..syslogins l where l.name = d.name and l.status&2<>2)
+	begin
+		print "Permanently unlock the following accounts -- entry in dba..locked_logins but not currently locked in master..syslogins:"
+		select ASE=@@servername,d.name,d.locked_date,d.locked_by from dba..locked_logins d, master..syslogins l where l.name = d.name and l.status&2<>2
+	end
+	go
+
+	if exists (select 1 from dba..locked_logins where name not in (select name from master..syslogins))
+	begin
+		print "Remove the following entries from dba..locked_logins -- no match in master..syslogins:"
+		select ASE=@@servername,d.name,d.locked_date,d.locked_by from dba..locked_logins d where d.name not in (select name from master..syslogins)
+	end
+	go
+	!
+
+	if [ -s $SQLOUT ]
+	then
+		cat $SQLOUT >> $TEMPMAIL
+		echo "" >> $TEMPMAIL
+	fi
+
+#------------------------------------------------------------------------------
+# check output
+# Report on logins that were dropped
+# Check for errors
+#------------------------------------------------------------------------------
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "`date` Query FAILED for $DBSERVER" >> $LOGFILE
+		cat $SQLOUT >> $LOGFILE
+	fi
+done
+
+echo "`date` END Verify locked logins" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+#  If any discrepencies were found, send mail
+#--------------------------------------------------------------------------
+if [ -s $TEMPMAIL ]
+then
+	> $MAILFILE
+	echo "\nThe following logins have a discrepency between dba..locked_logins and master..syslogins" >> $MAILFILE
+	echo "\nIf necessary, delete from dba..locked_logins or run the following script to permanently unlock the login(s):" >> $MAILFILE
+	echo "\n$SCRDIR/unlockLogins.scr -S <DBSERVER> -L <login> -perm\n" >> $MAILFILE
+	cat $TEMPMAIL >> $MAILFILE
+	test $HIGHRC -ne 0 && export MAILSUBJECT="ERROR Verifying locked logins" || export MAILSUBJECT="Verify Locked Logins - ACTION REQUIRED"
+	sendMail
+fi
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+test $HIGHRC -ne 0 && exit 1 || exit 0

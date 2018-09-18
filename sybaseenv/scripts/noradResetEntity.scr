@@ -1,0 +1,134 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: noradResetEntity.scr -S <ase> -SAM <sam name> -enable/-disable
+#
+#  Description: Enable or Disable an entity on a SAM.
+#
+#     Location:	/sccm/dba/sybase/scripts/noradResetEntity.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#
+#  Modification History:
+#	03/03/09 J. Aspenleiter	Initial Script
+#	06/16/09 J. Aspenleiter Took out input parameter -SAM using $MYSAM instead.
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.norad
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <ase> -enable/-disable"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export SERVERNAME=$2;shift 2;;
+			-enable)	export RESETBIT=1;shift 1;;
+			-disable)	export RESETBIT=0;shift 1;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# user and environment must be passed
+if [ ! "$SERVERNAME" -o ! "$RESETBIT" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export OUTFILE=$LOGDIR/misc/$SERVERNAME/$MYSAM.$SERVERNAME.noradResetEntity.$DATETIME
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $OUTFILE
+echo "`date` Entity reset for norad entity $SERVERNAME on SAM $MYSAM..." >> $OUTFILE
+
+###############################################################################
+###############################################################################
+# Reset Entity function. Connects to a Surveillance Server (SAM) and 
+# either enables, or disables the Entity.  
+#
+# Syntax: ResetEntity MYSAM ENTITY RESETBIT
+#
+# MYSAM	is SAM name of where the entity is running.
+#
+# ENTITY	is the ASE name that is to be disabled.
+#
+# RESETBIT	is the bit that says to enable, or disable the entity.
+#		0 = disable
+#		1 = enable
+#
+# Note: "target ." means to send commands to the connected SAM.
+#
+###############################################################################
+#
+function ResetEntity {
+
+$NSM_HOME/bin/console -c -e $1 admin <<ENDCOMMAND
+`getPass $1 admin`
+target .sybase
+alter entity $1.$2;active=$3;
+wait 10
+targetoff	
+exit
+
+ENDCOMMAND
+
+return 0
+}
+###############################################################################
+#
+################################################################################
+#
+#	MAIN
+#
+################################################################################
+#   
+# RESET THE ENTITY
+
+if [ $RESETBIT -eq 0 ]
+then
+	echo "Disabling the entity $SERVERNAME on SAM $MYSAM" | tee -a $OUTFILE
+else
+	echo "Enabling the entity $SERVERNAME on SAM $MYSAM" | tee -a $OUTFILE
+fi
+
+if [ $? -eq 0 ]
+then
+	ResetEntity $MYSAM $SERVERNAME $RESETBIT >> $OUTFILE
+else
+	echo "ERROR OCCURRED....."
+	exit 1
+fi
+#
+################################################################################
+#------------------------------------------------------------------------------
+# Check for errors
+# Exit
+#------------------------------------------------------------------------------
+checkNoradErr $OUTFILE
+if [ $? -ne 0 ]
+then
+        echo "ERROR - resetting entity $SERVERNAME on $MYSAM" | tee -a $OUTFILE
+        echo "Review $OUTFILE"
+        exit 1
+else
+        echo "Entity $SERVERNAME was toggled successfully on SAM $MYSAM" | tee -a $OUTFILE
+        exit 0
+fi

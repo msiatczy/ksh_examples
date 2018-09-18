@@ -1,0 +1,237 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: tarSqlbtForRefresh.scr -S <SOURCE DBSERVER> -T <TARGET_DBSERVER>{-full -D <dbname>|<DB list> -date <mmddyyyy> -scp}
+#
+#  Description: Create tar file of sqlbt control files for refresh in Tempe and copy to target server in Tempe.
+#  NOTE:  ctl files are not modified by this script.  another script must pick up the original file and modify it for use in Tempe.
+#
+#  NOTE2:  System database are excluded from the copy.
+
+#  THIS SCRIPT MUST RUN FROM wpsfa3000.  This is the only host in MF with access to all Sybase dump destinations.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<full> - only copy last full (default is last full plus all associated tran dumps)
+#
+#  NOTE:  ASSUMPTION IS THERE ARE ONLY 5 LINES FROM 'begin dump' TO 'end dump'
+#		IN EACH SQLBT CONTROL FILE
+#
+#  Modification History:
+#	05/31/07 M. Siatczynski	Initial Script (based on copySqlbtToSnap.scr)
+#	10/04/07 M. Siatczynski	Exclude sybsyntax database from copy
+#	12/26/07 M. Siatczynski	Change exits:  exit 1 = WARNING; exit 2 = ERROR
+#	08/17/09 M. Siatczynski	Echo WARNING messages to LOG ONLY, not to console (to avoid stdout msgs when run from Autosys)
+#------------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <SOURCE DBSERVER> -T <TARGET DBSERVER> {-full -D <dbname>|<DB list> -date <mmddyyyy> -scp}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 2
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export SOURCE_DBSERVER=$2;shift 2;;
+                        -T)     export TARGET_DBSERVER=$2;shift 2;;
+                        -D)     export DBSPEC=$2;shift 2;;
+                        -full)  export FULL=1;shift 1;;
+                        -date)  export PARMDATE=$2;shift 2;;
+                        -scp)   export SCP=1;shift 1;;
+                        -*)     echo $USAGE;exit 2;;
+                        *)      echo $USAGE;exit 2;;
+                esac
+        done
+fi
+
+if [ ! "$SOURCE_DBSERVER" -o ! "$TARGET_DBSERVER" ]
+then
+        echo $USAGE
+        exit 2
+fi
+
+test ! "$FULL" && export FULL=0
+test ! "$SCP" && export SCP=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/backup/$SOURCE_DBSERVER/$SOURCE_DBSERVER.$TARGET_DBSERVER.tarSqlbtForRefresh.$DATETIME
+export DBLIST=/tmp/dblist.$$
+export XDBLIST=/tmp/exclude.dblist.$$
+export TEMPDIR=/tmp/$SOURCE_DBSERVER.$TARGET_DBSERVER
+export TARFILE=/tmp/$SOURCE_DBSERVER.$TARGET_DBSERVER.sqlbt.ctl.tar
+export ADMINSN=p-ent-sybdba
+export SCPRC=0
+
+> $LOGFILE
+
+#--------------------------------------------------------------------------
+# Verify ADMINSN is active on this host--script MUST run on ADMINSN
+#--------------------------------------------------------------------------
+/sccm/software/bin/get_service_name | grep "^${ADMINSN}$" > /dev/null
+if [ $? -ne 0 ]
+then
+	echo "\nERROR - This script MUST run on $ADMINSN" | tee -a $LOGFILE
+	echo "$ADMINSN is not active on this host (`hostname`)" | tee -a $LOGFILE
+	exit 2
+fi
+
+if [ "$PARMDATE" ]
+then
+	export SQLBTCTLDIR=$SYBDRDIR/$SOURCE_DBSERVER/sqlbt/$SOURCE_DBSERVER$PARMDATE/physical
+else
+	export SQLBTCTLDIR=$SYBDRDIR/$SOURCE_DBSERVER/sqlbt/$SOURCE_DBSERVER/physical
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DBLIST && \rm -f $DBLIST
+	test $XDBLIST && \rm -f $XDBLIST
+	test -d $TEMPDIR && \rm -rf $TEMPDIR
+}
+
+trap 'tempCleanup' EXIT INT TEM
+
+#------------------------------------------------------------------------------------
+# make/chmod the transfer directory, if it doesn't exist
+#------------------------------------------------------------------------------------
+test ! -d $TEMPDIR && mkdir $TEMPDIR
+
+#------------------------------------------------------------------------------------
+# format list of system databases to exclude
+#------------------------------------------------------------------------------------
+> $XDBLIST
+echo "^dba$" >> $XDBLIST
+echo "^dbccdb$" >> $XDBLIST
+echo "^dbccalt$" >> $XDBLIST
+echo "^lookjack$" >> $XDBLIST
+echo "^master$" >> $XDBLIST
+echo "^model$" >> $XDBLIST
+echo "^sybsecurity$" >> $XDBLIST
+echo "^sybsecurity_archive$" >> $XDBLIST
+echo "^sybsyntax$" >> $XDBLIST
+echo "^sybsystemdb$" >> $XDBLIST
+echo "^sybsystemprocs$" >> $XDBLIST
+
+#------------------------------------------------------------------------------------
+# format list of databases
+# if a file is passed, make sure it's > 0 bytes 
+# if it's not clearly a file, make sure it's not an invalid filename
+#------------------------------------------------------------------------------------
+if [ "$DBSPEC" ]
+then
+# make sure control file exists and has entries
+	if [ -f $DBSPEC ]
+	then
+		if [ -s $DBSPEC ]
+		then
+			cat $DBSPEC > $DBLIST
+		else
+			echo "WARNING - $DBSPEC is 0 bytes" >> $LOGFILE
+			exit 1
+		fi
+	else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+		echo $DBSPEC | grep '/' > /dev/null
+		if [ $? -eq 0 ]
+		then
+			echo "ERROR - $DBSPEC is not valid--possible invalid filename?"
+			exit 2
+		else
+			echo $DBSPEC > $DBLIST
+		fi
+	fi
+else
+	ls $SQLBTCTLDIR | grep -v '\.skip$' | egrep -vf $XDBLIST | sort > $DBLIST
+fi
+
+#------------------------------------------------------------------------------------
+# For each database, strip the required backup info from the control file
+#------------------------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	export OLDCTLDIR=$SQLBTCTLDIR
+	export NEWCTLDIR=$TEMPDIR
+	if [ ! -d $NEWCTLDIR ]
+	then
+		mkdir $NEWCTLDIR
+		touch $NEWCTLDIR/.dtoptions
+	fi
+	> $NEWCTLDIR/$DBNAME
+#------------------------------------------------------------------------------------
+# grab the 'options' section from the control file.
+#------------------------------------------------------------------------------------
+	head -`grep -n 'end options' $OLDCTLDIR/$DBNAME | cut -d":" -f1` $OLDCTLDIR/$DBNAME >> $NEWCTLDIR/$DBNAME
+
+#------------------------------------------------------------------------------------
+# grab the 'dump' section for the last level 0 dump from the control file.
+# this is hardcoded to grab a certain number of lines.  if sqlbt version changes, verify this is still accurate.
+# if FULL=1, get only the last level 0, else get level 0 plus all tran dumps
+#------------------------------------------------------------------------------------
+	if [ $FULL -eq 1 ]
+	then
+		tail +`grep -n 'dump=0' $OLDCTLDIR/$DBNAME | tail -1 | cut -d":" -f1` $OLDCTLDIR/$DBNAME | head -7 >> $NEWCTLDIR/$DBNAME
+	else
+		tail +`grep -n 'dump=0' $OLDCTLDIR/$DBNAME | tail -1 | cut -d":" -f1` $OLDCTLDIR/$DBNAME >> $NEWCTLDIR/$DBNAME
+	fi
+
+#------------------------------------------------------------------------------------
+# validate that the last line of the control file = "end dump"
+#------------------------------------------------------------------------------------
+	if [ "`tail -1 $NEWCTLDIR/$DBNAME`" != "end dump" ]
+	then
+		echo "ERROR - $NEWCTLDIR/$DBNAME DUMP SECTION NOT ENDED PROPERLY"
+		exit 2
+	fi
+
+	echo "Control file created for $DBNAME" >> $LOGFILE
+done
+
+#------------------------------------------------------------------------------------
+# tar up all the sqlbt control files and place it under the tran backup directory
+#------------------------------------------------------------------------------------
+echo "Tar'ing up control files" >> $LOGFILE
+cd $TEMPDIR
+tar -cvf $TARFILE * >> $LOGFILE 2>&1
+cd
+
+#------------------------------------------------------------------------------------
+# if copy parm passed, get TARGETSN name from ASEDIRLIST
+# copy the tar file to TARGETSN
+# only remove the local tar file if it was copied to the target
+# exit
+#------------------------------------------------------------------------------------
+if [ $SCP -eq 1 ]
+then
+	export TARGETSN=`grep "^${TARGET_DBSERVER} " $ASEDIRLIST | cut -d" " -f2`
+	scp -p $TARFILE $TARGETSN:$TARFILE >> $LOGFILE 2>&1
+	export SCPRC=$?
+
+	if [ $SCPRC -eq 0 ]
+	then
+		\rm $TARFILE
+		exit 0
+	else
+		echo "ERROR - $TARFILE not copied to remote server"
+		exit 2
+	fi
+else
+	echo "$TARFILE created but NOT copied to remote server"
+	exit 0
+fi

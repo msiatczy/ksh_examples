@@ -1,0 +1,150 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: evgCheckBackupDone.scr -S <DBSERVER> -D <dbname>|list {-date <yyyymmdd>}
+#
+#  Description: Check to see if database dump has been completed
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - ASE
+#              	<dbname> - database name
+#              	<date> - yyyymmdd - defaults to current date
+#
+#  Modification History:
+#	12/09/10 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname>|list {-date <yyyymmdd>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBSPEC=$2;shift 2;;
+                        -date)	export CHECKDATE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBSPEC" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/backup/$DBSERVER/$DBSERVER.evgCheckBackupDone.$DATETIME
+export DBLIST=/tmp/dblist.$$
+test ! "$CHECKDATE" && export CHECKDATE=$YYYYMMDD
+export ALLBACKUPSDONE=1
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# format dblist
+#--------------------------------------------------------------------------
+> $DBLIST
+if [ "$DBSPEC" ]
+then
+# make sure control file exists and has entries
+        if [ -f $DBSPEC ]
+        then
+                if [ -s $DBSPEC ]
+                then
+                        cat $DBSPEC > $DBLIST
+                else
+                        echo "WARNING - $DBSPEC is 0 bytes" >> $LOGFILE
+                        exit 1
+                fi
+        else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+                echo $DBSPEC | grep '/' > /dev/null
+                if [ $? -eq 0 ]
+                then
+                        echo "ERROR - $DBSPEC is not valid--possible invalid filename?"
+                        exit 2
+                else
+# single dbname was passed
+                        echo $DBSPEC > $DBLIST
+                fi
+        fi
+fi
+
+#------------------------------------------------------------------------------
+# execute SQL to check if backup is done
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Checking to see if backup for the following databases has completed on $DBSERVER on $CHECKDATE" >> $LOGFILE
+cat $DBLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	export BACKUPDONE=`$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password | sed -e 's/ *//g'
+	\`getPass $DBSERVER $ADMINLOGIN\`
+	set nocount on
+	go
+	if exists (select * from dbadb..DBA_JOB_LOG where JOB_NAME = "dump" and TYPE = "database" and OBJECT = "$DBNAME" and convert(date,STARTTIME) = "$CHECKDATE")
+		select convert(char(1),1)
+	else
+		select convert(char(1),0)
+	go
+	!
+	`
+
+# check the setting - it must be 0 or 1...if it's not, the query probably wasn't successful
+	if [ "$BACKUPDONE" != "0" -a "$BACKUPDONE" != "1" ]
+	then
+		echo "BACKUPDONE variable not properly set (not 0 or 1) - defaulting to 0" >> $LOGFILE
+		echo "BACKUPDONE=$BACKUPDONE" >> $LOGFILE
+		export BACKUPDONE=0
+	fi
+
+# if any backup status is "not done", set overall flag to not done
+	if [ $BACKUPDONE -eq 0 ]
+	then
+		export ALLBACKUPSDONE=0
+		echo "Backup NOT COMPLETE for $DBNAME" >> $LOGFILE
+	else
+		echo "Backup COMPLETE for $DBNAME" >> $LOGFILE
+	fi
+done
+
+#------------------------------------------------------------------------------
+# check dump status and exit with appropriate status
+# NOTE:  exit status are opposite of done status (e.g. exit status 0 = BACKUPDONE 1)
+#------------------------------------------------------------------------------
+if [ $ALLBACKUPSDONE -eq 1 ]
+then
+	echo "Backup for databases on $DBSERVER COMPLETED on $CHECKDATE" >> $LOGFILE
+	exit 0
+else
+	echo "Backup for one or more databases on $DBSERVER NOT COMPLETED on $CHECKDATE or error occurred checking status" >> $LOGFILE
+	exit 1
+fi

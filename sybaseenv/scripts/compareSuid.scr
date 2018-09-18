@@ -1,0 +1,134 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: compareSuid.scr -S1 <DBSERVER1> -S2 <DBSERVER2> {-m <maildest>}
+#
+#  Description: Compare suids between two Sybase servers.
+#
+#     Location:	/sccm/dba/sybase/scripts/compareSuid.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	07/11/03 M. Siatczynski	Initial Script
+#	05/12/04 M. Siatczynski	Centralize script
+#	08/23/04 M. Siatczynski	Move COMPLOG to report directory
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+#--------------------------------------------------------------------------------
+#  Initialize variables and files
+#--------------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+USAGE="ERROR - Usage: $0 -S1 <DBSERVER1> -S2 <DBSERVER2> {-m <maildest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S1)	export DBSERVER1=$2;shift 2;;
+	                -S2)	export DBSERVER2=$2;shift 2;;
+	                -m)	export MAILDEST=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER1" -o ! "$DBSERVER2" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+export SUID1=/tmp/suid.$$.1
+export SUID2=/tmp/suid.$$.2
+export MISMATCH=/tmp/mismatch.$$
+
+export COMPLOG=$RPTDIR/misc/compareSuid.$MMYYYY
+export LOGFILE=$LOGDIR/misc/$DBSERVER1/$DBSERVER1.$DBSERVER2.compareSuid.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SUID1 && \rm -f $SUID1
+	test -f $SUID2 && \rm -f $SUID2
+	test -f $MISMATCH && \rm -f $MISMATCH
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Get suids with names for DBSERVER1 and DBSERVER2
+# Remove all leading and trailing blanks and make sure there is 
+#	only a single space between suid and name
+# Sort again with a unix sort
+# Check for errors
+# If errors, exit with 1, else exit with 0
+#------------------------------------------------------------------------------
+# DBSERVER1
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER1 -w200 -b <<-! | grep -v Password | sed -e 's/^ *//g' -e 's/ *$//g' -e 's/  */ /g' | sort -n > $SUID1
+`getPass $DBSERVER1 $ADMINLOGIN`
+set nocount on
+go
+select suid,name from master..syslogins order by suid
+go
+!
+checkSqlErr $SUID1
+if [ $? -eq 1 ]
+then
+	echo "ERROR - querying syslogins on $DBSERVER1"
+	cat $SUID1
+	exit 1
+fi
+
+# DBSERVER2
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER2 -w200 -b <<-! | grep -v Password | sed -e 's/^ *//g' -e 's/ *$//g' -e 's/  */ /g' | sort -n > $SUID2
+`getPass $DBSERVER2 $ADMINLOGIN`
+set nocount on
+go
+select suid,name from master..syslogins order by suid
+go
+!
+checkSqlErr $SUID2
+if [ $? -eq 1 ]
+then
+	echo "ERROR - querying syslogins on $DBSERVER2"
+	cat $SUID2
+	exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Compare space utilization
+#------------------------------------------------------------------------------
+sdiff -s -w80 $SUID1 $SUID2 > $MISMATCH
+export RC=$?
+
+if [ $RC -eq 0 ]
+then
+	echo "`date +'%D %T'` : suids match between $DBSERVER1 and $DBSERVER2" >> $COMPLOG
+else
+	echo "`date +'%D %T'` : suids DO NOT match between $DBSERVER1 and $DBSERVER2 - see $LOGFILE" >> $COMPLOG
+	> $LOGFILE
+	date >> $LOGFILE
+	echo "Details of mismatched suids between $DBSERVER1 and $DBSERVER2" >> $LOGFILE
+	echo "--------------------------------------------------------------------------------" >> $LOGFILE
+	echo "$DBSERVER1 suid/name                         $DBSERVER2 suid/name" >> $LOGFILE
+	echo "--------------------------------------------------------------------------------" >> $LOGFILE
+	tail +2 $MISMATCH >> $LOGFILE
+	echo "\nThe last matching suid between $DBSERVER1 and $DBSERVER2 is\n" >> $LOGFILE
+	comm -12 $SUID1 $SUID2 | tail -1 >> $LOGFILE
+	export MAILFILE=$LOGFILE
+	export MAILSUBJECT="$DBSERVER1 vs. $DBSERVER2 : suid mismatch"
+	sendMail
+fi

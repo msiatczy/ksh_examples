@@ -1,0 +1,127 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: autosysSendEvent.scr -J <job name|list of jobs> -E <event> {-S <status>}
+#
+#  Description: Send an event command for one or more jobs
+#  NOTE:  this job currently is hardcoded to run against autosys PRD 
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<event> - autosys event
+#
+#  NOTE:  This script still needs ERROR checking.
+#
+#  Modification History:
+#	01/31/07 M. Siatczynski	Initial Script
+#	10/18/07 M. Siatczynski	Echo event examples when displaying usage
+#	05/26/08 M. Siatczynski	Change sleep from 20 to 10
+#	10/14/08 M. Siatczynski	Add parm for status
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -J <job name|list of jobs> -E <event> {-S <status>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        echo "EVENT Examples:  JOB_ON_HOLD, JOB_OFF_HOLD, JOB_ON_ICE, JOB_OFF_ICE, FORCE_STARTJOB, KILLJOB, CHANGE_STATUS"
+        echo "STATUS Examples for event CHANGE_STATUS:  SUCCESS, FAILURE, INACTIVE, TERMINATED"
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -J)	export JOBSPEC=$2;shift 2;;
+                        -E)	export EVENT=$2;shift 2;;
+                        -S)	export JSTATUS=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$JOBSPEC" -o ! "$EVENT" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+# set status parameter
+export STATUSPARM=""
+if [ "$EVENT" = "CHANGE_STATUS" ]
+then
+	if [ ! "$JSTATUS" ]
+	then
+		echo "ERROR - STATUS must be specified with event CHANGE_STATUS"
+		exit 1
+	else
+		export STATUSPARM="-s $JSTATUS"
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/autosysSendEvent.$DATETIME.$$
+export JOBLIST=/tmp/joblist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $JOBLIST && \rm -f $JOBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Create list of job names
+#--------------------------------------------------------------------------
+> $JOBLIST
+if [ -f $JOBSPEC ]
+then
+	cat $JOBSPEC >> $JOBLIST
+else
+	echo $JOBSPEC >> $JOBLIST
+fi
+
+#--------------------------------------------------------------------------
+# source the file to set the autosys PRD environment and
+# run the outage script for each service name
+#--------------------------------------------------------------------------
+. /opt/sccm/autouser/bin/autoprd
+
+> $LOGFILE
+echo "`date` Send event ($EVENT $STATUSPARM) for the following job names:" >> $LOGFILE
+cat $JOBLIST >> $LOGFILE
+
+cat $JOBLIST |
+while read JOBNAME
+do
+	$AUTOSYS/bin/sendevent -J $JOBNAME -E $EVENT $STATUSPARM >> $LOGFILE
+done
+
+#--------------------------------------------------------------------------
+#  Wait 10 seconds
+#  Visually inspect the job settings
+#--------------------------------------------------------------------------
+sleep 10
+cat $JOBLIST |
+while read JOBNAME
+do
+	$AUTOSYS/bin/autorep -J $JOBNAME | grep $JOBNAME | tee -a $LOGFILE
+done
+
+#--------------------------------------------------------------------------
+# Exit with 0
+#--------------------------------------------------------------------------
+exit 0

@@ -1,0 +1,58 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+# temp script to parse connection timing files
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -h <hostname> -d <mmddyyyy> {-sort}"
+export CALLED="$0 $*"
+
+export SORT=0
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -h)     export HOST=$2;shift 2;;
+                        -d)     export DATE=$2;shift 2;;
+                        -sort)  export SORT=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$HOST" -o ! "$DATE" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export FILE=$PERFDIR/timeConn/$DBSERVER/$DBSERVER.timeConn.from.$HOST.$DATE
+
+if [ ! -s "$FILE" ]
+then
+	echo "$FILE does not exist or is 0 bytes"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Parse the file
+#--------------------------------------------------------------------------
+if [ $SORT -eq 1 ]
+then
+	cut -d" " -f1,2,9 $FILE | sort -n +2
+else
+	cut -d" " -f1,2,9 $FILE
+fi

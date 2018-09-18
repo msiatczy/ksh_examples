@@ -1,0 +1,156 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sysmon.scr -S <DBSERVER> -mm <minutes> {-ss <seconds> -storecpu}
+#
+#  Description: Execute sp_sysmon against DBSERVER for sample interval specified by <minutes> and <seconds>.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER>
+#              	<minutes> - sample interval minutes specified as mm
+#              	<seconds> - sample interval seconds specified as ss
+#
+#  Modification History:
+#	04/02/04 M. Siatczynski	Rewrite and centralize original script
+#	03/23/05 M. Siatczynski If exit with 1, send email to dba, but don't echo message to console
+#				(should ultimately include a valid list of messages to ignore)
+#	02/10/06 M. Siatczynski Implement ISQLEXE, getPass, ADMINLOGIN
+#	03/15/07 M. Siatczynski Added space after DBSERVER on pgrep so it finds the correct process
+#	10/18/07 M. Siatczynski Add parm to allow storage of cpu data in database
+#	10/22/07 M. Siatczynski Add parm noclear to sysmon so stats aren't cleared (causes problems for MDA)
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -mm <minutes> {-ss <seconds> -storecpu}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -mm)    export MM=$2;shift 2;;
+                        -ss)    export SS=$2;shift 2;;
+                        -storecpu)    export STORECPU=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$MM" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+# If seconds are not passed, default to 00
+test ! "$SS" && export SS="00"
+
+# If storecpu not passed, default to 0
+test ! "$STORECPU" && export STORECPU=0
+
+# check format of MM (and SS, if passed)
+echo $MM | grep "[0-9]\{2\}" > /dev/null
+if [ $? -ne 0 ]
+then
+	echo $USAGE
+	echo "ERROR - minutes must be 2 digits"
+	exit 1
+fi
+
+echo $SS | grep "[0-9]\{2\}" > /dev/null
+if [ $? -ne 0 ]
+then
+	echo $USAGE
+	echo "ERROR - seconds must be 2 digits"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$PERFDIR/sysmon/$DBSERVER/$DBSERVER.sysmon.$DATETIME
+export CURRENTPID=$$
+export MAILFILE=/tmp/mailfile.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export ADMINDBSERVER=PREDWOOD
+export SMDATE=$YYYYMMDD
+export SMTIME=$TIME_HHMMSS
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Check to see if another sysmon is already running
+#--------------------------------------------------------------------------
+export RUNNINGPID=`pgrep -U sybase -f "sysmon\.scr \-S $DBSERVER "`
+if [ $CURRENTPID -ne $RUNNINGPID ]
+then
+	echo "`date` : sysmon already running for $DBSERVER" | tee -a $LOGFILE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# Execute sp_sysmon against DBSERVER
+#--------------------------------------------------------------------------
+
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e <<-! | grep -v Password >> $LOGFILE
+`getPass $DBSERVER $ADMINLOGIN`
+exec sp_sysmon "00:$MM:$SS", noclear
+go
+!
+
+#------------------------------------------------------------------------------
+# check for errors
+# if STORECPU, store data in database
+#------------------------------------------------------------------------------
+checkSqlErr $LOGFILE
+if [ $? -eq 1 ]
+then
+	> $MAILFILE
+	echo "ERROR - failed to execute sp_sysmon against $DBSERVER" >> $MAILFILE
+	echo "Review output in $LOGFILE" >> $MAILFILE
+	export MAILSUBJECT="$DBSERVER: sysmon FAILED"
+	sendMail
+	exit 1
+else
+	if [ $STORECPU -eq 1 ]
+	then
+		export CPUVAL=`grep '^                  Average       ' $LOGFILE | sed -e 's/  */ /g' | cut -d" " -f3`
+		> $SQLFILE
+		> $SQLOUT
+
+		echo "insert perfdata..cpu values (\"$SMDATE\",\"$SMTIME\",\"$DBSERVER\",$CPUVAL)" >> $SQLFILE
+		echo "go" >> $SQLFILE
+
+		getPass $ADMINDBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$ADMINDBSERVER -w200 -i $SQLFILE >> $SQLOUT
+
+		checkSqlErr $SQLOUT
+		if [ $? -eq 1 ]
+		then
+			echo "ERROR - Unable to store cpu utilization for $DBSERVER in $ADMINDBSERVER"
+		fi
+	fi
+	exit 0
+fi

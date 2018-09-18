@@ -1,0 +1,230 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findMissingIndexStats.scr -S <DBSERVER>|all -D <dbname>|all> {-m <maildest> -update}
+#
+#  Description: Check for index columns which do not have stats
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	10/20/10 M. Siatczynski	Initial Script
+#	02/23/11 M. Siatczynski	Correct query to find missing stats, add index name to select, add parm to call script to update index stats
+#	02/25/11 M. Siatczynski	Update code block to source profile
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|all -D <dbname>|all> {-m <maildest> -update}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -update)     export UPDATE=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" -o ! "$ONEDBNAME" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$UPDATE" && export UPDATE=0
+
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export DBLIST=/tmp/dbnamelist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export MAILFILE=/tmp/mailfile.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dbserverlist
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAse15List > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# For each DBSERVER
+# create separate log file for each ASE
+# create a working dbnamelist
+# format sql
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	export LOGFILE=$LOGDIR/stats/$DBSERVER/$DBSERVER.findMissingIndexStats.$DATETIME
+	> $LOGFILE
+	echo "`date` START $DBSERVER check for missing index stats" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+#--------------------------------------------------------------------------
+	if [ "$ONEDBNAME" = "all" ]
+	then
+		getDbList -S $DBSERVER -user -system > $DBLIST
+		if [ $? -eq 1 ]
+		then
+			echo "ERROR - getting list of databases from $DBSERVER" | tee -a $LOGFILE
+			cat $DBLIST >> $LOGFILE
+			export HIGHRC=1
+			continue
+		fi
+	else
+		echo $ONEDBNAME > $DBLIST
+	fi
+	echo "The following databases will be checked:" >> $LOGFILE
+	cat $DBLIST >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# format SQL
+# execute SQL
+# check for errors
+#--------------------------------------------------------------------------
+	> $SQLFILE
+	echo "set nocount on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	for DBNAME in `cat $DBLIST`
+	do
+		export DBNAME
+		echo "use $DBNAME" >> $SQLFILE
+		echo "go" >> $SQLFILE
+
+# FUTURE - SQL below can be replaced with sp_missing_indexstats - this proc only works with 15.0.2 ESD #6 and higher
+#		echo "exec sp_missing_stats" >> $SQLFILE
+
+		echo "select" >> $SQLFILE
+		echo "convert(varchar,db_name()) + ' ' + convert(varchar,object_name(i.id)) + ' ' + i.name + ' (' + convert(varchar,dbo.sp_f_indexcols(object_name(i.id),i.name)) + ')'" >> $SQLFILE
+		echo "from sysindexes i" >> $SQLFILE
+		echo "where i.id > 99 and i.indid > 0 and i.indid < 255" >> $SQLFILE
+		echo "and row_count(db_id(),i.id) > 0" >> $SQLFILE
+		echo "and i.id not in" >> $SQLFILE
+		echo "(select s.id" >> $SQLFILE
+		echo "from sysstatistics s," >> $SQLFILE
+		echo "sysindexes i" >> $SQLFILE
+		echo "where i.id = s.id and s.formatid=100" >> $SQLFILE
+		echo "and dbo.sp_f_indexcols(object_name(i.id),i.name)=dbo.sp_f_colstats(s.colidarray,s.id))" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+
+	> $SQLOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w999 -i$SQLFILE -b | grep -v Password >> $SQLOUT
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+	        echo "$DBSERVER:  SQL FAILED" >> $LOGFILE
+		cat $SQLOUT >> $LOGFILE
+	        export HIGHRC=1
+	        continue
+	else
+		if [ -s "$SQLOUT" ]
+		then
+		        echo "\nMissing stats detected" >> $LOGFILE
+			cat $SQLOUT >> $LOGFILE
+
+			if [ $UPDATE -eq 1 ]
+			then
+# call script to update index stats
+				echo "\nCalling updateIndexStats.scr to update stats..." >>  $LOGFILE
+				cat $SQLOUT |
+				while read DBNAME TABLENAME INDEXNAME COLS
+				do
+					echo "\nUpdating index stats for $DBNAME $TABLENAME $INDEXNAME" >> $LOGFILE
+					$SCRDIR/updateIndexStats.scr -S $DBSERVER -D $DBNAME -T $TABLENAME -I $INDEXNAME -m $MAILDEST
+					if [ $? -eq 0 ]
+					then
+						echo "Update index stats SUCCESSFUL for $DBNAME $TABLENAME $INDEXNAME" >> $LOGFILE
+					else
+						echo "Update index stats FAILED for $DBNAME $TABLENAME $INDEXNAME" >> $LOGFILE
+					fi
+				done
+			fi
+		else
+		        echo "\nNo missing stats detected" >> $LOGFILE
+		fi
+	fi
+#--------------------------------------------------------------------------
+# Send mail if missing stats found
+#--------------------------------------------------------------------------
+	if [ -s "$SQLOUT" ]
+	then
+		> $MAILFILE
+		echo "$DBSERVER - No stats were found in sysstatistics for the following objects(columns)." >> $MAILFILE
+		echo "Objects listed below had a rowcount > 0 at the time of the check." >> $MAILFILE
+		echo "" >> $MAILFILE
+		echo "FORMAT:  dbname table index (index columns)" >> $MAILFILE
+		echo "" >> $MAILFILE
+		cat $SQLOUT >> $MAILFILE
+		if [ $UPDATE -eq 1 ]
+		then
+			echo "\nMissing stats were automatically updated.  See $LOGFILE for details" >> $MAILFILE
+		else
+			echo "\nYou may use updateIndexStats.scr to create index statistics on the designated indexes" >> $MAILFILE
+			echo "- OR -" >> $MAILFILE
+			echo "Re-execute findMissingIndexStats.scr with the -update parm." >> $MAILFILE
+		fi
+		export MAILSUBJECT="$DBSERVER - Missing index stats"
+		sendMail
+	fi
+	echo "\n`date` END $DBSERVER check for missing index stats" >> $LOGFILE
+done
+
+#--------------------------------------------------------------------------
+# Exit with final status
+#--------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+	exit 1
+else
+	exit 0
+fi

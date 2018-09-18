@@ -1,0 +1,131 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: pushLoginProc.scr -P <proc filename> -S <DBSERVER> -D <dbname>|all
+#
+#  Description: Push one proc to one or all databases on an ASE
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  NOTE:  This script is used for ASE15 instances ONLY!!
+#
+#  Modification History:
+#	11/11/08 J. Aspenleiter	Initial Script - Copied from pushProc.scr
+#	02/04/09 J. Aspenleiter	Mods to reference DISTDIR -- copied from pushProcDb.scr
+#	04/23/10 M. Siatczynski LOGFILE path corrected
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -P <proc filename> -S <DBSERVER> -D <dbname>|all"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -P)	export PROC=$2;shift 2;;
+	                -S)	export DBSERVER=$2;shift 2;;
+			-D)	export ONEDB=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$PROC" -o ! "$DBSERVER" -o ! "$ONEDB" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# initialize variables
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/$DBSERVER/pushLoginProc.$DATETIME
+export DBLIST=/tmp/dbname.lst.$$
+export PROCDIR=$DISTDIR/procs/ase15/login_procs
+
+#--------------------------------------------------------------------------
+# validate proc file
+#--------------------------------------------------------------------------
+echo "$PROCFILE" | tee -a $LOGFILE
+export PROCFILE=$PROCDIR/$PROC
+if [ ! -s $PROCFILE ]
+then
+	echo "ERROR - $PROCFILE does not exist or is 0 bytes" | tee -a $LOGFILE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# format dblist
+# 'all' implies user databases AND master AND model
+#--------------------------------------------------------------------------
+> $DBLIST
+if [ "$ONEDB" = "all" ]
+then
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password >> $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from sysdatabases where 
+	name not like 'dbcc%' 
+	and name not like 'sybsecurity%' 
+	and name not like 'sybsystem%' 
+	and name not like 'tempdb%' 
+	and name not in ('dba','lookjack','sybsyntax')
+	and status&1024 <> 1024
+	go
+	!
+else
+	echo $ONEDB >> $DBLIST
+
+fi
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Add the new proc(s) to dbserver(s)
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Pushing procs" >> $LOGFILE
+
+echo "\nCreating proc(s) on $DBSERVER..." | tee -a $LOGFILE
+
+for DB in `cat $DBLIST`
+do
+	echo "Creating proc in $DB" | tee -a $LOGFILE
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -D$DB -i$PROCFILE -w200 | grep -v Password >> $LOGFILE
+done
+
+#--------------------------------------------------------------------------
+#  check SQL errors
+#  exit
+#--------------------------------------------------------------------------
+checkSqlErr $LOGFILE
+if [ $? -ne 0 ]
+then
+        echo "ERROR - creating proc(s)" | tee -a $LOGFILE
+        echo "Review $LOGFILE"
+        exit 1
+else
+        echo "proc(s) SUCCESSFULLY created" | tee -a $LOGFILE
+	exit 0
+fi

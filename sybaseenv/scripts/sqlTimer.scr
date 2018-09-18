@@ -1,0 +1,137 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sqlTimer.scr -S <DBSERVER> -i <sql file> -o <sql out> -m <mail file>
+#
+#  Description: Executes a SQL query (as user sa) and records the execution time
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters: -S:	DBSERVER
+#		-i:	SQL file
+#		-o:	output file
+#		-m:	mail file
+#
+#
+#  Modification History:
+#	10/30/03 M. Siatczynski	Rewrite original script/centralize/standardize
+#	06/21/04 M. Siatczynski	Initialized SQLOUT before appending to it
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	03/21/11 M. Siatczynski	Update to accommodate AMG East
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -i <sql file> -o <output file> -m <mail file>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -i)     export SQLFILE=$2;shift 2;;
+                        -o)     export OUTFILE=$2;shift 2;;
+                        -m)     export MAILFILE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$SQLFILE" -o ! "$OUTFILE" ]
+then
+        echo $USAGE
+        exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+SQLOUT=/tmp/sqlout.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Get the start time
+#--------------------------------------------------------------------------
+export STARTPARMS=`date '+%j %H %M %S'`
+export STARTTIME=`date`
+let SDAY=`echo $STARTPARMS | awk '{print $1}'`
+let SHOUR=`echo $STARTPARMS | awk '{print $2}'`
+let SMIN=`echo $STARTPARMS | awk '{print $3}'`
+let SSEC=`echo $STARTPARMS | awk '{print $4}'`
+
+#--------------------------------------------------------------------------
+# Execute the SQL
+#--------------------------------------------------------------------------
+> $SQLOUT
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -i$SQLFILE -e -w200 | grep -v Password >> $SQLOUT
+
+#--------------------------------------------------------------------------
+# Get the end time
+#--------------------------------------------------------------------------
+export ENDPARMS=`date '+%j %H %M %S'`
+export ENDTIME=`date`
+let EDAY=`echo $ENDPARMS | awk '{print $1}'`
+let EHOUR=`echo $ENDPARMS | awk '{print $2}'`
+let EMIN=`echo $ENDPARMS | awk '{print $3}'`
+let ESEC=`echo $ENDPARMS | awk '{print $4}'`
+
+#--------------------------------------------------------------------------
+# If EDAY is less than SDAY, then we have rolled over to a new year, calculate appropriately
+#--------------------------------------------------------------------------
+test $EDAY -lt $SDAY && let EDAY=$EDAY+$SDAY
+
+#--------------------------------------------------------------------------
+# Calculate the total number of seconds
+#--------------------------------------------------------------------------
+let DAY=$EDAY-$SDAY
+let HOUR=$EHOUR-$SHOUR
+let MIN=$EMIN-$SMIN
+let SEC=$ESEC-$SSEC
+let TIME=$SEC+$MIN*60+$HOUR*3600+$DAY*86400
+
+#--------------------------------------------------------------------------
+# Write time trailers
+# Check for SQL errors
+# Write sql results to log
+# If SQL errors, write results to mail file
+#--------------------------------------------------------------------------
+echo "START TIME: $STARTTIME" >> $SQLOUT
+echo "END TIME: $ENDTIME" >> $SQLOUT
+echo "DURATION(SEC): $TIME" >> $SQLOUT
+
+checkSqlErr $SQLOUT
+if [ $? = 0 ]
+then
+	echo "STATUS: SUCCESSFUL\n" >> $SQLOUT
+	cat $SQLOUT >> $OUTFILE
+	exit 0
+else 
+	echo "STATUS: FAILED\n" >> $SQLOUT
+	cat $SQLOUT >> $OUTFILE
+	test "$MAILFILE" && cat $SQLOUT >> $MAILFILE
+	exit 1
+fi

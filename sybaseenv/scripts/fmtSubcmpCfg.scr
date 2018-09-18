@@ -1,0 +1,190 @@
+#!/bin/ksh 
+#--------------------------------------------------------------------------
+#        Usage: fmtSubcmpCfg.scr -RS <REPSERVER> -PDS <PDS> -RDS <RDS> (-L <dbtablist> | -D <dbname> -T <table>) {-m <maildest>}
+#
+#  Description: Format config files for rs_subcmp for one or more tables
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	PDS - Primary ASE
+#              	ONEDB - single dbname
+#              	ONETABLE - single table
+#              	DBTABLIST - list of databases/tables
+#              	MAILDEST - override default maildest of dba
+#
+#  NOTE:  Script MUST run from host in same env as RS
+#
+#  Modification History:
+#	12/01/08 M. Siatczynski	Original script
+#	12/16/08 M. Siatczynski	Remove password and login from cfg file, will be specified on cmdline
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -RS <REPSERVER> -PDS <PDS> -RDS <RDS> (-L <dbtablist> | -D <dbname> -T <table>) {-m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -RS)    export REPSERVER=$2;shift 2;;
+                        -PDS)   export PDS=$2;shift 2;;
+                        -RDS)   export RDS=$2;shift 2;;
+                        -L)     export DBTABLIST=$2;shift 2;;
+                        -D)     export ONEDB=$2;shift 2;;
+                        -T)     export ONETABLE=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+# REPSERVER and PDS MUST be passed
+if [ ! "$REPSERVER" -o ! "$PDS" -o ! "$RDS" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+# a single dbname/table and list of databases/tables is mutually exclusive
+if [ \( "$ONEDB" -o "$ONETABLE" \) -a "$DBTABLIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - DBNAME/TABLE and DBTABLIST are mutually exclusive"
+        exit 1
+fi
+
+# make sure the passed lists exist
+if [ "$DBTABLIST" -a ! -s "$DBTABLIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - $DBTABLIST does not exist or is 0 bytes"
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export TMPDBTABLIST=/tmp/dbtablist.$$
+export KEYFILE=/tmp/keys.$$
+export MAILFILE=/tmp/mailfile.$$
+export LOGFILE=$LOGDIR/replication/$REPSERVER/$REPSERVER.fmtSubcmpCfg.$DATETIME
+
+export ERRORFLAG=0
+> $LOGFILE
+> $MAILFILE
+
+echo "`date` SCRIPT START" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $KEYFILE && \rm -f $KEYFILE
+	test -f $TMPDBTABLIST && \rm -f $TMPDBTABLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Format list of dbnames and tables
+#  DBTABLIST implies a list of databases/tables was passed
+#--------------------------------------------------------------------------
+test "$DBTABLIST" && cat $DBTABLIST > $TMPDBTABLIST || echo $ONEDB $ONETABLE > $TMPDBTABLIST
+
+#--------------------------------------------------------------------------
+#  Get key columns for each table and format cfg file
+#--------------------------------------------------------------------------
+cat $TMPDBTABLIST |
+while read DBNAME TABLE
+do
+	$ISQLEXE -U$ADMINLOGIN -S$PDS -b -w200 <<-! | grep -v Password | sed -e 's/^ //g' -e 's/  */ /g'  > $KEYFILE
+	`getPass $PDS $ADMINLOGIN`
+	set proc_return_status off
+	go
+	use $DBNAME
+	go
+	exec sp_getUnqCol $TABLE
+	go
+	!
+
+	checkSqlErr $KEYFILE
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting key(s) for $PDS.$DBNAME.$TABLE"
+		cat $KEYFILE >> $LOGFILE
+		export ERRORFLAG=1
+		continue
+	fi
+	export ALLKEYS=`cat $KEYFILE`
+
+	export CFGFILE=$CTLDIR/$REPSERVER/subcmp/$REPSERVER.$DBNAME.$TABLE.cfg
+# if the file does not exists OR if the file exists and is writable, create/overwrite the file
+	if [ ! -f $CFGFILE -o -w $CFGFILE ]
+	then
+		> $CFGFILE
+		chmod 600 $CFGFILE
+
+		echo "PDS = $PDS" >> $CFGFILE
+		echo "RDS = $RDS" >> $CFGFILE
+		echo "PDB = $DBNAME" >> $CFGFILE
+		echo "RDB = $DBNAME" >> $CFGFILE
+		echo "PTABLE = $TABLE" >> $CFGFILE
+		echo "RTABLE = $TABLE" >> $CFGFILE
+		echo "PSELECT = select * from $TABLE order by $ALLKEYS" >> $CFGFILE
+		echo "RSELECT = select * from $TABLE order by $ALLKEYS" >> $CFGFILE
+#		echo "PUSER = $ADMINLOGIN" >> $CFGFILE
+#		echo "RUSER = $ADMINLOGIN" >> $CFGFILE
+#		echo "PPWD = `getPass $PDS $ADMINLOGIN`" >> $CFGFILE
+#		echo "RPWD = `getPass $RDS $ADMINLOGIN`" >> $CFGFILE
+
+## key loop here
+		export NUMKEYS=0
+		export NUMKEYS=`echo $ALLKEYS | nawk -F"," '{print NF}'`
+		export KEYNUM=1
+		while [ $KEYNUM -le $NUMKEYS ]
+		do
+		        export KEY=`echo $ALLKEYS | cut -d"," -f$KEYNUM`
+			echo "KEY = $KEY" >> $CFGFILE
+		        export KEYNUM=`expr $KEYNUM + 1`
+		done
+## key loop ends
+
+		echo "RECONCILE = N" >> $CFGFILE
+		echo "VISUAL = Y" >> $CFGFILE
+		echo "NUM_TRIES = 3" >> $CFGFILE
+		echo "WAIT = 10" >> $CFGFILE
+	else
+		echo "$CFGFILE exists but is not writable -- it must be update manually" | tee -a $LOGFILE
+	fi
+done
+
+#--------------------------------------------------------------------------
+# If there were any failures, send email
+#--------------------------------------------------------------------------
+echo "`date` SCRIPT END" >> $LOGFILE
+
+if [ $ERRORFLAG -eq 1 ]
+then
+	echo "`date` $REPSERVER subcmp cfg format FAILED.\n" >> $MAILFILE
+	cat $LOGFILE >> $MAILFILE
+	export MAILSUBJECT="$REPSERVER subcmp cfg format FAILED"
+	sendMail
+
+	exit 1
+else
+	exit 0
+fi

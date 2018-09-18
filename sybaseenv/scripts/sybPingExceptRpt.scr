@@ -1,0 +1,73 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sybPingExceptRpt.scr
+#
+#  Description: If the ping exceptions list contains data, mail it to dba.
+#
+#     Location: /sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	none
+#   
+#   Parameters:	none
+#
+#  Modification History:
+#       01/24/02 M. Siatczynski Original script
+#       01/02/04 M. Siatczynski Centralized script
+#       03/17/08 M. Siatczynski Compare to previous exceptions, only report if different, but always report the first run for a calendar day
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export PING_EXCEPT_LIST=$CTLDIR/sybPingExcept.lst
+export CURRJJJ=`date +"%j"`
+export PREVFILEBASE=sybPingExcept.lastcheck
+export PREVFILE=$CTLDIR/$PREVFILEBASE.$CURRJJJ
+export DIFFFILE=/tmp/pingdiff.$$
+export MAILFILE=/tmp/mailfile.$$
+export MAILSUBJECT="sybPing exceptions"
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $DIFFFILE && \rm -f $DIFFFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------------------
+# Create the "previous" file, if it doesn't exist
+# Remove any "previous" files older than 1 day
+#------------------------------------------------------------------------------------------
+test ! -f $PREVFILE && touch $PREVFILE
+find $CTLDIR -name $PREVFILEBASE.'*' -mtime +1 -exec \rm {} \;
+
+#------------------------------------------------------------------------------------------
+# If the exceptions list contains data, compare it to the previous exceptions file
+# If they aren't the same, mail it to dba
+# Overwrite the previous file with the current exceptions
+#------------------------------------------------------------------------------------------
+if [ -s "$PING_EXCEPT_LIST" ]
+then
+	diff $PING_EXCEPT_LIST $PREVFILE > $DIFFFILE
+	if [ -s $DIFFFILE ]
+	then
+		> $MAILFILE
+		echo "The following servers are sybPing exceptions." >> $MAILFILE
+		echo "Update $PING_EXCEPT_LIST, if necessary." >> $MAILFILE
+		echo "" >> $MAILFILE
+		cat $PING_EXCEPT_LIST >> $MAILFILE
+		sendMail
+	fi
+	cp $PING_EXCEPT_LIST $PREVFILE
+fi
+
+#------------------------------------------------------------------------------------------
+# Exit with 0
+#------------------------------------------------------------------------------------------
+exit 0

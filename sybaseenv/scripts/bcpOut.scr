@@ -1,0 +1,200 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: bcpOut.scr -S <DBSERVER> -D <dbname> -T <table>|<list of tables> -datdir <datdir> {-datfile <filename> -A <packet size> -pagedone <pagedest> -dtstamp}
+#
+#  Description: bcp out or more tables in a database
+#
+#  NOTE:  defaults:  character format, columns delimted by "^^", rows detlimited by "++\n"
+#
+#     Location:	/sccm/dba/sybase/scripts/bcpOut.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - short description of parm if not obvious
+#              	<dbname> - database name
+#              	<T> - single table or list of tables
+#              	<datdir> - directory where bcp data files will be written to
+#              	<datfile> - specific data file name - allows for rerun of job
+#              	<A> - packet size
+#              	<dtstamp> - add datetime stamp to output file
+#
+#  Modification History:
+#	05/25/05 M. Siatczynski	Original script
+#	11/03/05 M. Siatczynski	Added ++\n as row delimiter so this can be used for most tables
+#	02/21/06 M. Siatczynski	Add -X to bcp (security), implement getPass, ADMINLOGIN
+#	07/03/06 M. Siatczynski	Add -D <dbname> parm
+#	12/29/06 M. Siatczynski	Change -L parm to -T parm and allow for single table or list of tables, add -A parm, change -to to -datdir, add -datfile
+#	03/06/07 M. Siatczynski	Chmod DATFILE so not readable by world
+#	12/12/07 M. Siatczynski	Add -dtstamp flag to allow adding datetime stamp to output file
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname> -T <table>|<list of tables> -datdir <datdir> {-datfile <filename> -A <packet size> -pagedone <pagedest> -dtstamp}"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -T)     export TABLESPEC=$2;shift 2;;
+                        -datdir)    export DATDIR=$2;shift 2;;
+                        -datfile)   export DATFILESPEC=$2;shift 2;;
+                        -A)	export PKTSIZE=$2;shift 2;;
+                        -pagedone)    export PAGEDONE=$2;shift 2;;
+                        -dtstamp)    export DTSTAMP=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBNAME" -o ! "$TABLESPEC" -o ! "$DATDIR" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+if [ ! -d $DATDIR ]
+then
+	echo "ERROR - $DATDIR is not a valid directory"
+	exit 1
+fi
+
+# if packet size is specified, format PACKETSPEC
+if [ "$PKTSIZE" ]
+then
+	export PACKETSPEC="-A $PKTSIZE"
+else
+	export PACKETSPEC=""
+fi
+
+test ! "$DTSTAMP" && export DTSTAMP=0
+
+#--------------------------------------------------------------------------
+#  Initialize and validate Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.$DBNAME.bcpOut.$DATETIME
+export HIGHRC=0
+
+export TEMPOUT=/tmp/tempout.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export TABLELIST=/tmp/tablelist.$$
+
+# validate single table or list of tables
+if [ "$TABLESPEC" ]
+then
+# if the login spec is a file, validate the file contains something
+        if [ -f $TABLESPEC ]
+        then
+                if [ -s $TABLESPEC ]
+                then
+                        cat $TABLESPEC > $TABLELIST
+# if the tablelist is valid, verify a specific datfile name was not passed -- only valid with single table
+                        if [ "$DATFILESPEC" ]
+			then
+                        	echo "ERROR - datfile name can only be specified when single table is passed"
+	                        exit 1
+			fi
+                else
+                        echo "ERROR - $TABLESPEC is 0 bytes"
+                        exit 1
+                fi
+        else
+# make sure the loginspec doesn't contain slashes--otherwise it may be an invalid file reference
+# if it doesn't contain slashes, then it's probably a login name
+                echo $TABLESPEC | grep '/' > /dev/null
+                if [ $? -eq 0 ]
+                then
+                        echo "ERROR - $TABLESPEC is not valid--possible invalid filename?"
+                        exit 1
+                else
+                        echo $TABLESPEC > $TABLELIST
+                fi
+        fi
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $TEMPOUT && \rm -f $TEMPOUT
+	test $PAGEMSG && \rm -f $PAGEMSG
+	test $TABLELIST && \rm -f $TABLELIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------------
+# bcp out
+# write the rows copied per table to a file for compare during bcp in
+# check for errors
+#------------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START BCP OUT of the following tables from $DBSERVER.$DBNAME:" >> $LOGFILE
+cat $TABLELIST >> $LOGFILE
+
+cat $TABLELIST |
+while read TABLE
+do
+	export TABLE
+	if [ "$DATFILESPEC" ]
+	then
+		export DATFILE=$DATDIR/$DATFILESPEC
+	else
+		if [ $DTSTAMP -eq 1 ]
+		then
+			export DATFILE=$DATDIR/$DBSERVER.$DBNAME.$TABLE.$DATETIME.dat
+		else
+			export DATFILE=$DATDIR/$DBSERVER.$DBNAME.$TABLE.dat
+		fi
+	fi
+	> $TEMPOUT
+
+	echo "\n`date` START bcp out TABLE:$TABLE" >> $LOGFILE
+	getPass $DBSERVER $ADMINLOGIN | $OCSBIN/bcp ${DBNAME}..${TABLE} out ${DATFILE} -c -t"^^" -r"++\n" -X -U$ADMINLOGIN -S$DBSERVER $PACKETSPEC | grep -v Password: >> $TEMPOUT
+
+	test -f $DATFILE && chmod 640 $DATFILE
+	
+	cat $TEMPOUT >> $LOGFILE
+
+	checkBcpErr $TEMPOUT
+	if [ $? -eq 1 ]
+	then
+		echo "\n`date` END bcp out FAILED for TABLE:$TABLE" >> $LOGFILE
+	        export HIGHRC=1
+	else
+		echo "\n`date` END bcp out SUCCESSFUL for TABLE:$TABLE" >> $LOGFILE
+	fi
+done
+	
+#------------------------------------------------------------------------------
+# send page(s) if applicable
+# format the pagemsg
+# if pagedone, send appropriate page
+#------------------------------------------------------------------------------
+
+if [ "$PAGEDONE" ]
+then
+	test $HIGHRC -ne 0 && echo "bcpOut FAILED against $DBSERVER.$DBNAME" > $PAGEMSG || echo "bcpOut SUCCESSFUL against $DBSERVER.$DBNAME" > $PAGEMSG
+        export PAGEDEST=$PAGEDONE
+        sendPage
+fi
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+if [ $HIGHRC -ne 0 ]
+then
+	echo "`date` END BCP OUT COMPLETED with ERRORS" >> $LOGFILE
+	exit 1
+else
+	echo "`date` END BCP OUT COMPLETED SUCCESSFULLY" >> $LOGFILE
+	exit 0
+fi

@@ -1,0 +1,246 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: nativeTranDump.scr -S DBSERVER -dumpdir <main dump directory> {(-D DBNAME | -all | -L DBLIST) -compress <compression level> 
+#	 -m <maildest> -pagedone <pagedest>}
+#
+#  Description: Perform native sybase tran dump of one or a list or all databases on a server
+#  NOTE:  Databases are dumped sequentially, one at a time, from largest to smallest.
+#
+#     Location:	/sccm/dba/sybase/scripts/nativeTranDump.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#              	<DBNAME> - database name 
+#		<all> - This will dump all transaction logs that can be backed up.
+#              	<DUMPDIR> - base dump directory
+#              	<COMPLEVEL> - compression level (defaults to 100--tells us to use the sybdb.dbo.dl_dump_opt table)
+#				If no compression is to be used, you MUST pass this parameter with a 0.  This will
+#				tell the sp_dump_db proc that you do NOT want compression.
+#
+#  Modification History:
+#	12/23/04 M. Siatczynski	Original script
+#	12/28/04 M. Siatczynski	Replace -p parm with pagedone parm
+#	06/03/05 M. Siatczynski	Comment out "starting" page
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	05/19/09 M. Siatczynski	Updated to use new compression syntax (required format for archive database compatibility)
+#	10/27/09 J. Aspenleiter Updated script to use sp_dump_tran
+#	02/10/10 J. Aspenleiter Changed exit code from 1 to 2 for error.
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.miscfunctions
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-dumpdir <main dump directory> (-D <DBNAME> -L <DBLIST>) -compress <compression level>  -m <maildest> -pagedone <pagedest>}"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 2
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)		export DBSERVER=$2;shift 2;;
+                        -D)		export DBNAME=$2;shift 2;;
+                        -L)     	export DBLIST=$2;shift 2;;
+                        -dumpdir)	export DUMPDIR=$2;shift 2;;
+                        -compress)	export COMPLEVEL=$2;shift 2;;
+                        -m)		export MAILDEST=$2;shift 2;;
+                        -pagedone)	export PAGEDONE=$2;shift 2;;
+                        -*)		echo $USAGE;exit 2;;
+                        *)		echo $USAGE;exit 2;;
+                esac
+        done
+fi
+
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 2
+fi
+
+if [ "$DBNAME" -a "$DBLIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - DBNAME and DBLIST are mutually exclusive"
+        exit 2
+fi
+ 
+if [ "$DBLIST" -a ! -s "$DBLIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - DBLIST does not exist or is 0 bytes"
+        exit 2
+fi
+
+export ERRORFLAG=0
+export EXITRC=0
+export SQLFILE=/tmp/nativeTranDump.sql.$$
+export TMPDBLIST=/tmp/dblist.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+if [ "$DBNAME" ]
+then
+	export LOGFILE=$LOGDIR/backup/$DBSERVER/$DBSERVER.$DBNAME.nativeTranDump.$DATETIME
+else
+	export LOGFILE=$LOGDIR/backup/$DBSERVER/$DBSERVER.nativeTranDump.$DATETIME
+fi
+
+#--------------------------------------------------------------------------
+# validate dump directory, databases to dump, and compression level
+#--------------------------------------------------------------------------
+test ! "$DUMPDIR" && export DUMPDIR="0"
+test ! "$DBNAME" && export ALL_DB=1
+if [ $DUMPDIR != "0" ]
+then
+	if [ ! -d $DUMPDIR ]
+	then
+        	echo "ERROR - $DUMPDIR is not a valid directory"
+        	exit 2
+	fi
+	#create the DBSERVER subdirectory if it doesn't already exist
+	test ! -d $DUMPDIR/$DBSERVER && mkdir $DUMPDIR/$DBSERVER
+	
+fi
+
+
+# If no compression level is specified, then default to 1.
+# if no compression is to be used or specified, then the compression should be set to 1.
+# 0 is not a valid compression level, but it will be used in the sp_tran_db proc to set compression off
+test ! "$COMPLEVEL" && export COMPLEVEL=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $TMPDBLIST && \rm -f $TMPDBLIST
+	test $MAILFILE && \rm -f $MAILFILE
+	test $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Send special "start" page for 2004 year-end backups
+#------------------------------------------------------------------------------
+#echo "`date` $DBSERVER native full backup STARTING" > $PAGEMSG
+#export PAGEDEST=$PAGEDONE
+#sendPage
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+> $MAILFILE
+
+echo "SCRIPT START: `date`" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+# Ignore tempdb% databases
+# Check for errors
+#--------------------------------------------------------------------------
+> $SORTDBLIST
+if [ "$DBNAME" ]
+then
+        echo $DBNAME > $TMPDBLIST
+elif [ "$DBLIST" ]
+then
+	sort $DBLIST > $TMPDBLIST
+elif [ $ALL_DB -gt 0 ]
+then
+	getDbListDump -S $DBSERVER -tran -all > $TMPDBLIST
+		
+	checkSqlErr $TMPDBLIST
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - unable to obtain list of databases from $DBSERVER"
+		echo "Review output in $LOGFILE"
+		cat $TMPDBLIST >> $LOGFILE
+		echo "SCRIPT END: `date`" >> $LOGFILE
+		exit 2
+	fi
+fi
+
+echo "Performing native transaction log dump for the following database(s) on $DBSERVER:" >> $LOGFILE
+cat $TMPDBLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Execute backup for each database
+# sp_dump_tran syntax:
+#	exec sp_dump_tran @db_name = "$DBNAME"
+#	,@dump_path = NULL
+#	,@dump_filename = NULL
+#	,@retention_days = NULL
+#	,@compress_lvl = NULL
+#	,@stripe_num = NULL
+#	
+#------------------------------------------------------------------------------
+cat $TMPDBLIST |
+while read DBNAME
+do
+	export DBNAME
+	# sp_dump_tran proc will generate dump file name.
+	#export DUMPFILE=$DUMPDIR/$DBSERVER/$DBSERVER.$DBNAME.$DATETIME.dmp
+        > $SQLFILE
+        echo "set nocount on" >> $SQLFILE
+        echo "go" >> $SQLFILE
+	echo "set flushmessage on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "exec sp_dump_tran @db_name = \"$DBNAME\"" >> $SQLFILE
+	test $DUMPDIR != "0" && echo ",@dump_path = \"$DUMPDIR\"" >> $SQLFILE
+	test $COMPLEVEL -ne 100 && echo ",@compress_lvl = $COMPLEVEL" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+
+	echo "$DBSERVER.$DBNAME NATIVE BACKUP:" >> $LOGFILE
+        $SCRDIR/sqlTimer.scr -S $DBSERVER -i $SQLFILE -o $LOGFILE -m $MAILFILE
+
+        if [ $? -ne 0 ]
+        then
+                export ERRORFLAG=1
+        fi
+done
+
+echo "SCRIPT END: `date`" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# If there were any failures, send email
+# Set page status and final exit
+#--------------------------------------------------------------------------
+if [ $ERRORFLAG -eq 1 ]
+then
+        echo "\nNOTE: Check $LOGFILE for further details.\n" >> $MAILFILE
+        export MAILSUBJECT="$DBSERVER NATIVE TRANSACTION LOG DUMP FAILED"
+        sendMail
+
+	export PAGESTATUS=FAILED
+	export EXITRC=1
+else
+	export PAGESTATUS=SUCCESSFUL
+	export EXITRC=0
+fi
+
+
+#--------------------------------------------------------------------------
+#  If PAGEDONE set, send page
+#--------------------------------------------------------------------------
+if [ "$PAGEDONE" ]
+then
+	echo "`date` $DBSERVER native tran dump $PAGESTATUS" > $PAGEMSG
+	export PAGEDEST=$PAGEDONE
+	sendPage
+fi
+
+#--------------------------------------------------------------------------
+#  Exit
+#--------------------------------------------------------------------------
+exit $EXITRC

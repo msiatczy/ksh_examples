@@ -1,0 +1,120 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getPwdComplianceInfo.scr -S <DBSERVER>|all
+#
+#  Description: Get password compliance info for all logins on one or all ASEs
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - DBSERVER|all
+#
+#  Modification History:
+#       01/26/10 M. Siatczynski Initial script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER>|all"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export ONEDBSERVER=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$ONEDBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserver.lst.$$
+export SQLFILE=$SQLDIR/common/pwdComplianceInfo.sql
+export SQLOUT=/tmp/sqlout.$$
+export HIGHRC=0
+export LOGFILE=$LOGDIR/useradmin/central/getPwdComplianceInfo.$DATETIME
+
+#--------------------------------------------------------------------------
+#  Build server list
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAse15List > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Get password compliance info for the following ASEs:" >> $LOGFILE
+cat $DBSERVERLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Execute the SQL on each DBSERVER
+# append the output to the logfile
+#------------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -i$SQLFILE | grep -v Password: > $SQLOUT
+
+#------------------------------------------------------------------------------
+# Check for errors
+#------------------------------------------------------------------------------
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+	fi
+
+	cat $SQLOUT >> $LOGFILE
+
+done
+
+#------------------------------------------------------------------------------
+# write final trailer 
+#------------------------------------------------------------------------------
+echo "\n`date` END Password compliance info" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+        echo "Script FAILED - output in $LOGFILE"
+        exit 1
+else
+        echo "Script SUCCESSFUL - output in $LOGFILE"
+        exit 0
+fi

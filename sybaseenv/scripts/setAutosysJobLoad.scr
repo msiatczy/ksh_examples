@@ -1,0 +1,167 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: setAutosysJobLoad.scr -all|-S <service name>|-L <service name list> -pre|-post {-xops}
+#
+#  Description: Run the autosys script which changes the jobload for one or more service names
+#
+#     Location:	/sccm/dba/sybase/scripts/setAutosysJobLoad.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  NOTE:  This script still needs ERROR checking.
+#	  Passing -xops will PREVENT email from going to MF Service Desk
+#
+#  Modification History:
+#	02/20/04 M. Siatczynski	Initial Script
+#	03/22/04 M. Siatczynski	Added LOGFILE to redirect output from autosys script
+#	10/07/05 M. Siatczynski	Moved from FOZZIE refresh directory and converted for general use
+#	08/11/06 M. Siatczynski	Remove restriction that script must run from geneva
+#	05/16/08 M. Siatczynski	Add parm and code to include/exclude notification to MF Operations that outage script has been run
+#	10/30/08 M. Siatczynski	Also get SNs for repservers and eliminate duplicates (now necessary because of ERSSD)
+#	03/03/10 M. Siatczynski	Change Operations text to WISD Service Desk
+#	01/20/11 M. Siatczynski	Change mail1 to mail2, and WISD Service Desk to AMG Production Control
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -all|-S <service name>|-L <service name list> -pre|-post {-xops}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -all)   export ALL=1;shift 1;;
+                        -S)	export ONESN=$2;shift 2;;
+                        -L)	export SNLIST=$2;shift 2;;
+                        -pre)   export PRE=1;shift 1;;
+                        -post)  export POST=1;shift 1;;
+                        -xops)  export NOTIFYOPS=0;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$ALL" && export ALL=0
+test ! "$PRE" && export PRE=0
+test ! "$POST" && export POST=0
+test $PRE -eq 1 && export WHEN=pre || export WHEN=post
+test ! "$NOTIFYOPS" && export NOTIFYOPS=1
+test $NOTIFYOPS -eq 1 && export MAILDEST="$MAILDEST"
+
+# make sure pre or post is passed, but not both
+export PREPOSTSUM=`expr $PRE + $POST`
+if [ $PREPOSTSUM -ne 1 ]
+then
+        echo $USAGE
+        echo "ERROR - Either -pre OR -post must be passed."
+        exit 1
+fi
+
+# make sure -all, -S, or -L is specified, but not more than one option
+export OPTSUM=0
+test $ALL -eq 1 && export OPTSUM=`expr $OPTSUM + 1`
+test "$ONESN" && export OPTSUM=`expr $OPTSUM + 1`
+test "$SNLIST" && export OPTSUM=`expr $OPTSUM + 1`
+
+if [ $OPTSUM -ne 1 ]
+then
+        echo $USAGE
+        echo "ERROR - One, and only one, of the following options must be specified: (-all, -S, -L)"
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/setAutosysJobLoad.$WHEN.$DATETIME
+export TMPSNLIST=/tmp/snlist.$$
+export MAILFILE=/tmp/mailfile.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TMPSNLIST && \rm -f $TMPSNLIST
+	test -f $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Create list of service names
+#  Also get SNs from REPDIRLIST--because service names for RS 15 no longer have entry in ASEDIRLIST
+#--------------------------------------------------------------------------
+> $TMPSNLIST
+if [ $ONESN ]
+then
+	echo $ONESN >> $TMPSNLIST
+elif [ "$SNLIST" ]
+then
+	if [ -s $SNLIST ]
+	then
+		cat $SNLIST >> $TMPSNLIST
+	else
+		echo "ERROR - $SNLIST does not exist or is 0 bytes."
+		exit 1
+	fi
+elif [ $ALL -eq 1 ]
+then
+# execute two commands together in the current shell and pass result to sort and uniq--note semicolons and spacing
+	{ grep -v '^#' $ASEDIRLIST | cut -d" " -f2 ; grep -v '^#' $REPDIRLIST | cut -d" " -f2 ; } | sort | uniq  >> $TMPSNLIST
+fi
+
+#--------------------------------------------------------------------------
+# source the file to set the autosys PRD environment and
+# run the outage script for each service name
+#--------------------------------------------------------------------------
+. /opt/sccm/autouser/bin/autoprd
+
+> $LOGFILE
+echo "`date` Changing autosys job load to $WHEN for the following service names:" >> $LOGFILE
+cat $TMPSNLIST >> $LOGFILE
+
+cat $TMPSNLIST |
+while read SN
+do
+	echo "Changing Autosys job load for $SN..." | tee -a $LOGFILE
+	$AUTOUSER/bin/autosys_outage.sh $WHEN $SN | tee -a $LOGFILE
+done
+
+#--------------------------------------------------------------------------
+#  Visually inspect the job load settings
+#--------------------------------------------------------------------------
+echo "\nCheck job load for service names (first column):" | tee -a $LOGFILE
+echo "   Value should be 1 for pre outage and 400 for post outage\n" | tee -a $LOGFILE
+autorep -M ALL | egrep -f $TMPSNLIST | tee -a $LOGFILE
+
+#--------------------------------------------------------------------------
+#  Notify Ops that outage script has been run
+#--------------------------------------------------------------------------
+if [ $NOTIFYOPS -eq 1 ]
+then
+	echo "\nSending email to $MAILDEST...\n" | tee -a $LOGFILE
+	> $MAILFILE
+	export MAILSUBJECT="Autosys outage script has been run by Sybase DBA Team"
+	echo "\nNO ACTION IS REQUIRED by AMG Production Control.  This email is INFORMATIONAL ONLY.\n" >> $MAILFILE
+	echo "The autosys $WHEN outage script has been run by the Sybase DBA Team to change job load for the following machine names." >> $MAILFILE
+	cat $TMPSNLIST >> $MAILFILE
+	sendMail
+fi
+
+#--------------------------------------------------------------------------
+# Exit with 0
+#--------------------------------------------------------------------------
+exit 0

@@ -1,0 +1,208 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findInactiveDBs.scr -S <source DBSERVER> -T <target DBSERVER> -RS <REPSERVER> 
+#
+#  Description: Find databases marked for replication but are not actively replicating
+#
+#     Location:	/sccm/dba/sybase/scripts/replication/findInactiveDBs.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<source DBSERVER> - primary dbserver
+#              	<target DBSERVER> - secondary dbserver
+#              	<REPSERVER> - Repserver
+# 
+#  Modification History:
+#	01/10/11 K. Sawant original script, using similar logic of latency script
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+USAGE="ERROR - Usage: $0 -S <SOURCE DBSERVER> -T <TARGET DBSERVER> -RS <REPSERVER>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export SRC_DBSERVER=$2;shift 2;;
+	                -T)	export TGT_DBSERVER=$2;shift 2;;
+	                -RS)	export REPSERVER=$2;shift 2;;
+	                -m)	export MAILDEST=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# RepServer, Source and Target ASEs must be passed 
+if [ ! "$SRC_DBSERVER" -o ! "$TGT_DBSERVER" -o ! "$REPSERVER" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+ 
+integer DAYS
+test ! -d $RPTDIR/replication/findInactive/$REPSERVER && mkdir $RPTDIR/replication/findInactive/$REPSERVER
+export RPTFILE=$RPTDIR/replication/findInactive/$REPSERVER/$REPSERVER.${SRC_DBSERVER}_to_${TGT_DBSERVER}.findInactive.$MMYYYY
+export SRC_DBLIST=/tmp/sdblist.$$
+export SDBLIST=/tmp/Sdblist.$$
+export TGT_DBLIST=/tmp/tdblist.$$
+export TDBLIST=/tmp/Tdblist.$$
+export DIFFLIST=/tmp/difflist.$$
+export MAILFILE=/tmp/mailfile.$$
+export SQLOUT=/tmp/sqlout.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SRC_DBLIST && \rm -f $SRC_DBLIST
+	test $SDBLIST && \rm -f $SDBLIST
+	test $TGT_DBLIST && \rm -f $TGT_DBLIST
+	test $TDBLIST && \rm -f $TDBLIST
+	test $DIFFLIST && \rm -f $DIFFLIST 
+	test $MAILFILE && \rm -f $MAILFILE
+	test $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Get list of databases marked for replication from source and target ASEs
+#--------------------------------------------------------------------------
+$OCSBIN/isql -U$ADMINLOGIN -S$SRC_DBSERVER -b <<-! | egrep -v '(Password|rows affected|return status|row affected|^$)' > $SRC_DBLIST
+	`getPass $SRC_DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	sp_config_rep_agent
+	go
+	!
+
+checkSqlErr $SRC_DBLIST
+if [ $? -eq 1 ]
+then
+	echo "ERROR - SQL error(s) getting list of replicated databases from $SRC_DBSERVER"
+	cat $SRC_DBLIST
+	exit 1
+fi
+
+$OCSBIN/isql -U$ADMINLOGIN -S$TGT_DBSERVER -b <<-! | egrep -v '(Password|rows affected|return status|row affected|^$)' > $TGT_DBLIST
+	`getPass $TGT_DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	sp_config_rep_agent
+	go
+	!
+
+checkSqlErr $TGT_DBLIST
+if [ $? -eq 1 ]
+then
+	echo "ERROR - SQL error(s) getting list of replicated databases from $TGT_DBSERVER"
+	cat $TGT_DBLIST
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  If there are no databases to process, exit the script
+#--------------------------------------------------------------------------
+test ! -s $SRC_DBLIST || test ! -s $TGT_DBLIST && exit 0
+
+#--------------------------------------------------------------------------
+#  Compare DBLIST of Source and Target ASEs
+#--------------------------------------------------------------------------
+sort $SRC_DBLIST > $SDBLIST
+sort $TGT_DBLIST > $TDBLIST
+diff $SDBLIST $TDBLIST > $DIFFLIST
+
+# If Source and Target's database list does not match then exit with error message
+if [ -s $DIFFLIST ]
+then
+	echo "ERROR - Difference between $SRC_DBSERVER and $TGT_DBSERVER, check $DIFFLIST"
+	cat $DIFFLIST
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# Find inactive databases
+#--------------------------------------------------------------------------
+export DAYS=0 
+> $MAILFILE
+cat $TDBLIST |
+while read DBNAME
+do 
+#--------------------------------------------------------------------------
+# Check databases with offline status--accounts for databases in load (status2=16)
+#--------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$TGT_DBSERVER <<-! | grep -v Password > $SQLOUT
+	`getPass $TGT_DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	if (select status&1024 from master..sysdatabases where name = "$DBNAME") = 1024
+	and (select status2&16 from master..sysdatabases where name = "$DBNAME") = 16
+	begin
+		PRINT "DB under load"
+	end
+	go
+	!
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - SQL error(s) checking database suspect status"
+		cat $SQLOUT
+	fi
+
+#--------------------------------------------------------------------------
+# Check rs_lastcommit on the target server to find inactive databases
+#--------------------------------------------------------------------------
+	export DAYS="$(print "$($ISQLEXE -U$ADMINLOGIN -S$TGT_DBSERVER -b <<-! | tee $SQLOUT
+		`getPass $TGT_DBSERVER $ADMINLOGIN`
+		set nocount on
+		go
+		if (select status&1024 from master..sysdatabases where name = "$DBNAME") <> 1024
+			select ltrim(convert(char(11),(datediff(dd,dest_commit_time,getdate())))) 
+			from $DBNAME..rs_lastcommit where origin<>0
+		go
+		! )" | grep -v Password )"
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export COUNTRC=1
+		echo "ERROR - SQL error(s) calculating DAYS for $DBNAME"
+		cat $SQLOUT
+	else
+		export COUNTRC=0
+	fi
+
+#--------------------------------------------------------------------------
+# Send email
+#--------------------------------------------------------------------------
+	if [ $COUNTRC -eq 0 -a $DAYS -gt 0 ]
+	then
+		echo "`date +'%D %T'` : $DBNAME : Replication inactive for $SRC_DBSERVER -> $TGT_DBSERVER by [Days]: $DAYS" >> ${RPTFILE}
+		echo "`date +'%D %T'` : $DBNAME : Replication inactive for $SRC_DBSERVER -> $TGT_DBSERVER by [Days]: $DAYS" >> ${MAILFILE}
+	fi
+done
+
+#--------------------------------------------------------------------------
+#  If MAILFILE exists and has size > 0 bytes, send mail 
+#--------------------------------------------------------------------------
+if [ -s $MAILFILE ]
+then
+	export MAILSUBJECT="$REPSERVER REPLICATION Inactivity Report"
+	sendMail
+fi
+
+#--------------------------------------------------------------------------
+#  Exit with 0  
+#--------------------------------------------------------------------------
+exit 0

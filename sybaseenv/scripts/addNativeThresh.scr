@@ -1,0 +1,163 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: addNativeThresh.scr -S <DBSERVER> -pct <log free pct> {-D <dbname>}
+#
+#  Description: Add NATIVE threshold at x pct
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#              	<DBNAME> - database name
+#              	<PCT> - percent of log space at which to add the threshold
+#
+#  Modification History:
+#	06/07/04 M. Siatczynski	Initial Script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	01/07/10 J. Aspenleiter	Altered original script "addSqlbtThresh.scr" to be used with native tran dumps.
+#	09/13/10 M. Siatczynski	Update comment/desc associated with log free pct
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.miscfunctions
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -pct <log free pct> {-D <dbname>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -pct)   export PCT=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$PCT" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SQLFILE1=/tmp/sqlfile1.$$
+export SQLFILE2=/tmp/sqlfile2.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBLIST=/tmp/dblist.$$
+export LOGFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.addNativeThresh.$DATETIME
+export HIGHRC=0
+
+
+
+> $LOGFILE
+date >> $LOGFILE
+echo "Adding NATIVE threshold at $PCT % for $DBSERVER" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLFILE1 && \rm -f $SQLFILE1
+	test -f $SQLFILE2 && \rm -f $SQLFILE2
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $DBLIST && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# populate the DBLIST...
+#--------------------------------------------------------------------------
+
+if [ ! "$DBNAME" ]
+then
+
+	getDbListDump -S $DBSERVER -tran > $DBLIST
+
+else
+	echo $DBNAME > $DBLIST
+
+fi	
+
+
+
+#------------------------------------------------------------------------------
+# Format sql to check non-last chance thresholds on logsegments
+#------------------------------------------------------------------------------
+> $SQLFILE1
+echo "set nocount on" >> $SQLFILE1
+echo "go" >> $SQLFILE1
+
+cat $DBLIST |
+while read DBNAME
+do
+	echo "use $DBNAME" >> $SQLFILE1
+	echo "go" >> $SQLFILE1
+	echo "if not exists (select * from systhresholds where status <> 1 and proc_name = 'sp_threshold_native')" >> $SQLFILE1
+	echo "BEGIN" >> $SQLFILE1
+
+	echo "print \"use $DBNAME\"" >> $SQLFILE1
+	echo "print \"go\"" >> $SQLFILE1
+
+	echo "select \"exec sp_addthreshold $DBNAME,logsegment,\",convert(int,((sum(u.size))*.${PCT})),\",sp_threshold_native\"" >> $SQLFILE1
+	echo "from master..sysusages u" >> $SQLFILE1
+	echo "where u.dbid = db_id(\"$DBNAME\") and u.segmap = 4 group by u.dbid " >> $SQLFILE1
+	echo "print \"go\"" >> $SQLFILE1
+	echo "END" >> $SQLFILE1
+	echo "go" >> $SQLFILE1
+done
+
+
+
+#------------------------------------------------------------------------------
+# pipe in the sql to format the end sql
+# check for errors
+#------------------------------------------------------------------------------
+> $SQLFILE2
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w500 -i$SQLFILE1 | grep -v Password >> $SQLFILE2
+
+checkSqlErr $SQLFILE2
+if [ $? -ne 0 ]
+then
+	echo "ERROR - executing format SQL against $DBSERVER" | tee -a $LOGFILE
+	cat $SQLFILE2 >> $LOGFILE
+	exit 1
+fi
+
+#------------------------------------------------------------------------------
+# pipe in the sql to format the end sql
+# check for errors
+#------------------------------------------------------------------------------
+> $SQLOUT
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -e -w500 -i$SQLFILE2 | grep -v Password >> $SQLOUT
+
+checkSqlErr $SQLOUT
+if [ $? -ne 0 ]
+then
+	cat $SQLOUT >> $LOGFILE
+	echo "ERROR - executing adding NATIVE threshold for $DBSERVER:$DBNAME" | tee -a $LOGFILE
+	exit 1
+else
+	cat $SQLOUT >> $LOGFILE
+	echo "NATIVE threshold added SUCCESSFULLY for $DBSERVER:$DBNAME" | tee -a $LOGFILE
+fi
+
+#------------------------------------------------------------------------------
+# exit with 0 if an earlier error did not cause exit with 1
+#------------------------------------------------------------------------------
+exit 0

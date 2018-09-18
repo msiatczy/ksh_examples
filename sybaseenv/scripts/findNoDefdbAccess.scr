@@ -1,0 +1,155 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findNoDefdbAccess.scr -S <DBSERVER>|all
+#
+#  Description: Look for logins which do not have access to their default database
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	07/10/07 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|all"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export SQLOUT=/tmp/sqlout.$$
+export LOGFILE=$LOGDIR/useradmin/central/findNoDefdbAccess.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  For each ASE...
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START logins with no access to their default database" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# Create a working dbserverlist
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# For each DBSERVER
+# execute sql
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+
+	echo "`date` Checking $DBSERVER..." >> $LOGFILE
+
+	> $SQLOUT
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 <<-! -b | grep -v Password >> $SQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	use master
+	go
+	set nocount on
+	go
+	
+	declare defdb_cursor cursor for
+	      select name,dbname from master..syslogins where name not in ('sa','probe') and dbname <> 'master'
+	      order by name
+	      for read only
+	go
+	
+	declare @name varchar(30)
+	declare @defdb varchar(30)
+	
+	open defdb_cursor
+	fetch defdb_cursor into @name, @defdb
+	
+	while (@@sqlstatus=0)
+	begin
+		if exists (select * from sysdatabases where name = @defdb)	
+			execute ("select @@servername,name,dbname from master..syslogins where name = '" + @name + "' and name not in (select name from " + @defdb + "..sysusers) and name not in (select suser_name(suid) from " + @defdb + "..sysalternates)")
+		else
+			execute ("select @@servername,name,dbname+'(INVALID DBNAME)' from master..syslogins where name = '" + @name + "'")
+--			print "Login=%1!, Defdb=%2! -- DBNAME DOES NOT EXIST on this ASE", @name, @defdb
+		fetch defdb_cursor into @name, @defdb
+	end
+	
+	close defdb_cursor
+	deallocate cursor defdb_cursor
+	go
+	!
+
+	cat $SQLOUT >> $LOGFILE
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+	        echo "$DBSERVER:  SQL FAILED" >> $LOGFILE
+	        export HIGHRC=1
+	        continue
+	else
+	        echo "$DBSERVER:  SQL SUCCESSFUL" >> $LOGFILE
+	fi
+done
+
+#--------------------------------------------------------------------------
+# Exit with final status
+#--------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+	echo "\nScript FAILED"
+	echo "Review output in $LOGFILE\n"
+	exit 1
+else
+	echo "\nScript SUCCESSFUL"
+	echo "Review output in $LOGFILE\n"
+	exit 0
+fi

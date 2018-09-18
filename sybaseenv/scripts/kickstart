@@ -1,0 +1,67 @@
+#!/bin/ksh
+######################################################################
+#
+#	Program:	kickstart
+#	Purpose:	Check to see if a unix process is running
+#			and start it (optional).
+#	Output:		Stdout.  Starts process.
+#	Arguements:	-CHECK:		user
+#			-EXECUTE:	SQL Server
+#	Author:		Marsha Siatczynski
+#	Date:		10/01/01
+#
+#	Modifications:
+#
+#	10/01/01:	Original
+#	07/17/02:	Original
+#	10/29/03: M. Siatczynski Centralized script
+#
+######################################################################
+
+. /sccm/dba/sybase/.dbaSybProfile
+
+USG="${0} -CHECK <check> -EXECUTE <execute> \n\t"
+
+while [ $# -gt 0 ]
+do
+	case $1 in
+		-CHECK )	CHECK=$2;shift 2;;
+		-EXECUTE )	EXECUTE=$2;shift 2;;
+         	? )	echo "Usage: ${USG}";exit;;
+		* )	break;
+	esac
+done
+
+############################################################################### 
+# Check usage
+############################################################################### 
+if [ ${CHECK}'A' = 'A' ]
+then
+	echo "Usage: ${USG}"
+	exit 1
+fi
+
+############################################################################### 
+# Set some variables
+############################################################################### 
+
+if [ "${CHECK}" ]
+then
+	ps -def | grep ${CHECK} | grep -v grep | grep -v kickstart > /dev/null
+	RUNNING=$?
+fi
+
+if [ ${RUNNING} -eq 0 ]
+then
+	if [ ! "${EXECUTE}" ]
+	then
+		echo "${CHECK} is RUNNING"
+	fi
+else
+	if [ "${EXECUTE}" ]
+	then
+		${EXECUTE}
+	else
+		echo "${CHECK} is NOT RUNNING"
+	fi
+fi

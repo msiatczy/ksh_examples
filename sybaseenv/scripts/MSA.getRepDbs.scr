@@ -1,0 +1,148 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: MSA.getRepDbs.scr -RS <replicate repserver> {-genctl <filename>}
+#
+#  Description: Get list of databases managed by RSSD 
+#		Optionally, gen a control file for use during a switch active
+#
+#     Location:	/sccm/dba/sybase/scripts/getRepDbs.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<REPSERVER> - Repserver
+#
+#  Modification History:
+#	10/07/10 K. Sawant	Initial Script, copied over from getRepDbs.scr
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -RS <replicate repserver> {-genctl <filename>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -RS)		export REPSERVER=$2;shift 2;;
+	                -genctl)	export FILESPEC=$2;shift 2;;
+	                -*)		echo $USAGE;exit 1;;
+	                *)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$REPSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+# generate control file central location ($CTLDIR/replication)
+export CTLFILE=$CTLDIR/replication/$FILESPEC
+export SQLFILE=/tmp/sqlfile.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $SQLFILE && \rm -f $SQLFILE
+}
+ 
+trap 'tempCleanup' EXIT INT TERM
+
+#-----------------------------------------------------------------------
+# Get RSASE and RSSD based on REPSERVER
+# Make sure they are set to something
+#-----------------------------------------------------------------------
+grep "^$REPSERVER " $REPDIRLIST | cut -d" " -f8,9 | read RSASE RSSD
+if [ ! "$RSASE" -o ! "$RSSD" ]
+then
+	echo "ERROR - RSASE or RSSD not properly set"
+	exit 1
+fi
+
+#-----------------------------------------------------------------------
+# Format the SQL
+#-----------------------------------------------------------------------
+> $SQLFILE
+
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+##echo "use $RSSD" >> $SQLFILE
+##echo "go" >> $SQLFILE
+echo "create table #ctltemp1 (logid int not null, ldsname varchar(15) null, ldbname varchar(25) null, dbname varchar(25) null, active varchar(15) null, standby varchar(15) null, tertiary varchar(15) null)" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "create table #ctltemp2 (DSname varchar(25) null, DBname varchar(25) null)" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "insert #ctltemp1 (logid, ldsname, ldbname) select ldbid, dsname, dbname from rs_databases where ptype = 'L'" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "insert #ctltemp2 (DSname, DBname) select dsname, dbname from rs_databases where prsid=(select id from rs_sites where name='$REPSERVER') and dbname!='$RSSD'" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "update #ctltemp1 set t.active = d.dsname, t.dbname = d.dbname from #ctltemp1 t, rs_databases d where t.logid = d.ldbid and d.ptype = 'A'" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "update #ctltemp1 set t.standby = d.dsname from #ctltemp1 t, rs_databases d where t.logid = d.ldbid and d.ptype = 'S'" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "update #ctltemp1 set t1.tertiary = t2.DSname from #ctltemp1 t1, #ctltemp2 t2 where t1.dbname = t2.DBname" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+if [ ! "$FILESPEC" ]
+then
+	echo "set nocount off" >> $SQLFILE
+	echo "go" >> $SQLFILE
+fi
+
+#echo "select dbname,active,standby,ldsname,ldbname from #ctltemp1 order by dbname" >> $SQLFILE
+echo "select active,dbname,standby,ldsname,ldbname,tertiary from #ctltemp1 order by active,dbname" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "drop table #ctltemp1" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "drop table #ctltemp2" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#-----------------------------------------------------------------------
+# Run the SQL
+# Specify dbname on connect string to accommodate ERSSD (ASA)
+# Connection to ASA doesn't like -X on isql string, so go plain isql call
+# If generating a control file, remove leading space and convert multiple spaces to single space
+#-----------------------------------------------------------------------
+if [ "$FILESPEC" ]
+then
+	getPass $RSASE $ADMINLOGIN | $OCSBIN/isql -U$ADMINLOGIN -S$RSASE -D$RSSD -w200 -b -i $SQLFILE | egrep -v '(Password|rows affected|^$)' | sed -e 's/^ //g' -e 's/  */ /g' > $CTLFILE
+	checkSqlErr $CTLFILE
+	if [ $? -ne 0 ]
+	then
+	        echo "\nGeneration of $CTLFILE FAILED"
+	        echo "\nReview errors in $CTLFILE\n"
+	        exit 1
+	else
+		echo "\nControl file: $CTLFILE\n"
+
+# Check for entries which contain NULL - print warning about these
+		grep 'NULL' $CTLFILE > /dev/null
+		export RC=$?
+		if [ $RC -eq 0 ]
+		then
+			echo "WARNING - $CTLFILE contains NULL entries.  Edit and correct file.\n"
+		fi
+
+	        exit 0
+	fi
+else	
+	echo "\n\n"
+	getPass $RSASE $ADMINLOGIN | $OCSBIN/isql -U$ADMINLOGIN -S$RSASE -D$RSSD -w200 -i $SQLFILE | grep -v Password
+	echo "\n\n"
+fi
+
+#-----------------------------------------------------------------------
+# Exit with 0
+#-----------------------------------------------------------------------
+exit 0

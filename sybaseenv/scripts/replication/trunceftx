@@ -1,0 +1,8 @@
+../truncLog.scr -S PHICKORY2 -D EFTXPaymentWarehouse -noprompt
+../truncLog.scr -S PHICKORY2 -D EFTXProfile -noprompt
+../truncLog.scr -S PHICKORY2 -D EFTXReference -noprompt
+../truncLog.scr -S PHICKORY2 -D EFTXRepository -noprompt
+../truncLog.scr -S PHICKORY2 -D EFTXSecurity -noprompt
+../truncLog.scr -S PHICKORY2 -D EFTXSynchronization -noprompt
+../truncLog.scr -S PHICKORY2 -D EFTXSystem -noprompt
+../truncLog.scr -S PHICKORY2 -D EFTXTaxWarehouse -noprompt

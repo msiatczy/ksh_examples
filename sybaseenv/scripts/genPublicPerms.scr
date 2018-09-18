@@ -1,0 +1,221 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: genPublicPerms.scr -S <DBSERVER> -D <dbname>|all|user> {-object <all|user>}
+#
+#  Description: Look for user databases with permissions granted to public
+#		use ddlgen to gen the sql to grant the perms
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - DBSERVER
+#              	<dbname> - all databases or just user databases (excludes system and "admin" databases like dba and lookjack)
+#              	<object> - all=all object, including system; user=exclude system objects (including rep objects and SQR objects)--default is all objects
+#
+#
+#  Modification History:
+#	09/15/06 M. Siatczynski	Initial Script
+#	01/11/11 M. Siatczynski	Update script used to get service names
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname>|all|user> {-object <all|user>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+                        -object)     export OBJECTSPEC=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$ONEDBNAME" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+# default is all objects
+test ! "$OBJECTSPEC" && export OBJECTSPEC=all
+
+# source profile after setting DBSERVER
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/dbnamelist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export NEWDBLIST=/tmp/newdblist.$$
+export DDLLOG=/tmp/ddllog.$$
+export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.genPublicPerms.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $NEWDBLIST && \rm -f $NEWDBLIST
+	test -f $DDLLOG && \rm -f $DDLLOG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  For each ASE...
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START gen public perms" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# Get the service name and port for this dbserver - needed for ddlgen
+# Verify the service name is active on this host--script MUST run on service name host
+#--------------------------------------------------------------------------
+export SN=`grep "^$DBSERVER " $ASEDIRLIST | cut -d" " -f2`
+export PORT=`grep "^$DBSERVER " $ASEDIRLIST | cut -d" " -f8`
+
+/apps/OSscripts/srvnamesLOC | grep "$SN" > /dev/null
+if [ $? -ne 0 ]
+then
+        echo "\nERROR - This script MUST run on current host for $SN" | tee -a $LOGFILE
+        echo "$SN is not active on this host (`hostname`)" | tee -a $LOGFILE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+#--------------------------------------------------------------------------
+if [ "$ONEDBNAME" = "all" ]
+then
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases
+	where name not like 'tempdb%'
+	order by name
+	go
+	!
+
+	checkSqlErr $DBLIST
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting list of databases from $DBSERVER" | tee -a $LOGFILE
+		cat $DBLIST >> $LOGFILE
+		export HIGHRC=1
+		exit 1
+	fi
+elif [ "$ONEDBNAME" = "user" ]
+then
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases
+	where name not like 'tempdb%'
+	and name not like 'dbcc%'
+	and name not like 'sybsystem%'
+	and name not like 'sybsecurity%'
+	and name not in ('master','model','lookjack','dba')
+	order by name
+	go
+	!
+
+	checkSqlErr $DBLIST
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting list of databases from $DBSERVER" | tee -a $LOGFILE
+		cat $DBLIST >> $LOGFILE
+		export HIGHRC=1
+		exit 1
+	fi
+else
+	echo $ONEDBNAME > $DBLIST
+fi
+
+#--------------------------------------------------------------------------
+# if objectspec is user, then query the databases to pare down the list to
+# only those where perms are granted to user objects
+# NEWDBLIST is the pared down list
+#--------------------------------------------------------------------------
+if [ "$OBJECTSPEC" = "user" ]
+then
+	> $SQLFILE
+	echo "set nocount on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	for DBNAME in `cat $DBLIST`
+	do
+		echo "use $DBNAME" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "if exists (select * from sysprotects where uid = user_id('public') and id > 99 and object_name(id) <> 'repmon' and object_name(id) not like 'rs[_]%' and object_name(id) not like 'SQR%')" >> $SQLFILE
+		echo "select db_name()" >> $SQLFILE
+	done
+
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password > $NEWDBLIST
+
+	checkSqlErr $NEWDBLIST
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting list of databases with perms granted to user objects from $DBSERVER" | tee -a $LOGFILE
+		cat $NEWDBLIST >> $LOGFILE
+		export HIGHRC=1
+		exit 1
+	fi
+else
+	cat $DBLIST > $NEWDBLIST
+fi
+
+#--------------------------------------------------------------------------
+# use ddlgen to get the perm SQL
+# check for errors
+#--------------------------------------------------------------------------
+if [ -s $NEWDBLIST ]
+then
+	for DBNAME in `cat $NEWDBLIST`
+	do
+		export DBNAME
+		echo "`date` Getting public perms for $DBSERVER $DBNAME..." >> $LOGFILE
+		export PERMFILE=$SQLDIR/useradmin/$DBSERVER/$DBNAME/$DBSERVER.$DBNAME.publicperm.sql.$DATETIME
+		> $PERMFILE
+		$SYBASE/ASEP/bin/ddlgen -U$ADMINLOGIN -S$SN:$PORT -TGRP -D$DBNAME -Npublic -P`getPass $DBSERVER $ADMINLOGIN` -O$PERMFILE > $DDLLOG
+		egrep -i '(error|unable)' $DDLLOG > /dev/null
+		if [ $? -eq 0 -o ! -s $PERMFILE ]
+		then
+			export HIGHRC=1
+			cat $DDLLOG | tee -a $LOGFILE
+		fi
+	done
+else
+	echo "No public perms found in the specified databases on $DBSERVER"
+fi
+
+#--------------------------------------------------------------------------
+# Exit with final status
+#--------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+	echo "\nScript FAILED"
+	echo "Review output in $LOGFILE\n"
+	exit 1
+else
+	exit 0
+fi

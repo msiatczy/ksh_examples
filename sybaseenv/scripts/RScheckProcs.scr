@@ -1,0 +1,145 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: RScheckProcs.scr -RS <REPSERVER> -RSASE <(E)RSSD ASE/ASA> -RSSD <(E)RSSD> {-m <maildest>}
+#
+#  Description: Check replicated databases to make sure that the following procs
+#		are marked for replication:
+#			rs_marker
+#			rs_lastcommit
+#
+#     Location:	/sccm/dba/sybase/scripts/RScheckProcs.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<REP ASE/ASA> - ASE holding the RSSD
+#              	<RSSD> - RSSD
+#
+#
+#  Modification History:
+#	03/25/03 M. Siatczynski	Rewrite original script
+#	11/19/03 K. Hess	Move script to central location /sccm/dba/sybase/scripts
+#	08/02/05 M. Siatczynski	Change output location
+#				Added -RS parm so output can be categorized
+#				Only save output file if > 0 bytes
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	10/22/08 M. Siatczynski	Changes to accommodate RS15 with ERSSD
+#	04/20/11 M. Siatczynski	Do not invoke mailx directly...call sendMail function
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -RS <REPSERVER> -RSASE <(E)RSSD ASE/ASA> -RSSD <(E)RSSD> {-m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -RS)    export REPSERVER=$2;shift 2;;
+                        -RSASE) export RSASE=$2;shift 2;;
+                        -RSSD)  export RSSD=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$RSASE" -o ! "$RSSD" -o ! "$REPSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+test ! -d $LOGDIR/replication/checkProcs/$REPSERVER && mkdir $LOGDIR/replication/checkProcs/$REPSERVER
+export TEMPOUT=/tmp/tempout.$$
+export OUTFILE=$LOGDIR/replication/checkProcs/$REPSERVER/$REPSERVER.$RSSD.RScheckProcs.$MMDDYYYY
+export MAILFILE=/tmp/mailfile.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $TEMPOUT && \rm -f $TEMPOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Query the RSSD to get the PHYSICAL DSNAME and DBNAME for each database
+# currently ACTIVE.
+# Then query the physical DSNAME/DBNAME to check the procs.
+# ASA doesn't like -X on ISQLEXE call, use plain isql call
+#--------------------------------------------------------------------------
+> $TEMPOUT
+
+$OCSBIN/isql -U$ADMINLOGIN -S$RSASE -b -w200 -D $RSSD <<-! | egrep -v '(Password|rows affected|^$)' |
+	`getPass $RSASE $ADMINLOGIN`
+	set nocount on
+	go
+	select dsname,dbname from rs_databases where ptype in ('A','S')
+	and dbname <> db_name()
+	order by dsname,dbname	
+	go
+	!
+
+while read DBSERVER DB
+do
+	export DBSERVER DB
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password >> $TEMPOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	if (select status2&16 from master..sysdatabases where name = "$DB") <> 16
+	begin
+		declare @proc_count tinyint
+		declare @dsname varchar(30)
+		declare @dbname varchar(30)
+		select @dsname=@@servername
+		select @dbname=db_name()
+		select @proc_count=(select count(*) from $DB..sysobjects where name in ('rs_marker','rs_update_lastcommit') and sysstat & -32768 = -32768)
+		if @proc_count <> 2
+		print "ERROR - %1!:%2! both rs_marker and rs_update_lastcommit not replicated",@dsname,@dbname
+	end
+	else
+		print "WARNING - Database $DB is currently offline.  Unable to check replication procs."
+	go
+	!
+done
+
+#--------------------------------------------------------------------------
+# If any non-replicated procs are found, send email to MAILDEST
+#--------------------------------------------------------------------------
+if [ -s $TEMPOUT ]
+then
+	cat $TEMPOUT > $OUTFILE
+	> $MAILFILE
+	date >> $MAILFILE
+	echo "The following procs should be marked for replication in all replicated databases:\n" >> $MAILFILE
+	echo "	rs_marker" >> $MAILFILE
+	echo "	rs_update_lastcommit\n" >> $MAILFILE
+	echo "This note indicates some databases are in error...see the list of SERVERS:databases below.\n" >> $MAILFILE
+	echo "Run sp_setrepproc in each database listed to verify the replicated procs." >> $MAILFILE
+	echo "Then use the following command in the database to mark the proc for replication:" >> $MAILFILE
+	echo "	sp_setrepproc <proc_name>,'table','log_current'\n\n" >> $MAILFILE
+
+	cat $OUTFILE >> $MAILFILE
+
+	export MAILSUBJECT="ERROR:  Verify replication procs"
+	sendMail
+
+	exit 1
+else
+	exit 0
+fi

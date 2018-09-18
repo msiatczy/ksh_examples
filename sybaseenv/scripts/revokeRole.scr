@@ -1,0 +1,157 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: revokeRole.scr -U <user> -login <login>|-L <login list> -S <DBSERVER> -role <role>
+#
+#  Description: Revoke a role from one or more logins on a specific DBSERVER.
+#
+#     Location:	/sccm/dba/sybase/scripts/revokeRole.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<user> - login of the user running the add
+#		<login> - login
+#		<role> - role
+#
+#
+#  Modification History:
+#	09/13/06 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -U <user> -login <login>|-L <login list> -S <DBSERVER> -role <role>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-U)		export EXEUSER=$2;shift 2;;
+			-login)		export ONELOGIN=$2;shift 2;;
+			-L)		export INPUTLIST=$2;shift 2;;
+			-S)		export DBSERVER=$2;shift 2;;
+			-role)		export ROLE=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# user and login must be passed
+if [ ! "$EXEUSER" -o ! "$ROLE" -o ! "$DBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# either login name or list must be passed
+if [ ! "$ONELOGIN" -a ! "$INPUTLIST" ]
+then
+        echo $USAGE
+        echo "ERROR - login name or list of logins MUST be passed"
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.revokeRole.$DATETIME
+export SQLFILE=/tmp/loginsql.$$
+export SQLOUT=/tmp/sqlout.$$
+export LOGINLIST=/tmp/loginlist.$$
+export HIGHRC=0
+
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $LOGINLIST && \rm -f $LOGINLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create a working login list
+#------------------------------------------------------------------------------
+if [ "$INPUTLIST" ]
+then
+        if [ ! -s $INPUTLIST ]
+        then
+                echo "ERROR - $INPUTLIST does not exist or is 0 bytes"
+                exit 1
+        else
+                cat $INPUTLIST > $LOGINLIST
+        fi
+else
+        echo $ONELOGIN > $LOGINLIST
+fi
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Role revoke" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Format sql for each login in the list
+#------------------------------------------------------------------------------
+> $SQLFILE
+
+echo "use master" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $LOGINLIST |
+while read LOGIN
+do
+	export LOGIN
+	echo "print \"Revoking $ROLE to $LOGIN on %1!...\",@@servername" >> $SQLFILE
+	echo "execute sp_role \"revoke\",$ROLE,$LOGIN" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#------------------------------------------------------------------------------
+# run the sql
+#------------------------------------------------------------------------------
+echo "`date` Revoking role $ROLE on $DBSERVER for the following logins:" >> $LOGFILE
+cat $LOGINLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+getPass $DBSERVER $EXEUSER | $ISQLEXE -U$EXEUSER -S$DBSERVER -w200 -i $SQLFILE > $SQLOUT
+
+cat $SQLOUT >> $LOGFILE
+#------------------------------------------------------------------------------
+# Check for errors
+#------------------------------------------------------------------------------
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	export HIGHRC=1
+	echo "`date` Role revoke FAILED for $DBSERVER" >> $LOGFILE
+else
+	echo "`date` Role revoke SUCCESSFUL for $DBSERVER" >> $LOGFILE
+fi
+
+echo "`date` END Role revoke" >> $LOGFILE
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+        echo "\nRole revoke FAILED - output in $LOGFILE"
+	echo "\nREMINDER:  THIS SCRIPT MUST BE EXECUTED AGAINST BOTH ASES IN A REPLICATED ENVIRONMENT.\n"
+        exit 1
+else
+        echo "\nRole revoke SUCCESSFUL"
+	echo "\nREMINDER:  THIS SCRIPT MUST BE EXECUTED AGAINST BOTH ASES IN A REPLICATED ENVIRONMENT.\n"
+        exit 0
+fi

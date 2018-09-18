@@ -1,0 +1,95 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: pushCommitSybadminTools.scr -H <host|all> -F <filename|all>
+#
+#  Description: Pushes $DISTDIR/commit/sybadmin/tools code for COMMIT to designated host
+#
+#     Location: /sccm/dba/sybase/scripts
+#
+#  Modification History:
+#       06/02/10 M. Siatczynski Initial Script
+#       07/12/10 M. Siatczynski	Remove UNIXLOGIN parm (not required now that ssh is trusted to EVG servers)
+#     				Add ability to specify all for ONEHOST
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -H <host|all> -F <filename|all>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+			-H)	export ONEHOST=$2;shift 2;;
+			-F)	export ONEFILE=$2;shift 2;;
+			-*)	echo $USAGE;exit 1;;
+			*)	echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export FILELIST=/tmp/filelist.$$
+export HOSTLIST=/tmp/hostlist.$$
+export SYBADMINDIST=$DISTDIR/commit/sybadmin/tools
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $FILELIST && \rm -f $FILELIST
+	test -f $HOSTLIST && \rm -f $HOSTLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  format host list
+#--------------------------------------------------------------------------
+if [ "$ONEHOST" = "all" ]
+then
+	cat $CTLDIR/commitHost.lst > $HOSTLIST
+else
+	echo $ONEHOST > $HOSTLIST
+fi
+
+#--------------------------------------------------------------------------
+#  format file list
+#--------------------------------------------------------------------------
+if [ "$ONEFILE" = "all" ]
+then
+	ls -1 $SYBADMINDIST > $FILELIST
+else
+	echo $ONEFILE > $FILELIST
+fi
+
+#--------------------------------------------------------------------------
+#  Copy the file(s) to the target host(s)
+#--------------------------------------------------------------------------
+cat $HOSTLIST |
+while read HOSTNAME
+do
+	echo "Copying file to $HOSTNAME..."
+	cat $FILELIST |
+	while read FILENAME
+	do
+		export FILENAME
+		export SOURCEFILE=$SYBADMINDIST/$FILENAME
+		export DESTFILE=/opt/dba/sybadmin/tools/$FILENAME
+		scp -p $SOURCEFILE $HOSTNAME:$DESTFILE 
+	done
+done
+
+#--------------------------------------------------------------------------
+#  Exit
+#--------------------------------------------------------------------------
+exit 0

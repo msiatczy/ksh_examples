@@ -1,0 +1,92 @@
+#!/bin/ksh
+
+# 8/25/04 M. Siatczynski Removed termed associates (ghowe mhaseman) from mail list and add khess while I'm on maternity leave
+# 2/10/05 M. Siatczynski Removed khess, svivekan from email list
+# 9/22/05 M. Siatczynski Changed USER to LOGIN
+# 9/28/05 M. Siatczynski Removed mnelso from email list
+# 2/17/06 M. Siatczynski Implement ISQLEXE
+
+. /sccm/dba/sybase/.dbaSybProfile
+
+export DBSERVER=IDTPROD1
+export LOGIN=stl_monkey
+export LOGINPWD=monkey
+export FILE_ROOT=$PERFDIR/settle/performance_ui
+# NOTE:  DATETIME includes HHMMSS, so file name uniqueness depends on seconds
+export SQLOUT=${FILE_ROOT}_${DATETIME}.out
+export TXTFILE=${FILE_ROOT}_${DATETIME}.txt
+export ARCHIVE_DIR=$PERFDIR/settle_archive
+export AGE=8
+export MAILLIST="nlorman msiatczy rpokala"
+
+# Clean up
+find $PERFDIR/settle -name "performance_ui*" \! -name "performance_ui*.gz" -mtime +${AGE} -exec gzip {} \;
+find $PERFDIR/settle -name "performance_ui*.gz" -mtime +${AGE} -exec mv {} ${ARCHIVE_DIR}/. \;
+
+> $SQLOUT
+> $TXTFILE
+
+export PRECALL=`date +"%D %T"`
+
+$ISQLEXE -U$LOGIN -S$DBSERVER -w600 <<-! >> $SQLOUT
+$LOGINPWD
+exec sp_uwho_active
+go
+exec sp_lock_what
+go
+use settle
+go
+declare @date1 datetime,
+@date2 datetime,
+@date3 datetime,
+@today datetime,
+@postdate char(17),
+@connect int,
+@fgndur int,
+@fisdur int,
+@totsql int
+select @date1 = getdate()
+select @connect = datediff(ms,'$PRECALL',@date1)
+select @today = convert(char(8), getdate(), 112)
+set statistics io,time on
+exec ss_fgn_trade_detail_P @today
+set statistics io,time off
+select @date2 = getdate()
+select @fgndur = datediff(ms,@date1,@date2)
+set statistics io,time on
+exec ss_fis_sel_survey_1 @today
+set statistics io,time off
+select @date3 = getdate()
+select @fisdur = datediff(ms,@date2,@date3)
+select @totsql = datediff(ms,'$PRECALL',@date3)
+select @postdate = convert(char(8),@date3,1)+' '+convert(char(8),@date3,8)
+print "DURATION(ms)|$PRECALL|connect|%1!|fgn|%2!|fis|%3!|totsql|%4!|%5!",@connect,@fgndur,@fisdur,@totsql,@postdate
+go
+!
+
+export POSTCALL=`date +"%D %T"`
+
+echo "Start  : $PRECALL" >> $TXTFILE
+egrep '(DURATION|Msg)' $SQLOUT >> $TXTFILE
+echo "Finish : $POSTCALL" >> $TXTFILE
+
+export SECONDS_START=`head -1 $TXTFILE | cut -d":" -f4`
+export SECONDS_FINISH=`tail -1 $TXTFILE | cut -d":" -f4`
+
+export MINUTES_START=`head -1 $TXTFILE | cut -d":" -f3`
+export MINUTES_FINISH=`tail -1 $TXTFILE | cut -d":" -f3`
+
+export MINUTES_SECONDS_START=`expr $MINUTES_START \* 60`
+export MINUTES_SECONDS_FINISH=`expr $MINUTES_FINISH \* 60`
+
+export SECONDS_DIFF=`expr $MINUTES_SECONDS_FINISH + $SECONDS_FINISH - $MINUTES_SECONDS_START - $SECONDS_START`
+
+echo "Elapsed(sec): $SECONDS_DIFF" >> $TXTFILE
+
+if [ `tail -1 $TXTFILE | cut -d":" -f2` -ge 10 ]
+then
+	mailx -s "settle UI Performance Delay Threshold Exceeded!" $MAILLIST < $TXTFILE
+	exit 1
+else
+	exit 0
+fi

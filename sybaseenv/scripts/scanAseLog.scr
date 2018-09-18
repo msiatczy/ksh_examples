@@ -1,0 +1,397 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: scanAseLog.scr -S <dbserver> {-m <maildest> -p <pagedest> -pagerange}
+#
+#  Description: Scan the ASE errorlog. Always send an email, send page if parm is passed.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	02/10/04 M. Siatczynski	Initial Script
+# 	K. Hess	8/23/01	Added "failed" to print list
+# 	M. Siatczynski	12/31/01 moved $WORRIES variable prior to setting list
+# 			added exceptions list ($PAGE_EXCEPT)	
+# 			changed rm of work files to test statements (old code commented out)
+# 			added more comments
+# 			added code for conditional paging based on page_dest setting
+#	M. Murphy 3/13/02 Added messages to ignore list ($IGNORE)
+#	M. Murphy 4/04/02 Added messages to ignore list
+#	M. Murphy 4/09/02 Added messages to ignore list
+#	M. Siatczynski 6/28/02 Added 913 to paging exception list
+#	M. Murphy 7/8/02 Added 3 12.5 messages to ignore list
+#	M. Siatczynski 7/11/02 Escaped () in ignore list message
+#	M. Murphy 7/12/02 Added 'affinity' message to ignore list
+#	M. Siatczynski 7/17/02 Added SETDBSERVER prior to source of .dbaProfile
+#	M. Siatczynski 7/30/02 Added code to page for 'kernel  secleanup' message
+#	M. Siatczynski 8/30/02 Included trap function to cleanup tmp files
+#	M. Siatczynski 9/06/02 Added "cannot send," to ignore list
+#	M. Siatczynski 9/10/02 Added "nrpacket: recv, Connection timed out" to ignore list
+#	M. Siatczynski 10/02/02 Updates for THRESHOLD ACTION messages
+#	M. Siatczynski 12/14/02 Added 9966 to page exceptions
+#	M. Murphy 2/4/03 Added 'unable to write statistics' to do not page list
+#	M. Siatczynski 3/12/03 Added 'select found no sockets sent SIGURG' to ignore list
+#	M. Siatczynski 3/15/03 Added server name to page message
+#	M. Siatczynski 4/04/03 Added page exceptions for rep agent messages
+#	M. Murphy 4/29/03 Added 1621 to page exceptions list
+#	M. Siatczynski 5/05/03 Added audit header/trailer records to debug autosys chase alarms
+#	M. Siatczynski 5/07/03 Exclude paging for 'kernel  *****' messages
+#	M. Siatczynski 5/07/03 Exclude paging for 'kernel  [Handler' messages
+#	M. Siatczynski 5/07/03 Exclude paging for 'RepAgent*Msg 05030506' messages
+#	M. Siatczynski 5/07/03 Update page exclusions so we will be paged for stack traces [A-Za-df-rt-z]
+#	M. Siatczynski 10/07/03 Add 1131 to page exceptions
+#	M. Siatczynski 10/13/03 Add 216 to page exceptions
+#	M. Siatczynski 10/31/03 Added "Warning! The spinlock pool" to ignore list
+#	M. Siatczynski 11/05/03 Removed audit header/trailer records to debug autosys chase alarms
+#	K. Hess		01/30/04	Added application to Worries
+#	K. Hess		05/11/04	Added application to page exceptions
+#	05/18/04 M. Siatczynski	Centralized script
+#				Changed logic for grabbing lines from current errorlog
+#	06/01/04 M. Siatczynski	Ignore 7211 pages
+#	06/07/04 M. Siatczynski	Corrected SCANLOG typo: scanAaseLog to scanAseLog
+#	06/10/04 M. Siatczynski	Ignore 'Failed to execute the threshold procedure' pages
+#	06/22/04 M. Siatczynski	Added -pagerange parm
+#	07/07/04 M. Siatczynski	Temporarily ignore pages for 7205 and 7235 messages
+#	07/08/04 M. Siatczynski	Temporarily ignore pages for 'Failed to connect to remote server'
+#	05/12/05 K. Hess	Added ignore of kernel message: "extended error information: hostname:  login:"
+#	05/19/05 M. Siatczynski	Added ignore of all Deadlock Id detail messages
+#	07/12/05 M. Siatczynski	Added "Error: 3020" to page exception list
+#	08/01/05 M. Siatczynski	Added "Error: 3021" to page exception list
+#	10/13/05 M. Siatczynski	Added "The configuration option" to the page exception list
+#	11/07/05 M. Siatczynski Removed "Warning! The spinlock pool" from ignore list
+#	12/09/05 M. Siatczynski Add "EXPRESSNET TEST" to worries to test paging from scan log
+#	05/26/06 M. Siatczynski Added "Error: 11206" and "Unable to connect to server" to page exception list
+#	06/13/06 M. Siatczynski	Added "Error: 3019" to page exception list
+#	12/26/06 M. Siatczynski	Ignore the following lines-audit switches will be picked up by another script
+#				AUDIT THRESHOLD
+#				background task message: Configuration option changed.
+#				background task message: Changing the value of 'current audit table'
+#	01/22/07 M. Siatczynski	Add following to worries:  audproc: (this should flag most audit error events), remove EXPRESSNET TEST from worries
+#	01/23/07 M. Siatczynski	Ignore "Loading global audit options" and "Global audit options successfully loaded" (flagged with audproc:)
+#	08/29/07 M. Siatczynski	Ignore "Begin processing to generate RSA keypair" and "Completed processing to generate RSA keypair"
+#	12/04/07 M. Siatczynski Added "The spinlock pool has grown....." to ignore list AGAIN
+#	12/10/07 M. Siatczynski Remove "The spinlock pool has grown....." from the ignore list AGAIN
+#	09/24/08 M. Siatczynski Add "SySAM: WARNING: ASE will shutdown" to the WORRIES list
+#	09/21/09 M. Siatczynski Add "segment is full" to the WORRIES list
+#	08/04/10 M. Siatczynski Add "not allowed" to the WORRIES list
+#	08/26/10 M. Siatczynski Add "Password Expired:" to the WORRIES list - no paging, email only
+#	09/21/10 M. Siatczynski Add deprecated to list of WORRIES, do not page for this message
+#	09/23/10 M. Siatczynski Add space after Msg to avoid detection of this string in sqltext
+#	02/10/11 M. Siatczynski Updates to accommodate AMG East env
+#	04/23/11 M. Siatczynski	Added ignore of kernel messages related to ksmask__rpacket
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-m <maildest> -p <pagedest> -pagerange}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -m)     export MAILTO=$2;shift 2;;
+                        -p)     export PAGETO=$2;shift 2;;
+                        -pagerange)     export PAGERANGE=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$PAGERANGE" && export PAGERANGE=0
+
+# profile must be sourced after setting DBSERVER
+export SETDBSERVER=$DBSERVER
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+## reset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+## reset the centrally-set MAILDEST variable if a different maildest was passed
+test "$PAGETO" && export PAGEDEST=$PAGETO || unset PAGEDEST
+test "$MAILTO" && export MAILDEST=$MAILTO
+
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+if [ -f $SYBASE/$SYBASE_ASE/install/errorlog_${DBSERVER} ]
+then
+# AMG West
+	export ASELOG=$SYBASE/$SYBASE_ASE/install/errorlog_${DBSERVER}
+elif [ -f $SYBASE/$SYBASE_ASE/install/${DBSERVER}.log ]
+then
+# AMG East
+	export ASELOG=$SYBASE/$SYBASE_ASE/install/${DBSERVER}.log
+fi
+export STARTCTL=$CTLDIR/$DBSERVER/$DBSERVER.scanAseLog.startline
+export LASTLINECTL=$CTLDIR/$DBSERVER/$DBSERVER.scanAseLog.lastline
+export TEMPLASTLINE=/tmp/lastline.$$
+export TEMPLOG=/tmp/templog.$$
+export FERR_FILE=/tmp/filtered_errors.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export TEMPPAGEMSG=/tmp/temp.pagemsg.$$
+export WORRIES=/tmp/worries.$$
+export IGNORE=/tmp/ignore.$$
+export PAGE_EXCEPT=/tmp/page_except.$$
+export SCANLOG=$LOGDIR/misc/$DBSERVER/$DBSERVER.scanAseLog.$MMYYYY
+
+if [ ! -f $ASELOG ]
+then
+	echo $CALLED
+	echo "ERROR - $ASELOG does not exist on `hostname`"
+	exit 1
+fi
+
+# If a startline control file does not exist, create one and initialize with line 1
+if [ ! -f $STARTCTL ]
+then
+	echo 1 > $STARTCTL
+fi
+
+# If a lastline control file does not exist, create one
+if [ ! -f $LASTLINECTL ]
+then
+	> $LASTLINECTL
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TEMPLASTLINE && \rm -f $TEMPLASTLINE
+	test -f $TEMPLOG && \rm -f $TEMPLOG
+	test -f $FERR_FILE && \rm -f $FERR_FILE
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+	test -f $TEMPPAGEMSG && \rm -f $TEMPPAGEMSG
+	test -f $WORRIES && \rm -f $WORRIES
+	test -f $IGNORE && \rm -f $IGNORE
+	test -f $PAGE_EXCEPT && \rm -f $PAGE_EXCEPT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#---------------------------------------------------------------------------------------
+# Define worries
+#---------------------------------------------------------------------------------------
+> $WORRIES
+
+print "Error" >> $WORRIES
+print "Msg " >> $WORRIES
+print "stack trace" >> $WORRIES
+print "No Pss structures" >> $WORRIES
+print "Failed" >> $WORRIES
+print "failed" >> $WORRIES
+print "sddone"  >> $WORRIES
+print "Unable" >> $WORRIES
+print "denied" >> $WORRIES
+print "Automatic checkpointing" >> $WORRIES
+print "infected" >> $WORRIES
+print "Invalid" >> $WORRIES
+print "I/O error" >> $WORRIES
+print "Bad file number" >> $WORRIES
+print "MIRROR" >> $WORRIES
+print "background task message" >> $WORRIES
+print "kernel" >> $WORRIES
+print "upgrade version" >> $WORRIES
+print "could not truncate the log" >> $WORRIES
+print "waiting for space to become available" >> $WORRIES
+print "secleanup" >> $WORRIES
+print "application" >> $WORRIES
+print "audproc:" >> $WORRIES
+print "SySAM: WARNING: ASE will shutdown" >> $WORRIES
+print "segment is full" >> $WORRIES
+print "not allowed" >> $WORRIES
+print "Password Expired:" >> $WORRIES
+print "has been deprecated" >> $WORRIES
+
+#---------------------------------------------------------------------------------------
+# Define worries that can be ignored (more detailed text)
+#---------------------------------------------------------------------------------------
+> $IGNORE
+
+print "Error: 1608" >> $IGNORE
+print "nopen: t_alloc, Protocol error" >> $IGNORE
+print "nclose: t_rcvrel, Orderly release message not found" >> $IGNORE
+print "THRESHOLD ACTION: .* : NON-LCT reached" >> $IGNORE
+print "THRESHOLD ACTION: .* : Dumping log via" >> $IGNORE
+print "THRESHOLD ACTION: .* : Dump duration" >> $IGNORE
+print "THRESHOLD ACTION: .* : Log successfully dumped" >> $IGNORE
+print "THRESHOLD ACTION: .* : Log pages used" >> $IGNORE
+print "kernel  fd = [0-9]*" >> $IGNORE
+print "kernel  b_stliopt_generic: t_alloc failed: Protocol error." >> $IGNORE
+print "nclose: Unknown servtype, 0" >> $IGNORE
+print "nrpacket: t_rcv\(\), Illegal file descriptor" >> $IGNORE
+print "nrpacket: recv, Connection timed out" >> $IGNORE
+print "Cannot read, host process disconnected:" >> $IGNORE
+print "Cannot send, host process disconnected:" >> $IGNORE
+print "kesetown: engine [0-9]* is still not online after [0-9]* attempts to affinity to it." >> $IGNORE
+print "kernel  nrecvoob: select found no sockets sent SIGURG" >> $IGNORE
+#print "The spinlock pool has grown to be larger than the spinlock monitor area" >> $IGNORE
+print "kernel  extended error information: hostname:" >> $IGNORE
+print "^Deadlock Id" >> $IGNORE
+print "AUDIT THRESHOLD" >> $IGNORE
+print "background task message: Configuration option changed\." >> $IGNORE
+print "background task message: Changing the value of \'current audit table\'" >> $IGNORE
+print "Loading global audit options" >> $IGNORE
+print "Global audit options successfully loaded" >> $IGNORE
+print "Begin processing to generate RSA keypair" >> $IGNORE
+print "Completed processing to generate RSA keypair" >> $IGNORE
+print "kernel  ksmask__rpacket: Invalid tdslength value" >> $IGNORE
+print "kernel  originating node of previous invalid TDS packet:" >> $IGNORE
+
+#---------------------------------------------------------------------------------------
+# Define paging exceptions
+# Exclude all kernel messages that DON'T start with an 's' - this will trap secleanup
+#---------------------------------------------------------------------------------------
+> $PAGE_EXCEPT
+
+print "background" >> $PAGE_EXCEPT
+print "dumped" >> $PAGE_EXCEPT
+print "kernel  [A-Za-df-rt-z]" >> $PAGE_EXCEPT
+print "1131" >> $PAGE_EXCEPT
+print "1621" >> $PAGE_EXCEPT
+print "4233" >> $PAGE_EXCEPT
+print "9960" >> $PAGE_EXCEPT
+print "9965" >> $PAGE_EXCEPT
+print "9966" >> $PAGE_EXCEPT
+print "12920" >> $PAGE_EXCEPT
+print "Orderly" >> $PAGE_EXCEPT
+print "913" >> $PAGE_EXCEPT
+print "Unable to write statistics" >> $PAGE_EXCEPT
+print "RepAgent.* Msg 14082" >> $PAGE_EXCEPT
+print "Error: 9261" >> $PAGE_EXCEPT
+print "kernel  \*\*\*\*\*" >> $PAGE_EXCEPT
+print "kernel  \[Handler" >> $PAGE_EXCEPT
+print "RepAgent.*Msg 05030506" >> $PAGE_EXCEPT
+print "216" >> $PAGE_EXCEPT
+print "application" >> $PAGE_EXCEPT
+print "7211" >> $PAGE_EXCEPT
+print "7205" >> $PAGE_EXCEPT
+print "7235" >> $PAGE_EXCEPT
+print "Failed to connect to remote server" >> $PAGE_EXCEPT
+print "Failed to execute the threshold procedure" >> $PAGE_EXCEPT
+print "Error: 3019" >> $PAGE_EXCEPT
+print "Error: 3020" >> $PAGE_EXCEPT
+print "Error: 3021" >> $PAGE_EXCEPT
+print "The configuration option" >> $PAGE_EXCEPT
+print "Error: 11206" >> $PAGE_EXCEPT
+print "Unable to connect to server" >> $PAGE_EXCEPT
+print "Password Expired:" >> $PAGE_EXCEPT
+print "has been deprecated" >> $PAGE_EXCEPT
+
+#---------------------------------------------------------------------------------------
+# Compare the last line of the current errorlog with the last line previously scanned
+# If the lines are identical, then there are no new messages to scan
+#---------------------------------------------------------------------------------------
+export CONTINUESCAN=1
+tail -1 $ASELOG > $TEMPLASTLINE
+cmp -s $LASTLINECTL $TEMPLASTLINE && export CONTINUESCAN=0 || export CONTINUESCAN=1
+
+# the entries to SCANLOG are somewhat informational so we can verify that the new script is working properly
+if [ $CONTINUESCAN -eq 0 ]
+then
+        echo "`date +'%D %T'` : No new entries in $ASELOG" >> $SCANLOG
+	exit 0
+else
+        echo "`date +'%D %T'` : Scanning $ASELOG" >> $SCANLOG
+fi
+
+#---------------------------------------------------------------------------------------
+# Grab all messages in the errorlog since the last scan
+# wc -l < filename will print only the linecount and not filename
+#---------------------------------------------------------------------------------------
+export STARTLINE=`cat $STARTCTL`
+test ! "$STARTLINE" && export STARTLINE=1
+
+# get the total number of lines in the current errorlog
+# If STARTLINE > TOTALLINES then the errorlog has been rolled--restart at the begining of the log
+export TOTALLINES=`wc -l < $ASELOG`
+test $STARTLINE -gt $TOTALLINES && export STARTLINE=1
+
+# Grab all lines from the errorlog, starting with STARTLINE to the end of the file
+tail +$STARTLINE $ASELOG > $TEMPLOG
+
+# store new starting point
+export NUMLINES=`wc -l < $TEMPLOG`
+export NEWSTARTLINE=`expr $STARTLINE + $NUMLINES`
+echo $NEWSTARTLINE > $STARTCTL
+tail -1 $TEMPLOG > $LASTLINECTL
+
+#---------------------------------------------------------------------------------------
+# If a valid templog was created, search for worries in the temp log.
+# grep out the ignore messages
+#---------------------------------------------------------------------------------------
+if [ ! -f $TEMPLOG ]
+then
+	echo "ERROR - Unable to scan $DBSERVER:$ASELOG"
+	exit 1
+else
+	if [ -f $WORRIES -a -f $TEMPLOG ]
+	then
+		egrep -f $WORRIES $TEMPLOG | egrep -vf $IGNORE > $FERR_FILE
+	fi
+fi
+
+#---------------------------------------------------------------------------------------
+# If the filtered error file is not empty then there are valid errors
+# MAIL all messages in the temp error file
+#---------------------------------------------------------------------------------------
+if [ -s $FERR_FILE ]
+then
+	> $MAILFILE
+	print $DBSERVER >> $MAILFILE
+	cat $FERR_FILE >> $MAILFILE
+	export MAILSUBJECT="SCAN LOG: Check $DBSERVER"
+	sendMail
+
+#---------------------------------------------------------------------------------------
+# if PAGEDEST is set, then filter page exceptions and send PAGE
+# NOTE:  the parm order on egrep must be -vf NOT -fv (the filename must immediately follow the 'f')
+# Strip the first 3 fields of the errorlog format from the page message
+#---------------------------------------------------------------------------------------
+	if [ "$PAGEDEST" ]
+	then
+		> $PAGEMSG
+		> $TEMPPAGEMSG
+		print -n "$DBSERVER:" >> $PAGEMSG
+
+		egrep -vf $PAGE_EXCEPT $FERR_FILE >> $TEMPPAGEMSG
+
+		if [ -s $TEMPPAGEMSG ]
+		then
+			cut -d":" -f4- $TEMPPAGEMSG >> $PAGEMSG
+			sendPage $DBSERVER
+		fi
+	fi
+fi	
+
+#---------------------------------------------------------------------------------------
+# Exit
+#---------------------------------------------------------------------------------------
+exit 0

@@ -1,0 +1,159 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getPerms.scr -S <DBSERVER> -to <granted to> {-D <dbname>|<DB list>}
+#
+#  Description: Get perms granted to a specific entity (role, user, group, etc)
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER>
+#              	<DBSPEC> - single database or list of databases
+#              	<GRANTEDTO> - entity to which the perms have been granted
+#
+#  NOTE:  This script produces a SQL file as output.  No LOGFILE is created.
+#
+#  Modification History:
+#	05/22/07 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -to <granted to> {-D <dbname>|<DB list>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBSPEC=$2;shift 2;;
+                        -to)    export GRANTEDTO=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+
+if [ ! "$DBSERVER" -o ! "$GRANTEDTO" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/dblist.$$
+export PERMTEMP=/tmp/permtemp.$$
+export PERMSQLOUT=$SQLDIR/useradmin/$DBSERVER/$DBSERVER.$GRANTEDTO.perm.sql
+export PERMSGRANTED=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $PERMTEMP && \rm -f $PERMTEMP
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------------
+# format list of databases
+# if a file is passed, make sure it's > 0 bytes
+# if it's not clearly a file, make sure it's not an invalid filename
+#------------------------------------------------------------------------------------
+if [ "$DBSPEC" ]
+then
+# make sure control file exists and has entries
+	if [ -f $DBSPEC ]
+	then
+		if [ -s $DBSPEC ]
+		then
+			cat $DBSPEC > $DBLIST
+		else
+			echo "ERROR - $DBSPEC is 0 bytes"
+			exit 1
+		fi
+	else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+		echo $DBSPEC | grep '/' > /dev/null
+		if [ $? -eq 0 ]
+		then
+			echo "ERROR - $DBSPEC is not valid--possible invalid filename?"
+			exit 1
+		else
+			echo $DBSPEC > $DBLIST
+		fi
+	fi
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from sysdatabases where
+	name not in ('master','model','dba','lookjack')
+	and name not like 'sybsystem%'
+	and name not like 'dbcc%'
+	and name not like 'sybsecurity%'
+	and name not like 'tempdb%'
+	and status2 & 16 <> 16
+	order by name
+	go
+	!
+
+	checkSqlErr $DBLIST
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - getting list of databases from $DBSERVER"
+		cat $DBLIST
+		exit 1
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# START OF MAIN LOOP
+# Grep for perms granted to GRANTEDTO
+#------------------------------------------------------------------------------
+> $PERMSQLOUT
+
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	export PERMSQL=$SQLDIR/useradmin/$DBSERVER/$DBNAME/$DBSERVER.$DBNAME.allperm.sql
+	> $PERMTEMP
+
+	grep "to ${GRANTEDTO}$" $PERMSQL > $PERMTEMP
+
+	if [ -s $PERMTEMP ]
+	then
+		export PERMSGRANTED=1
+		echo "use $DBNAME" >> $PERMSQLOUT
+		echo "go" >> $PERMSQLOUT
+		cat $PERMTEMP >> $PERMSQLOUT
+		echo "go" >> $PERMSQLOUT
+	fi
+done
+
+#------------------------------------------------------------------------------
+# Write trailers and exit
+#------------------------------------------------------------------------------
+if [ $PERMSGRANTED -eq 1 ]
+then
+	echo "\nPermission file created:  $PERMSQLOUT\n"
+else
+	echo "\nNO perms granted to $GRANTEDTO on $DBSERVER\n"
+fi
+exit 0

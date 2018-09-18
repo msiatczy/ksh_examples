@@ -1,0 +1,151 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: cleanDir.scr -dir <directory> -days <days to keep {-size <size of file #c> -pctalarm <alarm pct threshold> -m <maildest> -rptonly}>
+#
+#  Description: Interim script to cleanup files in a given directory
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<dir> - directory beneath which to remove files
+#              	<days> - number of days to keep
+#              	<size> - size of file to be removed
+#              	<pctalarm> - threshold at which to send an email (default = 90%)
+#				only valid when actually doing a delete  n/a for -rptonly
+#		<rptonly> - only report old files, don't delete
+#
+#  Modification History:
+#	10/14/03 M. Siatczynski	Initial Script
+#	05/14/04 M. Siatczynski Add pctalarm and corresponding logic
+#	06/04/04 M. Siatczynski Change RPTFILE to LOGFILE and write to logs rather than reports
+#				Add process id ($$) to LOGFILE
+#	06/16/04 M. Siatczynski Add -rptonly flag
+#	08/23/04 K. Hess	Added size option to remove 57 byte tran log files
+#	06/11/07 M. Siatczynski	Only email report if there are files to report
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -dir <directory> -days <days to keep> {-size <size of file #c> -pctalarm <alarm pct threshold> -m <maildest> -rptonly}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -dir)		export DIR=$2;shift 2;;
+                        -days)		export NUMDAYS=$2;shift 2;;
+                        -size)		export SIZE=$2;shift 2;;
+                        -pctalarm)	export PCTALARM=$2;shift 2;;
+                        -m)		export MAILDEST=$2;shift 2;;
+                        -rptonly)	export RPTONLY=1;shift 1;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DIR" -o ! "$NUMDAYS" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ ! -d $DIR ]
+then
+	echo "ERROR - $DIR is not a valid directory"
+	exit 1
+fi
+
+test ! "$PCTALARM" && export PCTALARM=90
+test ! "$RPTONLY" && export RPTONLY=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/cleanDir.$DATETIME.$$
+export TMPLIST=/tmp/tmplist.$$
+export HIGHRC=0
+
+> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TMPLIST && \rm -f $TMPLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Write headers
+#  If -rptonly, then just generate a report, don't do any deletes
+#--------------------------------------------------------------------------
+date >> $LOGFILE
+echo $CALLED >> $LOGFILE
+
+if [ $RPTONLY -eq 1 ]
+then
+	echo "The following files are older than $NUMDAYS days and should be manually removed if they are not needed:" >> $LOGFILE
+	if [ $SIZE ]
+	then
+		find $DIR -type f -mtime +$NUMDAYS -size $SIZE -print > $TMPLIST
+		export HIGHRC=$?
+	else
+		find $DIR -type f -mtime +$NUMDAYS -print > $TMPLIST
+		export HIGHRC=$?
+	fi
+	if [ -s $TMPLIST ]
+	then
+		echo "$DIR contains the following files older than $NUMDAYS days" >> $LOGFILE
+		cat $TMPLIST >> $LOGFILE
+		export MAILSUBJECT="REPORT: $DIR contains files older than $NUMDAYS days"
+		export MAILFILE=$LOGFILE
+		sendMail
+	else
+		echo "$DIR does not contain files older than $NUMDAYS days" >> $LOGFILE
+	fi
+else
+#  Get the disk usage before the delete
+	echo "\nDisk usage before delete:\n" >> $LOGFILE
+	df -k $DIR >> $LOGFILE
+	echo "The following files are being removed:" >> $LOGFILE
+
+#  Delete the files
+	if [ $SIZE ]
+	then
+		find $DIR -type f -mtime +$NUMDAYS -size $SIZE -print -exec \rm -f {} \; >> $LOGFILE
+		export HIGHRC=$?
+	else
+		find $DIR -type f -mtime +$NUMDAYS -print -exec \rm -f {} \; >> $LOGFILE
+		export HIGHRC=$?
+	fi
+#  Get the disk usage after the delete
+	echo "\nDisk usage after delete:\n" >> $LOGFILE
+	df -k $DIR >> $LOGFILE
+
+#  Check percent full for filesystem.  If percent full > PCTALARM then send mail.
+	export PCTFULL=`df -k $DIR | grep -v '^Filesystem' | sed -e 's/  */ /g' | cut -d" " -f5 | sed -e 's/%//g'`
+
+	if [ $PCTFULL -gt $PCTALARM ]
+	then
+		export MAILSUBJECT="WARNING: $DIR > ${PCTALARM}%"
+		export MAILFILE=$LOGFILE
+		sendMail
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# Exit with return status from find command
+#--------------------------------------------------------------------------
+exit $HIGHRC

@@ -1,0 +1,185 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findLogin.scr -L <login> -S <DBSERVER>|all {-detail -exact}
+#
+#  Description: Check ALL ASEs for a specific login or logins containing the login name
+#
+#     Location:	/sccm/dba/sybase/scripts/findLogin.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<login> - login to search for
+#		<DBSERVER> - one or all DBSERVERS
+#		<detail> - print detailed DB access for the login
+#		<exact> - only search for exact login matches (default is wildcard search)
+#
+#  Modification History:
+#	12/19/05 M. Siatczynski	Initial Script
+#	02/10/06 M. Siatczynski	Implement ISQLEXE
+#	09/20/06 M. Siatczynski	Add additional parms:  DBSERVER, -detail
+#	09/27/06 M. Siatczynski	Add -exact parm to search for exact login match (default is wildcard search)
+#	10/06/10 M. Siatczynski	Add lockdate to output
+#	04/26/11 M. Siatczynski	Add lastlogindate to output
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -L <login> -S <DBSERVER>|all {-detail -exact}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-L)		export LOGIN=$2;shift 2;;
+			-S)		export ONEDBSERVER=$2;shift 2;;
+			-detail)	export DETAIL=1;shift 1;;
+			-exact)		export EXACT=1;shift 1;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# login and DBSERVER spec must be passed
+if [ ! "$LOGIN" -o ! "$ONEDBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+test ! "$DETAIL" && export DETAIL=0
+test ! "$EXACT" && export EXACT=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/useradmin/central/findLogin.$DATETIME
+export DBSERVERLIST=/tmp/dbserver.list.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export HIGHRC=0
+export GREPRC=0
+
+#--------------------------------------------------------------------------
+#  Build server list
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  write headers
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Checking the following DBSERVERS for login $LOGIN:" >> $LOGFILE
+cat $DBSERVERLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+#  Format the sql
+#--------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "use master" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+# search syslogins for the login name
+echo "if exists (select name from master..syslogins" >> $SQLFILE
+if [ $EXACT -eq 0 ]
+then
+	echo "where name like \"%$LOGIN%\")" >> $SQLFILE
+else
+	echo "where name = \"$LOGIN\")" >> $SQLFILE
+fi
+echo "begin" >> $SQLFILE
+echo "select @@servername+':  LOGIN exists ('+name+')  Locked: ('+convert(varchar(19),lockdate)+')  LastLogin: ('+convert(varchar(19),lastlogindate)+')'" >> $SQLFILE
+echo "from master..syslogins" >> $SQLFILE
+if [ $EXACT -eq 0 ]
+then
+	echo "where name like \"%$LOGIN%\"" >> $SQLFILE
+else
+	echo "where name = \"$LOGIN\"" >> $SQLFILE
+fi
+echo "order by name" >> $SQLFILE
+
+# Get detail--only if login exists
+if [ $DETAIL -eq 1 ]
+then
+	echo "print ''" >> $SQLFILE
+	echo "print '%1! ROLES GRANTED:',@@servername" >> $SQLFILE
+	echo "execute sp_login_roles $LOGIN" >> $SQLFILE
+	echo "print ''" >> $SQLFILE
+	echo "print '%1! DATABASE ACCESS:',@@servername" >> $SQLFILE
+	echo "execute sp_login_dbs $LOGIN" >> $SQLFILE
+fi
+
+echo "end" >> $SQLFILE
+echo "else" >> $SQLFILE
+echo "begin" >> $SQLFILE
+echo "select @@servername+ ':  LOGIN does not exist'" >> $SQLFILE
+echo "end" >> $SQLFILE
+
+echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# Run the sql to search for login
+# Check for errors
+#------------------------------------------------------------------------------
+for DBSERVER in `cat $DBSERVERLIST`
+do
+	> $SQLOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w500 -i $SQLFILE | egrep -v '(Password|return status)' >> $SQLOUT
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - querying $DBSERVER"
+		export HIGHRC=1
+	fi
+
+	cat $SQLOUT >> $LOGFILE
+done
+
+#------------------------------------------------------------------------------
+# Show results on screen
+# If the logfile is empty, remove it
+#------------------------------------------------------------------------------
+echo ""
+grep 'LOGIN exists' $LOGFILE
+export GREPRC=$?
+
+if [ $GREPRC -eq 0 ]
+then
+	echo "\nReview details in $LOGFILE"
+else
+	echo "\nNo matches found for $LOGIN\n" | tee -a $LOGFILE
+fi
+
+#------------------------------------------------------------------------------
+# Exit
+#------------------------------------------------------------------------------
+echo "\n`date` Script complete" >> $LOGFILE
+test $HIGHRC -eq 1 && exit 1 || exit 0

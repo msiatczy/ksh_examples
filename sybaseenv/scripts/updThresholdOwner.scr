@@ -1,0 +1,208 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: updThresholdOwner.scr -S <DBSERVER> -D <dbname|DBlist> -segment <segment|all> -freespace <free space|all> {-owner <login>}
+#
+#  Description: Modify owner of a particular threshold.  
+#		Owner defaults to ADMINLOGIN
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#              	<dbname> - database name
+#              	<segment> - name of the segment to which the threshold is attached
+#              	<free space> - free space setting for the threshold
+#
+#  Modification History:
+#	03/30/06 M. Siatczynski	Initial Script
+#	12/22/06 M. Siatczynski	Change FREESPACE datatype from smallint to int
+#	12/28/07 M. Siatczynski	Change DBNAME to DBSPEC to allow list of databases
+#	08/17/09 M. Siatczynski	Echo WARNING messages to LOG ONLY, not to console (to avoid stdout msgs when run from Autosys)
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname|DBlist> -segment <segment|all> -freespace <free space|all> {-owner <login>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBSPEC=$2;shift 2;;
+                        -segment)   export SEGMENT=$2;shift 2;;
+                        -freespace)   export FREESPACE=$2;shift 2;;
+                        -owner)   export OWNER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBSPEC" -o ! "$SEGMENT" -o ! "$FREESPACE" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+# if owner is not specified, default to ADMINLOGIN
+test ! "$OWNER" && export OWNER=$ADMINLOGIN
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SQLOUT=/tmp/sqlout.$$
+export SQLFILE=/tmp/sqlfile.$$
+export DBLIST=/tmp/dblist.$$
+export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.updThresholdOwner.$DATETIME
+
+> $LOGFILE
+echo "`date` $DBSERVER - Updating threshold owners" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Format list of databases
+#--------------------------------------------------------------------------
+# make sure control file exists and has entries
+if [ -f $DBSPEC ]
+then
+	if [ -s $DBSPEC ]
+	then
+		cat $DBSPEC > $DBLIST
+	else
+		echo "WARNING - $DBSPEC is 0 bytes" >> $LOGFILE
+		exit 1
+	fi
+else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+	echo $DBSPEC | grep '/' > /dev/null
+	if [ $? -eq 0 ]
+	then
+		echo "ERROR - $DBSPEC is not valid--possible invalid filename?" | tee -a $LOGFILE
+		exit 2
+	else
+		echo $DBSPEC > $DBLIST
+	fi
+fi
+
+echo "for the following databases:" >> $LOGFILE
+cat $DBLIST >> $LOGFILE
+
+#---------------------------------------------------------------------------------------
+# format the sql to get the details of the thresholds to modify
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "create table #thresh (DBNAME varchar(30) not null, SEGMENT varchar(18) not null, FREESPACE int not null)" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	echo "use $DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "insert #thresh" >> $SQLFILE
+	echo "select db_name(),s.name,t.free_space" >> $SQLFILE
+	echo "from $DBNAME..systhresholds t, $DBNAME..syssegments s" >> $SQLFILE
+	echo "where db_name() = \"$DBNAME\" and" >> $SQLFILE
+	echo "s.segment = t.segment" >> $SQLFILE
+	if [ "$SEGMENT" != "all" ]
+	then
+		echo "and s.name = \"$SEGMENT\"" >> $SQLFILE
+	fi
+	if [ "$FREESPACE" != "all" ]
+	then
+		echo "and t.free_space = $FREESPACE" >> $SQLFILE
+	fi
+	echo "go" >> $SQLFILE
+done
+
+echo "if exists (select * from #thresh)" >> $SQLFILE
+echo "select * from #thresh" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "drop table #thresh" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# Append the output to the logfile
+# Check for errors
+#------------------------------------------------------------------------------
+echo "`date` $DBSERVER:Getting current threshold settings" >> $LOGFILE
+
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 -i$SQLFILE | grep -v Password | sed -e 's/  */ /g' > $SQLOUT
+
+cat $SQLOUT >> $LOGFILE
+
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	echo "ERROR - Getting threshold info on $DBSERVER" | tee -a $LOGFILE
+	exit 1
+else
+	if [ ! -s $SQLOUT ]
+	then
+		echo "No thresholds match parameters specified" | tee -a $LOGFILE
+		echo $CALLED >> $LOGFILE
+		exit 0
+	fi
+fi
+
+#---------------------------------------------------------------------------------------
+# format SQL to modify the threshold
+#---------------------------------------------------------------------------------------
+> $SQLFILE
+
+cat $SQLOUT |
+while read DBNAME SEGMENT FREESPACE
+do
+	echo "use $DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "exec sp_modifythreshold $DBNAME,$SEGMENT,$FREESPACE" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#---------------------------------------------------------------------------------------
+# modify the threshold
+# Execute as OWNER
+# check for errors
+# exit
+#---------------------------------------------------------------------------------------
+echo "`date` Modifying threshold(s) on $DBSERVER to $OWNER:" >> $LOGFILE
+
+> $SQLOUT
+getPass $DBSERVER $OWNER | $ISQLEXE -U$OWNER -S$DBSERVER -w200 -e -i$SQLFILE | grep -v Password > $SQLOUT
+
+cat $SQLOUT >> $LOGFILE
+
+checkSqlErr $SQLOUT
+if [ $? -ne 0 ]
+then
+	echo "`date` Modification of threshold(s) on $DBSERVER FAILED" | tee -a $LOGFILE
+	echo "See $LOGFILE for details."
+	exit 1
+else
+	echo "`date` Modification of threshold(s) on $DBSERVER SUCCESSFUL" >> $LOGFILE
+	exit 0
+fi

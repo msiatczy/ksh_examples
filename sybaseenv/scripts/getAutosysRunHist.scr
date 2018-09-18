@@ -1,0 +1,92 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getAutosysRunHist.scr -J <job name> {-R <num runs>}
+#
+#  Description: Get run history for an autosys job
+#  NOTE:  this job currently is hardcoded to run against autosys PRD 
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<event> - autosys event
+#
+#  Modification History:
+#	01/31/07 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -J <job name> -R <num runs>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -J)	export JOBNAME=$2;shift 2;;
+                        -R)	export RUNSBACK=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$JOBNAME" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$RUNSBACK" && export RUNSBACK=1
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/getAutosysRunHist.$JOBNAME.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+#function tempCleanup {
+#	test -f $JOBLIST && \rm -f $JOBLIST
+#}
+#
+#trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# source the file to set the autosys PRD environment and
+# loop through and check previous runs
+#--------------------------------------------------------------------------
+. /opt/sccm/autouser/bin/autoprd
+
+> $LOGFILE
+echo "`date` Check previous runtimes for $JOBNAME" >> $LOGFILE
+
+export RUNNUM=0
+export RUNCOUNT=1
+while [ $RUNCOUNT -le $RUNSBACK ]
+do
+	if [ $RUNNUM -eq 0 ]
+	then
+		$AUTOSYS/bin/autorep -J $JOBNAME -L 0 -r $RUNNUM | tee -a $LOGFILE
+	else
+		$AUTOSYS/bin/autorep -J $JOBNAME -L 0 -r $RUNNUM | grep ^$JOBNAME | tee -a $LOGFILE
+	fi
+	export RUNCOUNT=`expr $RUNCOUNT + 1`
+	export RUNNUM=`expr $RUNNUM - 1`
+done
+
+#--------------------------------------------------------------------------
+# Exit with 0
+#--------------------------------------------------------------------------
+exit 0

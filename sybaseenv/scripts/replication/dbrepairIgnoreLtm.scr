@@ -1,0 +1,212 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dbrepairIgnoreLtm.scr -L <control list> -S <dbserver> -fmt|-run {-noprompt}
+#
+#  Description: Ignore LTM(s) with dbcc dbrepair for database on <dbserver>
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<control list> - input list of databases to be replicated
+#              	<dbserver> - database server 
+#
+#   NOTE:  -L <control list> and other parameters are mutually exclusive.
+#
+#  Modification History:
+#	09/29/08 M. Siatczynski	Initial Script - copied from ignoreLtm.scr
+#       09/16/10 K. Sawant      Added Tertiary connection to incorporate MSA's control list
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+#  Initialize Parameters
+#--------------------------------------------------------------------------
+
+export USAGE="\nERROR - Usage: $0 -L <control list> -S <dbserver> -fmt|-run {-noprompt}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -L)     export LISTFILE=$2;shift 2;;
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -fmt)   export FMT=1;shift 1;;
+                        -run)   export RUN=1;shift 1;;
+                        -noprompt)   export PROMPT=0;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$FMT" && export FMT=0
+test ! "$RUN" && export RUN=0
+test ! "$PROMPT" && export PROMPT=1
+
+#--------------------------------------------------------------------------
+#  Verify Parameters
+#--------------------------------------------------------------------------
+# fmt and/or run must be passed
+if [ $FMT -eq 0 -a $RUN -eq 0 ]
+then
+	echo "$USAGE"
+	echo "\n-fmt and/or -run MUST be passed\n"
+	exit 1
+fi
+
+# if -run is passed, <dbserver> must be passed
+if [ $RUN -eq 1 -a ! "$DBSERVER" ]
+then
+	echo "$USAGE"
+	echo "\ndbserver MUST be passed with -run\n"
+	exit 1
+fi
+
+export SQLFILE=$SQLDIR/replication/$DBSERVER.dbrepairIgnoreLtm.sql
+export TEMPLIST=/tmp/templist.$$
+
+if [ "$LISTFILE" ]
+then
+#LISTFILE must exist under central control directory
+        CTLFILE=$CTLDIR/replication/$LISTFILE
+        if [ ! -s $CTLFILE ]
+        then
+                echo "\nERROR - $CALLED"
+                echo "\n$CTLFILE does not exist or is 0 bytes\n"
+                exit 1
+        fi
+else
+#if LISTFILE wasn't passed, all other parameters must be passed
+        if [ ! "$DBSERVER" -o $RUN -eq 0 ]
+        then
+                echo "$USAGE"
+                echo "\nIf control list is not passed, <repserver>, <dbserver> and -run MUST be passed.\n"
+                exit 1
+# verify sql file exists
+	else
+		if [ ! -s "$SQLFILE" ]
+		then
+                	echo "$USAGE"
+	                echo "\n$SQLFILE does not exist - rerun script with -fmt option.\n"
+	                exit 1
+		fi			
+        fi
+fi
+
+#--------------------------------------------------------------------------
+#  Define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TEMPLIST && \rm -f $TEMPLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Format the sql
+#--------------------------------------------------------------------------
+if [ $FMT -eq 1 ]
+then
+#  Remove the old sql files, if they exist
+	for PDS in `cut -d" " -f1 $CTLFILE | sort | uniq`
+	do
+		export SQLFILE_PDS=$SQLDIR/replication/$PDS.dbrepairIgnoreLtm.sql
+		test -f $SQLFILE_PDS && \rm $SQLFILE_PDS
+	done
+	for RDS in `cut -d" " -f3 $CTLFILE | sort | uniq`
+	do
+		export SQLFILE_RDS=$SQLDIR/replication/$RDS.dbrepairIgnoreLtm.sql
+		test -f $SQLFILE_RDS && \rm $SQLFILE_RDS
+	done
+	for TDS in `cut -d" " -f6 $CTLFILE | sort | uniq`
+	do
+		export SQLFILE_TDS=$SQLDIR/replication/$TDS.dbrepairIgnoreLtm.sql
+		test -f $SQLFILE_TDS && \rm $SQLFILE_TDS
+	done
+
+	> $TEMPLIST
+	cat $CTLFILE |
+	while read PDS DBNAME RDS dummy dummy TDS
+	do
+		export PDS DBNAME RDS dummy dummy TDS
+		export SQLFILE_PDS=$SQLDIR/replication/$PDS.dbrepairIgnoreLtm.sql
+		export SQLFILE_RDS=$SQLDIR/replication/$RDS.dbrepairIgnoreLtm.sql
+		export SQLFILE_TDS=$SQLDIR/replication/$TDS.dbrepairIgnoreLtm.sql
+		echo $SQLFILE_PDS >> $TEMPLIST
+		echo $SQLFILE_RDS >> $TEMPLIST
+		echo $SQLFILE_TDS >> $TEMPLIST
+
+		echo "dbcc dbrepair($DBNAME,ltmignore)" >> $SQLFILE_PDS
+		echo "go" >> $SQLFILE_PDS
+		echo "waitfor delay '00:00:01'" >> $SQLFILE_PDS
+		echo "go" >> $SQLFILE_PDS
+
+		echo "dbcc dbrepair($DBNAME,ltmignore)" >> $SQLFILE_RDS
+		echo "go" >> $SQLFILE_RDS
+		echo "waitfor delay '00:00:01'" >> $SQLFILE_RDS
+		echo "go" >> $SQLFILE_RDS
+
+		echo "dbcc dbrepair($DBNAME,ltmignore)" >> $SQLFILE_TDS
+		echo "go" >> $SQLFILE_TDS
+		echo "waitfor delay '00:00:01'" >> $SQLFILE_TDS
+		echo "go" >> $SQLFILE_TDS
+
+	done
+#	echo "\nSQL file(s) generated:"
+#	sort $TEMPLIST | uniq
+fi
+
+#--------------------------------------------------------------------------
+#  Run the SQL
+#--------------------------------------------------------------------------
+if [ $RUN -eq 1 ]
+then
+#--------------------------------------------------------------------------
+#  PROMPT TO CONTINUE
+#--------------------------------------------------------------------------
+	if [ $PROMPT -eq 1 ]
+	then
+		echo "\nYou are about to IGNORE LTM(s) on $DBSERVER using SQL in $SQLFILE\n"
+		export CONTINUE=""
+		while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+		do
+			echo "DO YOU WISH TO CONTINUE? {y/n}"
+			read CONTINUE
+		done
+		if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+		then
+			echo "\nExiting - No SQL run against $DBSERVER\n"
+			exit 0
+		fi
+	fi
+
+#	echo "Running SQL in $SQLFILE..."
+	export OUTFILE=$LOGDIR/replication/$DBSERVER/$DBSERVER.dbrepairIgnoreLtm.$DATETIME
+	> $OUTFILE
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e -i$SQLFILE | grep -v Password >> $OUTFILE
+
+#--------------------------------------------------------------------------
+#  Check output
+#--------------------------------------------------------------------------
+	checkSqlErr $OUTFILE
+	if [ $? -ne 0 ]
+	then
+	        echo "Script FAILED"
+	        echo "\nReview output in $OUTFILE\n"
+	        exit 1
+	else
+	        test $PROMPT -eq 1 && echo "Script SUCCESSFUL"
+	        exit 0
+	fi
+fi
+
+exit 0

@@ -1,0 +1,214 @@
+#!/bin/ksh 
+#--------------------------------------------------------------------------
+#        Usage: subcmpTableData.scr -RS <REPSERVER> {-L <dbtablist> | -D <dbname> -T <table> -m <maildest> -mailsumm <file of email addrs>}
+#
+#  Description: Run rs_subcmp on one or more tables
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	ONEDB - single dbname
+#              	ONETABLE - single table
+#              	DBTABLIST - list of databases/tables
+#              	MAILDEST - override default maildest of dba
+#
+#  NOTE:  Script MUST run from RS host in order to find rs_subcmp utility
+#
+#	rs_subcmp return codes:
+#		0=tables are the same
+#		1=error occurred with rs_subcmp
+#		2=tables are different
+#
+#  Modification History:
+#	12/01/08 M. Siatczynski	Original script
+#	12/08/08 M. Siatczynski	chmod any result files 600, as they may contain customer data
+#	12/15/08 M. Siatczynski	Get the PDS and RDS from the config file in order to run getPass
+#	01/12/09 M. Siatczynski	Add code for sending email summary to FMG 
+#	01/15/09 M. Siatczynski	On failure, send summary to DBA
+#	12/18/09 M. Siatczynski	Adjust exit codes to avoid Autosys job failure
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -RS <REPSERVER> {-L <dbtablist> | -D <dbname> -T <table> -m <maildest> -mailsumm <file of email addrs>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -RS)    export REPSERVER=$2;shift 2;;
+                        -L)     export DBTABLIST=$2;shift 2;;
+                        -D)     export ONEDB=$2;shift 2;;
+                        -T)     export ONETABLE=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -mailsumm)     export MAILLIST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+# REPSERVER MUST be passed
+if [ ! "$REPSERVER" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+# a single dbname/table and list of databases/tables is mutually exclusive
+if [ \( "$ONEDB" -o "$ONETABLE" \) -a "$DBTABLIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - DBNAME/TABLE and DBTABLIST are mutually exclusive"
+        exit 1
+fi
+
+# make sure the passed lists exist
+if [ "$DBTABLIST" -a ! -s "$DBTABLIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - $DBTABLIST does not exist or is 0 bytes"
+        exit 1
+fi
+
+if [ "$MAILLIST" ]
+then
+	if [ -s "$MAILLIST" ]
+	then
+		export MAILSUMM=1
+	else
+        	echo "$USAGE"
+	        echo "WARNING - $MAILLIST does not exist or is 0 bytes"
+		export MAILSUMM=0
+	fi
+else
+	export MAILSUMM=0
+fi
+
+## set env based on REPSERVER so it can find rs_subcmp utility
+export SETREPSERVER=$REPSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#  chmod 600 temp result file used for rs_subcmp
+#--------------------------------------------------------------------------
+export TMPRESULT=/tmp/subcmpresult.$$
+export TMPDBTABLIST=/tmp/dbtablist.$$
+export MAILFILE=/tmp/mailfile.$$
+export SUMMFILE=/tmp/summfile.$$
+export LOGFILE=$LOGDIR/replication/$REPSERVER/$REPSERVER.subcmpTableData.$DATETIME
+
+export ERRORFLAG=0
+> $LOGFILE
+> $MAILFILE
+touch $TMPRESULT;chmod 600 $TMPRESULT
+
+echo "`date` SCRIPT START" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TMPRESULT && \rm -f $TMPRESULT
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $SUMMFILE && \rm -f $SUMMFILE
+	test -f $TMPDBTABLIST && \rm -f $TMPDBTABLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Format list of dbnames and tables
+#  DBTABLIST implies a list of databases/tables was passed
+#--------------------------------------------------------------------------
+test "$DBTABLIST" && cat $DBTABLIST > $TMPDBTABLIST || echo $ONEDB $ONETABLE > $TMPDBTABLIST
+
+#--------------------------------------------------------------------------
+#  Execute rs_subcmp for each dbname/table
+#  Make sure the cfg file exists for each dbname/table
+#  Only keep result files which have a size greater than 0 bytes
+#  If data differences are found, set ERRORFLAG=1
+#  If execution failes, set ERRORFLAG=2
+#  This will allow us to set highest success RC for autosys to 1
+#--------------------------------------------------------------------------
+cat $TMPDBTABLIST |
+while read DBNAME TABLE
+do
+	export CFGFILE=$CTLDIR/$REPSERVER/subcmp/$REPSERVER.$DBNAME.$TABLE.cfg
+	export RESULTFILE=$LOGDIR/replication/$REPSERVER/$REPSERVER.$DBNAME.$TABLE.$DATETIME
+	export SUBCMPRC=0
+	export SUBCMPSTATUS="UNKNOWN"
+	if [ -s "$CFGFILE" ]
+	then
+		echo "`date` BEGIN compare $DBNAME.$TABLE" >> $LOGFILE
+		egrep '(^PDS|^RDS)' $CFGFILE >> $LOGFILE
+		export PDS=`grep '^PDS' $CFGFILE | cut -d"=" -f2 | sed -e 's/ //g'`
+		export RDS=`grep '^RDS' $CFGFILE | cut -d"=" -f2 | sed -e 's/ //g'`
+		$SYBASE/$SYBASE_REP/bin/rs_subcmp -f $CFGFILE -U $ADMINLOGIN -u $ADMINLOGIN -P `getPass $PDS $ADMINLOGIN` -p `getPass $RDS $ADMINLOGIN` > $TMPRESULT 2>&1
+		export SUBCMPRC=$?
+		echo "`date` END compare $DBNAME.$TABLE" >> $LOGFILE
+		if [ -s $TMPRESULT ]
+		then
+			touch $RESULTFILE;chmod 600 $RESULTFILE
+			cat $TMPRESULT > $RESULTFILE
+		fi
+		if [ $SUBCMPRC -eq 0 ]
+		then
+			export SUBCMPSTATUS="SUCCESS"
+		elif [ $SUBCMPRC -eq 2 ]
+		then
+			export SUBCMPSTATUS="FAILURE-DATADIFF"
+			echo "See $RESULTFILE for data comparision details" >> $LOGFILE
+		        export ERRORFLAG=1
+		else
+			export SUBCMPSTATUS="FAILURE-EXE"
+	        	export ERRORFLAG=2
+		fi
+		echo "STATUS: $SUBCMPSTATUS for $DBNAME.$TABLE" >> $LOGFILE
+	else
+	        echo "ERROR - $CFGFILE does not exist or is 0 bytes" >> $LOGFILE
+	        export ERRORFLAG=2
+	fi
+done
+
+#--------------------------------------------------------------------------
+# If there were any failures, send email to DBA only
+# If no failures, send summary to email dist list
+# DO NOT SEND any actual data rows in mailfile, as it may contain customer information
+#--------------------------------------------------------------------------
+echo "`date` SCRIPT END" >> $LOGFILE
+
+if [ $ERRORFLAG -gt 0 ]
+then
+	echo "`date` subcmp for $REPSERVER FAILED.\n" >> $MAILFILE
+	echo "See $LOGFILE for complete details.\n" >> $MAILFILE
+	grep '^STATUS: ' $LOGFILE >> $MAILFILE
+	export MAILSUBJECT="$REPSERVER subcmp FAILED"
+	sendMail
+
+	exit $ERRORFLAG
+else
+	if [ $MAILSUMM -eq 1 ]
+	then
+# create summary report
+# reinitialize MAILFILE
+		grep '^STATUS: ' $LOGFILE > $SUMMFILE
+		> $MAILFILE
+		echo "`date` Data verification summary for $REPSERVER\n" >> $MAILFILE
+		cat $CTLDIR/$REPSERVER/$REPSERVER.email.header.txt >> $MAILFILE
+		cat $SUMMFILE >> $MAILFILE
+		export MAILSUBJECT="Data Verification Summary for $REPSERVER"
+		export MAILDEST=`cat $MAILLIST`
+		sendMail -noheader
+	fi
+	exit 0
+fi

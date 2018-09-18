@@ -1,0 +1,132 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sshExe.scr -sn <sn> -scr <path/script> <allparms>
+#
+#  Description: Execute a script on a remote server without Autosys agent
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<ctlfile> - list of directories to process
+#		<clean> - remove files which match criteria
+#		<mailrpt> - mail report of files that match criteria
+#
+#  Modification History:
+#	02/09/11 M. Siatczynski	Initial script
+#	02/15/11 M. Siatczynski	Incorporate sshQueue.lst for ability to queue jobs in outage/maintenance scenario
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 {-noqueue} -sn <sn> -scr <path/script> {<allparms>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -sn)	export SN=$2;shift 2;;
+                        -scr)	export SCRNAME=$2;shift 2;;
+                        -noqueue)	export QUEUE=0;shift 1;;
+# take everything else as parms to remote script - rely on remote script to check usage
+                        *)      export ALLPARMS=$*;shift $#;;
+                esac
+        done
+fi
+
+if [ ! "$SN" -o ! "$SCRNAME" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+test ! "$QUEUE" && export QUEUE=1
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+# make sure the SN is pingable
+# If it's not pingable, it might be an invalid name...don't go any farther. e.g. don't create a directory for a bogus SN
+ping $SN > /dev/null 2>&1
+export PINGRC=$?
+if [ $PINGRC -ne 0 ]
+then
+	echo "ERROR - $SN ping failed...exiting"
+	exit 1
+fi
+
+# make a directory for the SN, if one doesn't already exist
+test ! -d "$LOGDIR/sshExe/$SN" && mkdir $LOGDIR/sshExe/$SN
+
+export BASESCR=`basename $SCRNAME`
+export LOGFILE=$LOGDIR/sshExe/$SN/sshExe.$BASESCR.$DATETIME
+export QUEUECTL=$CTLDIR/sshQueue.lst
+export TMPOUT=/tmp/tmpout.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $TMPOUT && \rm -f $TMPOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Write headers
+# check queue unless -noqueue option is passed
+# wait 2 minutes between checks
+#------------------------------------------------------------------------------
+> $LOGFILE
+
+if [ $QUEUE -eq 1 ]
+then
+	export GREPRC=0
+	while [ $GREPRC -eq 0 ]
+	do
+		grep "^${SN}$" $QUEUECTL > /dev/null
+		export GREPRC=$?
+		if [ $GREPRC -eq 0 ]
+		then
+			echo "`date` Jobs are queued for $SN" >> $LOGFILE
+			sleep 120
+		fi
+	done
+fi
+
+# do not write starting message until we've cleared queuing
+echo "`date` START - Executing $SCRNAME on $SN" >> $LOGFILE
+echo "CALLED: $CALLED" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Execute remote script (log output)
+#------------------------------------------------------------------------------
+> $TMPOUT
+/usr/local/bin/ssh -n $SN "$SCRNAME $ALLPARMS" >> $TMPOUT 2>&1
+export REMOTERC=$?
+
+cat $TMPOUT >> $LOGFILE
+
+test $REMOTERC -ne 0 && export HIGHRC=1
+
+#------------------------------------------------------------------------------
+# Write trailers and exit
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 0 ]
+then
+	echo "\n`date` END - Remote command SUCCESSFUL" >> $LOGFILE
+else
+	echo "\n`date` END - Remote command FAILED" >> $LOGFILE
+fi
+
+exit $HIGHRC

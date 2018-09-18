@@ -1,0 +1,172 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dbccDbCacheRemove.scr -S <DBSERVER> -D <DBNAME|DBlist> {-noprompt}
+#
+#  Description: Remove one or more datbases from cache
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - Database server name
+#		<DBSPEC> - Database name or list of databases
+#
+#
+#  Modification History:
+#	03/29/11 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <DBNAME|DBlist> {-noprompt}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 2
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -D)	export DBSPEC=$2;shift 2;;
+	                -noprompt)	export PROMPT=0;shift 1;;
+	                -*)	echo $USAGE;exit 2;;
+	                *)	echo $USAGE;exit 2;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBSPEC" ]
+then
+	echo $USAGE
+	exit 2
+fi
+
+test ! "$PROMPT" && export PROMPT=1
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/dbcc/$DBSERVER/$DBSERVER.dbccDbCacheRemove.$DATETIME
+export SQLFILE=/tmp/dbcc.sql.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBLIST=/tmp/dblist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# write log header
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Script executed to remove databases from cache on $DBSERVER" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# Format list of databases
+#--------------------------------------------------------------------------
+# make sure control file exists and has entries
+if [ "$DBSPEC" ]
+then
+	if [ -f $DBSPEC ]
+	then
+		if [ -s $DBSPEC ]
+		then
+			cat $DBSPEC > $DBLIST
+		else
+			echo "WARNING - $DBSPEC is 0 bytes" >> $LOGFILE
+			exit 1
+		fi
+	else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+		echo $DBSPEC | grep '/' > /dev/null
+		if [ $? -eq 0 ]
+		then
+			echo "ERROR - $DBSPEC is not valid--possible invalid filename?" | tee -a $LOGFILE
+			exit 2
+		else
+			echo $DBSPEC > $DBLIST
+		fi
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# Prompt for confirmation
+#------------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+	echo "\nYou are about to remove the following databases from cache on $DBSERVER:"
+	cat $DBLIST
+	echo ""
+	CONTINUE=""
+	while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+	do
+		echo "DO YOU WISH TO CONTINUE? {y/n}"
+		read CONTINUE
+	done
+	if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+	then
+		echo "\n`date` Script exiting - no action taken on $DBSERVER.\n" | tee -a $LOGFILE
+		exit 0
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# format sql
+#------------------------------------------------------------------------------
+echo "`date` Formatting SQL to remove the following databases from cache:" >> $LOGFILE
+cat $DBLIST >> $LOGFILE
+
+> $SQLFILE
+echo "use master" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "dbcc traceon(3604)" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	echo "dbcc dbtable($DBNAME)" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "dbcc dbcacheremove($DBNAME)" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+echo "dbcc traceoff(3604)" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# execute SQL
+#------------------------------------------------------------------------------
+echo "Executing SQL to remove databases from cache...." >> $LOGFILE
+> $SQLOUT
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e -i $SQLFILE > $SQLOUT
+cat $SQLOUT >> $LOGFILE
+
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	echo "FAILED to remove databases from cache on $DBSERVER" >> $LOGFILE 
+        exit 2
+else
+	echo "SUCCESSFULLY removed databases from cache on $DBSERVER" >> $LOGFILE 
+        exit 0
+fi

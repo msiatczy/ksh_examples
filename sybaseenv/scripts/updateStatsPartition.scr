@@ -1,0 +1,315 @@
+#!/bin/ksh 
+#--------------------------------------------------------------------------
+#        Usage: updateStatsPartition.scr -S <DBSERVER> {-L <dblist> | -D <dbname> -T <tablelist> -recomp -m <maildest> -p <pagedest>}
+#
+#  Description: Run update partition statistics on one or more databases on a server
+#
+#     Location:	/sccm/dba/sybase/scripts/updateStatsPartition.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	DBSERVER - database server
+#              	ONEDB - database name
+#              	DBLIST - list of databases
+#              	TABLELIST - list of tables (only valid with -D)
+#              	RECOMP - call sp_recompile script (recompile.scr)
+#              	MAILDEST - override default maildest of dba
+#              	PAGEDEST - page destination/flag
+#
+#
+#  Modification History:
+#	03/29/04 M. Siatczynski	Rewrite and centralize original script
+#	10/07/05 M. Siatczynski Add table owner table names to accommodate objects owned by non-dbo
+#	02/10/06 M. Siatczynski Implement ISQLEXE, getPass, ADMINLOGIN
+#	05/13/07 M. Siatczynski Ignore offline databases (status2=16)
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-L <dblist> | -D <dbname> -T <tablelist> -recomp -m <maildest> -p <pagedest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export ONEDB=$2;shift 2;;
+                        -L)     export DBLIST=$2;shift 2;;
+                        -T)     export TABLELIST=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -p)     export PAGEDEST=$2;shift 2;;
+                        -recomp)     export RECOMP=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+# DBSERVER MUST be passed
+if [ ! "$DBSERVER" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+# a single dbname and list of dbnames is mutually exclusive
+if [ "$ONEDB" -a "$DBLIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - DBNAME and DBLIST are mutually exclusive"
+        exit 1
+fi
+
+# a list of tables is only valid with a single dbname
+if [ "$TABLELIST" ]
+then
+	if [ ! "$ONEDB" ]
+	then
+	        echo "$USAGE"
+		echo "ERROR - DBNAME MUST be passed with a list of tables"
+		exit 1
+	elif [ "$DBLIST" ]
+	then
+	        echo "$USAGE"
+		echo "ERROR - TABLELIST is not valid with a list of databases"
+		exit 1
+	fi
+fi
+
+# make sure the passed lists exist
+if [ "$DBLIST" -a ! -s "$DBLIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - $DBLIST does not exist or is 0 bytes"
+        exit 1
+fi
+
+if [ "$TABLELIST" -a ! -s "$TABLELIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - $TABLELIST does not exist or is 0 bytes"
+        exit 1
+fi
+
+test ! "$RECOMP" && export RECOMP=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+# standard exlude list
+export XLIST=$CTLDIR/$DBSERVER/$DBSERVER.statsExclude.lst
+export STATSQL=/tmp/statsql.$$
+export SORTDBLIST=/tmp/sortdblist.$$
+export TMPDBLIST=/tmp/dblist.$$
+export TMPXLIST=/tmp/xlist.$$
+export TMPTABLELIST=/tmp/tmptable.$$
+export DBTABLELIST=/tmp/dbname_tablelist.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+
+if [ "$ONEDB" ]
+then
+	export LOGFILE=$LOGDIR/stats/$DBSERVER/$DBSERVER.$ONEDB.updateStatsPartition.$DATETIME
+else
+	export LOGFILE=$LOGDIR/stats/$DBSERVER/$DBSERVER.updateStatsPartition.$DATETIME
+fi
+
+export ERRORFLAG=0
+> $LOGFILE
+> $MAILFILE
+
+echo "`date` SCRIPT START" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $STATSQL && \rm -f $STATSQL
+	test -f $SORTDBLIST && \rm -f $SORTDBLIST
+	test -f $TMPDBLIST && \rm -f $TMPDBLIST
+	test -f $TMPXLIST && \rm -f $TMPXLIST
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+	test -f $DBTABLELIST && \rm -f $DBTABLELIST
+	test -f $TMPTABLELIST && \rm -f $TMPTABLELIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Determine what databases to run update partition stats on:
+#	- single database (-D option)
+#	- list of databases (-L option)
+#	- all databases (no option) 
+#		Exclude list is only used when running against all databases.
+#  NOTE:  sed removes the spaces from the isql output, otherwise the files can't 
+#  be accurately compared to the exclusion list
+#  Automatically exclude read-only databases (status=1024)
+#  Check for SQL errors
+#--------------------------------------------------------------------------
+> $SORTDBLIST
+if [ "$ONEDB" ]
+then
+	echo $ONEDB > $TMPDBLIST
+elif [ "$DBLIST" ]
+then
+	sort $DBLIST > $TMPDBLIST
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password | sed -e 's/ //g' | sort > $SORTDBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases
+	where name not like 'tempdb%'
+	and status&1024 <> 1024
+	and status2&16 <> 16
+	go
+	!
+
+	checkSqlErr $SORTDBLIST
+	if [ $? -eq 1 ]
+	then
+		cat $SORTDBLIST >> $LOGFILE
+		echo "ERROR - unable to obtain list of databases from $DBSERVER"
+		echo "Review output in $LOGFILE"
+		echo "`date` END" >> $LOGFILE
+		exit 1
+	fi
+
+#--------------------------------------------------------------------------
+#  Exclude database in the exclusion list
+#--------------------------------------------------------------------------
+	if [ -s $XLIST ]
+	then
+		sort $XLIST > $TMPXLIST
+		comm -23 $SORTDBLIST $TMPXLIST > $TMPDBLIST
+
+		echo "The following databases are excluded from update partition statistics:\n" >> $LOGFILE
+		cat $TMPXLIST >> $LOGFILE
+		echo "" >> $LOGFILE
+	else
+		cat $SORTDBLIST > $TMPDBLIST
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  Format list of dbnames and partitioned tables
+#  TABLELIST implies that a single DBNAME was passed
+#--------------------------------------------------------------------------
+> $DBTABLELIST
+if [ "$TABLELIST" ]
+then
+	for TABLE in `cat $TABLELIST`
+	do
+		echo "$ONEDB $TABLE" >> $DBTABLELIST	
+	done
+else
+	for DBNAME in `cat $TMPDBLIST`
+	do
+		> $TMPTABLELIST
+		$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password | sed -e 's/^ //g' -e 's/  *$//g' >> $TMPTABLELIST
+		`getPass $DBSERVER $ADMINLOGIN`
+		set nocount on
+		go
+		use $DBNAME
+		go
+		select distinct "$DBNAME "+user_name(o.uid)+"."+o.name from sysobjects o, syspartitions p where p.id = o.id order by o.name
+		go
+		!
+
+		checkSqlErr $TMPTABLELIST
+		if [ $? -eq 1 ]
+		then
+			cat $TMPTABLELIST >> $LOGFILE
+			echo "ERROR - unable to obtain list of partitioned tables for $DBNAME on $DBSERVER"
+			echo "Review output in $LOGFILE"
+			echo "Continuing to process other databases" >> $LOGFILE
+			export ERRORFLAG=1
+		else
+			cat $TMPTABLELIST >> $DBTABLELIST
+		fi
+	done
+fi
+
+#--------------------------------------------------------------------------
+#  Execute update partition statistics for each partitioned table
+#--------------------------------------------------------------------------
+if [ -s $DBTABLELIST ]
+then
+	cat $DBTABLELIST |
+	while read DBNAME TABLE
+	do
+		> $STATSQL
+		echo "use $DBNAME" >> $STATSQL
+		echo "go" >> $STATSQL
+		echo "update partition statistics $TABLE" >> $STATSQL
+		echo "go" >> $STATSQL
+		$SCRDIR/sqlTimer.scr -S $DBSERVER -i $STATSQL -o $LOGFILE -m $MAILFILE
+		if [ $? -ne 0 ]
+		then
+			export ERRORFLAG=1
+		fi
+	done
+else
+# if there are no tables to process, then there's no need to call recompile.scr, so set flag to 0 
+	echo "No partitioned tables to process" >> $LOGFILE
+	export RECOMP=0
+fi
+
+#--------------------------------------------------------------------------
+# format the string to call recompile.scr based on the parms passed to this script
+# call recompile.scr here with same parms as passed to this script
+#--------------------------------------------------------------------------
+if [ $RECOMP -eq 1 ]
+then
+	export RECOMPSTRING="$SCRDIR/recompile.scr -S $DBSERVER"
+	if [ "$DBLIST" ]
+	then
+		export RECOMPSTRING="$RECOMPSTRING -L $DBLIST"
+	elif [ "$ONEDB" ]
+	then
+		export RECOMPSTRING="$RECOMPSTRING -D $ONEDB"
+		if [ "$TABLELIST" ]
+		then
+			export RECOMPSTRING="$RECOMPSTRING -T $TABLELIST"
+		fi
+	fi
+	test "$MAILDEST" != "dba" && export RECOMPSTRING="$RECOMPSTRING -m $MAILDEST"
+	test "$PAGEDEST" && export RECOMPSTRING="$RECOMPSTRING -p $PAGEDEST"
+
+	echo "`date` Calling $RECOMPSTRING" >> $LOGFILE
+	$RECOMPSTRING
+fi
+
+#--------------------------------------------------------------------------
+# If there were any failures, send email
+# If a page destination is set, then send a page
+#--------------------------------------------------------------------------
+echo "`date` SCRIPT END" >> $LOGFILE
+if [ $ERRORFLAG -eq 1 ]
+then
+	echo "\nNOTE: Check $LOGFILE for further details.\n" >> $MAILFILE
+	export MAILSUBJECT="$DBSERVER UPDATE PARTITON STATS FAILED"
+	sendMail
+
+	if [ "$PAGEDEST" ]
+	then
+		echo "`date` $DBSERVER UPDATE PARTITON STATS FAILED" > $PAGEMSG
+		sendPage
+	fi
+	exit 1
+else
+	exit 0
+fi

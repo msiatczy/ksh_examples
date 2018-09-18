@@ -1,0 +1,157 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: noradImport.scr -SAM <sam name> -file <arch file path> -restoreall / ( -rules -stores )
+#
+#  Description: Import configurations from an archive file.  Could be used to restore a corrupt SAM, or to
+#		promote setting from one SAM to another. 
+#
+#     Location:	/sccm/dba/sybase/scripts/noradImport.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#
+#  Modification History:
+#	03/11/09 J. Aspenleiter	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.norad
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -SAM <sam name> -file <arch file path> -restoreall / ( -rules -stores )"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-SAM)		export SAMNAME=$2;shift 2;;
+			-file)		export ARCHPATH=$2;shift 2;;
+			-restoreall)	export FULL=4;shift 1;;
+			-rules)		export RULES=1;shift 1;;
+			-stores)	export STORES=2;shift 1;; 
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# user and environment must be passed
+if [[ -z $SAMNAME || -z $ARCHPATH ]] || [[ -z $RULES && -z $STORES && -z $FULL ]]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# verify path given to file is valid
+if [[ ! -f $ARCHPATH ]]
+then
+	echo "Path given is not valid - $ARCHPATH"
+	exit 1
+fi 
+
+# set these variables to zero if they are not set...  Then set the attribute for what will 
+# be restored.
+
+[[ -z $FULL ]] && export FULL=0
+[[ -z $RULES ]] && export RULES=0
+[[ -z $STORES ]] && export STORES=0
+
+# if $RESTOREBIT > 3 then FULL IMPORT
+# if $RESTOREBIT = 1 then RULES IMPORT
+# if $RESTOREBIT = 2 then STORES IMPORT
+# if $RESTOREBIT = 3 then RULES & STORES IMPORT
+export RESTOREBIT=$FULL+$RULES+$STORES
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export OUTFILE=$LOGDIR/backup/central/$SAMNAME.noradImport.$DATETIME
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $OUTFILE
+echo "`date` $SAMNAME importing from $ARCHPATH..." >> $OUTFILE
+
+###############################################################################
+###############################################################################
+# Reset Entity function. Connects to a Surveillance Server (SAM) and 
+# either enables, or disables the Entity.  
+#
+# Syntax: ImportSam SAMNAME ARCHPATH RESTOREBIT
+#
+# SAMNAME	is SAM name of where the entity is running.
+#
+# ARCHPATH	is the archive file you are importing from.
+#
+# RESTOREBIT	is the bit that decides what will be imported... 
+# 		if $RESTOREBIT > 3 then FULL IMPORT
+# 		if $RESTOREBIT = 1 then RULES IMPORT
+# 		if $RESTOREBIT = 2 then STORES IMPORT
+# 		if $RESTOREBIT = 3 then RULES & STORES IMPORT
+#
+#
+###############################################################################
+#
+function ImportSam {
+
+if [[ $RESTOREBIT -eq 1 ]]
+then
+	export INCLUDE="std-rules"
+elif [[ $RESTOREBIT -eq 2 ]]
+then
+	export INCLUDE="std-stores" 
+elif [[ $RESTOREBIT -eq 3 ]]
+then
+	export INCLUDE="std-rules,std-stores"
+elif [[ $RESTOREBIT -gt 3 ]]
+then
+	export INCLUDE="std-rules,std-stores,crdb-dsn,odbc,alert-action-templates,alert-handlers,alert-io-templates"
+fi
+
+cd $NSM_HOME/cfg
+../bin/nsmcopy --import=$ARCHPATH --no-backup --include=$INCLUDE
+
+return 0
+}
+###############################################################################
+#
+################################################################################
+#
+#	MAIN
+#
+################################################################################
+#   
+# Import
+
+if [ $? -eq 0 ]
+then
+	ImportSam >> $OUTFILE
+else
+	echo "ERROR OCCURRED....."
+	exit 1
+fi
+#
+################################################################################
+#------------------------------------------------------------------------------
+# Check for errors
+# Exit
+#------------------------------------------------------------------------------
+checkNoradErr $OUTFILE
+if [ $? -ne 0 ]
+then
+        echo "ERROR - error occured while trying to import to $SAMNAME from $ARCHPATH" | tee -a $OUTFILE
+        echo "Review $OUTFILE"
+        exit 1
+else
+        echo "Import completed successfully for SAM $SAMNAME" | tee -a $OUTFILE
+        exit 0
+fi

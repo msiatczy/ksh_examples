@@ -1,0 +1,188 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findGuestUser.scr -S <DBSERVER>|all -D <dbname>|all> {-m <maildest>}
+#
+#  Description: Look for databases with guest user
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	07/10/07 M. Siatczynski	Initial Script
+#	07/25/07 M. Siatczynski	Change msg from 'OK' to 'NO guest USER'
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+# unset MAILDEST and use only parm specified on command line
+unset MAILDEST
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|all -D <dbname>|all> {-m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" -o ! "$ONEDBNAME" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export DBLIST=/tmp/dbnamelist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export MAILFILE=/tmp/mailfile.$$
+export LOGFILE=$LOGDIR/useradmin/central/findGuestUser.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  For each ASE...
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START find guest users" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# Create a working dbserverlist
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# For each DBSERVER
+# create a working dbnamelist
+# format sql
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+#--------------------------------------------------------------------------
+# Create a working dblist
+#--------------------------------------------------------------------------
+	if [ "$ONEDBNAME" = "all" ]
+	then
+		getDbList -S $DBSERVER -user > $DBLIST
+		if [ $? -eq 1 ]
+		then
+			echo "ERROR - getting list of databases from $DBSERVER" | tee -a $LOGFILE
+			cat $DBLIST >> $LOGFILE
+			export HIGHRC=1
+			continue
+		fi
+	else
+		echo $ONEDBNAME > $DBLIST
+	fi
+
+#--------------------------------------------------------------------------
+# format SQL
+# execute SQL
+# check for errors
+#--------------------------------------------------------------------------
+	> $SQLFILE
+	echo "set nocount on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	for DBNAME in `cat $DBLIST`
+	do
+		export DBNAME
+		echo "use $DBNAME" >> $SQLFILE
+		echo "go" >> $SQLFILE
+
+		echo "if exists (select name from $DBNAME..sysusers where name = 'guest')" >> $SQLFILE
+		echo "select @@servername,db_name(),'guest EXISTS'" >> $SQLFILE
+		echo "else" >> $SQLFILE
+		echo "select @@servername,db_name(),'NO guest USER'" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+
+	echo "`date` Checking $DBSERVER..." >> $LOGFILE
+
+	> $SQLOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w999 -i$SQLFILE -b | grep -v Password >> $SQLOUT
+	cat $SQLOUT >> $LOGFILE
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+	        echo "$DBSERVER:  SQL FAILED" >> $LOGFILE
+	        export HIGHRC=1
+	        continue
+	else
+	        echo "$DBSERVER:  SQL SUCCESSFUL" >> $LOGFILE
+	fi
+#--------------------------------------------------------------------------
+# Send mail if MAILDEST is set
+# Only send mail if guest users exist in one or more databases
+# NOTE:  the set of GUESTUSER MUST immediately follow the grep, 0=guest user exists
+#--------------------------------------------------------------------------
+	if [ "$MAILDEST" ]
+	then
+		export GUESTUSER=0
+		grep 'guest EXISTS' $SQLOUT > /dev/null
+		export GUESTUSER=$?
+		if [ $GUESTUSER -eq 0 ]
+		then 
+			cat $SQLOUT > $MAILFILE
+			export MAILSUBJECT="$DBSERVER - Summary of guest users"
+			sendMail
+		fi
+	fi
+done
+
+#--------------------------------------------------------------------------
+# Exit with final status
+#--------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+	echo "\nScript FAILED"
+	echo "Review output in $LOGFILE\n"
+	exit 1
+else
+	echo "\nScript SUCCESSFUL"
+	echo "Review output in $LOGFILE\n"
+	exit 0
+fi

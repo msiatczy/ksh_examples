@@ -1,0 +1,162 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: noradVcsEntityStatus.scr -S <ase> 
+#
+#  Description: This program will check the status of a given entity.  If the entity is enabled, the return code will be
+#		110 for online.  If the entity is disabled, the return code will be 100 for offline.  These are the values
+#		VCS expects for it's monitoring program to function.
+#
+#     Location:	/sccm/dba/sybase/scripts/noradVcsEntityStatus.scr
+#
+#    Called by:	(optional) VCS - to monitor a norad entity.
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#
+#  Modification History:
+#	06/16/09 J. Aspenleiter Script created.
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.norad
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <ase> "
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export SERVERNAME=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# user and environment must be passed
+if [ ! "$SERVERNAME" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export OUTFILE=$LOGDIR/misc/$SERVERNAME/$MYSAM.$SERVERNAME.noradVcsEntityStatus.$$.$DATETIME
+export STATUSFILE=/tmp/noradstatus.$$
+#export STATUSFILE=$ADHOCDIR/jpa/noradstatus.$$
+#--------------------------------------------------------------------------
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $STATUSFILE && \rm -f $STATUSFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $OUTFILE
+echo "`date` Entity status check for norad entity $SERVERNAME on SAM $MYSAM..." >> $OUTFILE
+
+###############################################################################
+###############################################################################
+# Entity Status Check function. Connects to a Surveillance Server (SAM) and 
+# checks the status of given entity.  
+#
+# Syntax: CheckEntity MYSAM ENTITY
+#
+# MYSAM	is SAM name of where the entity is running.
+#
+# ENTITY	is the ASE name that is to be disabled.
+#
+#
+# Note: "target ." means to send commands to the connected SAM.
+#
+###############################################################################
+#
+function CheckEntity {
+
+$NSM_HOME/bin/cfgedit $NSM_HOME/cfg/dbgscom.cfg -read=ENTITIES/$1.$2,ACTIVE,LONG
+
+
+#$NSM_HOME/bin/console -c -e $1 admin <<ENDCOMMAND > $STATUSFILE
+#`getPass $1 admin`
+#target .sybase
+#wait 1
+#list ent
+#wait 1
+#targetoff	
+#exit
+
+#ENDCOMMAND
+
+#cat $STATUSFILE >> $OUTFILE
+#cat $STATUSFILE |grep "$2 " |sed -e "s/ //g" |sed -e "s/^.*\(.\)$/\1/"
+
+#return $STATUSBIT
+
+}
+###############################################################################
+#
+################################################################################
+#
+#	MAIN
+#
+################################################################################
+#   
+# try checking the status multiple times if the status is unknown.
+
+typeset -i COUNT=1
+while (($COUNT < 5))
+do
+	export STATUSBIT=`CheckEntity $MYSAM $SERVERNAME`
+	echo "The status of $SERVERNAME is $STATUSBIT" >> $OUTFILE
+
+	if [[ $STATUSBIT = "1" || $STATUSBIT = "0" ]]
+	then
+		typeset -i COUNT=5
+	else
+		typeset -i COUNT=$COUNT+1
+	fi
+done
+
+#
+################################################################################
+#------------------------------------------------------------------------------
+# Check for errors
+# VCS expects the following return codes...
+# ONLINE = 110
+# OFFLINE = 100
+# UNKNOWN = 111
+# Exit
+#------------------------------------------------------------------------------
+checkNoradErr $OUTFILE
+if [ $? -ne 0 ]
+then
+        echo "ERROR - resetting entity $SERVERNAME on $MYSAM" >> $OUTFILE
+	exit 111
+else
+	if [[ $STATUSBIT = "1" ]]
+	then
+        	\rm -f $OUTFILE
+        	exit 110
+	elif [[ $STATUSBIT = "0" ]]
+	then
+        	\rm -f $OUTFILE
+        	exit 100
+	else
+        	exit 111
+	fi
+
+        exit 111
+fi

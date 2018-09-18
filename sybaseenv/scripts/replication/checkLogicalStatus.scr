@@ -1,0 +1,91 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkLogicalStatus.scr -RS <repserver>
+#
+#  Description: Short description for the use of this script. 
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<control list> - input list of databases to be replicated
+#              	<primary DBSERVER> - primary database server
+#              	<replicate DBSERVER> - replicate database server
+#              	<dbname> - database to be replicated
+#
+#   NOTE:  -L <control list> and other parameters are mutually exclusive.
+#
+#  Modification History:
+#	05/15/03 M. Siatczynski	Initial Script
+#	07/23/04 M. Siatczynski	Centralized script
+#	02/21/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+#  Initialize Parameters
+#--------------------------------------------------------------------------
+
+export USAGE="\nERROR - Usage: $0 -RS <repserver>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -RS)    export REPSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+
+#--------------------------------------------------------------------------
+#  Verify Parameters
+#--------------------------------------------------------------------------
+if [ ! "$REPSERVER" ]
+then
+	echo "$USAGE"
+	echo "\nrepserver MUST be passed\n"
+	exit 1
+fi
+
+export OUTFILE=$LOGDIR/replication/$REPSERVER/$REPSERVER.checkLogicalStatus.$DATETIME
+
+#--------------------------------------------------------------------------
+#  Run admin logical_status
+#  Reverse the order of the returned columns and make sure the (now first) two values are "None"
+#--------------------------------------------------------------------------
+> $OUTFILE
+$ISQLEXE -U$ADMINLOGIN -S$REPSERVER -w800 -b <<-! | grep -v Password | sed -e 's/^ //g' -e 's/  */ /g' >> $OUTFILE
+`getPass $REPSERVER $ADMINLOGIN`
+admin logical_status
+go
+!
+
+export NUMDB=0
+cat $OUTFILE |
+while read LINE
+do
+	let "NUMDB = $NUMDB + 1"
+	set -A LINEARRAY `echo $LINE`
+	export NUMELE=${#LINEARRAY[*]}
+	let "ELE = $NUMELE - 1"
+	while [ $ELE -gt 0 ]
+	do
+		/usr/ucb/echo -n "${LINEARRAY[$ELE]} "
+		let "ELE = $ELE - 1"
+	done
+	echo ""
+done
+echo "\nNumber of databases checked = $NUMDB\n"
+
+exit 0

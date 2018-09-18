@@ -1,0 +1,251 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: addUserForRole.scr -U <user> -login <user to be added>|-L <login list> -role <rolename> -S <DBSERVER>
+#
+#  Description: Add a login or list of logins to all databases where a particular role has been granted permissions
+#
+#     Location:	/sccm/dba/sybase/scripts/addUserForRole.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<user> - login of the user running the add
+#		<login> - user to be added
+#		<DBSERVER> - DBSERVER
+#
+#  Modification History:
+#       08/15/06 M. Siatczynski Initial script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -U <user> -login <user to be added>|-L <login list> -role <rolename> -S <DBSERVER>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-U)		export EXEUSER=$2;shift 2;;
+			-login)		export ONELOGIN=$2;shift 2;;
+			-L)		export INPUTLIST=$2;shift 2;;
+			-role)		export ROLENAME=$2;shift 2;;
+			-S)		export DBSERVER=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$EXEUSER" -o ! "$DBSERVER" -o ! "$ROLENAME" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# either login name or list must be passed
+if [ ! "$ONELOGIN" -a ! "$INPUTLIST" ]
+then
+	echo $USAGE
+	echo "ERROR - login name or list of logins MUST be passed"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export SQLFILE=/tmp/usersql.$$
+export ROSQL=/tmp/rosql.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBLIST=/tmp/dblist.$$
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export LOGINLIST=/tmp/loginlist.$$
+export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.addUserForRole.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $ROSQL && \rm -f $ROSQL
+	test $SQLOUT && \rm -f $SQLOUT
+	test $DBLIST && \rm -f $DBLIST
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $LOGINLIST && \rm -f $LOGINLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create a working login list
+#------------------------------------------------------------------------------
+if [ "$INPUTLIST" ]
+then
+	if [ ! -s $INPUTLIST ]
+	then
+		echo "ERROR - $INPUTLIST does not exist or is 0 bytes"
+		exit 1
+	else
+		cat $INPUTLIST > $LOGINLIST
+	fi
+else
+	echo $ONELOGIN > $LOGINLIST
+fi
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START User add for $ROLENAME role" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Create a working dblist based on where role perms have been granted
+#------------------------------------------------------------------------------
+$ISQLEXE -U$EXEUSER -S$DBSERVER -w200 -b <<-! | egrep -v '(Password:|return status)' > $DBLIST
+`getPass $DBSERVER $EXEUSER`
+set nocount on
+go
+exec sp_role_dbs $ROLENAME
+go
+!
+
+checkSqlErr $DBLIST
+if [ $? -eq 1 ]
+then
+        cat $DBLIST >> $LOGFILE
+        echo "ERROR - getting list of database names for $ROLENAME role on $DBSERVER" | tee -a $LOGFILE
+        exit 1
+fi
+
+# Check for the message which indicates there are no permissions granted to the role
+grep 'No permissions have been granted' $DBLIST > /dev/null
+if [ $? -eq 0 ]
+then
+	echo "No databases on $DBSERVER have permissions granted to $ROLENAME" | tee -a $LOGFILE
+	exit 0
+fi
+
+#------------------------------------------------------------------------------
+# Format the SQL
+# Set replication off so adds do not replicate
+#  (this code should be improved to only issue the command if EXEUSER has replication_role
+#------------------------------------------------------------------------------
+echo "`date` Formatting SQL" >> $LOGFILE
+> $SQLFILE
+echo "set replication off" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+
+#------------------------------------------------------------------------------
+# check to see if the database is read-only
+# if it is, take it out of read-only before adding the user
+#------------------------------------------------------------------------------
+	> $ROSQL
+	echo "set nocount on" >> $ROSQL
+	echo "go" >> $ROSQL
+	echo "if exists (select 1 from master..sysdatabases where name = \"$DBNAME\" and status&1024=1024)" >> $ROSQL
+	echo "select 1" >> $ROSQL
+	echo "else" >> $ROSQL
+	echo "select 0" >> $ROSQL
+	echo "go" >> $ROSQL
+
+	export READONLY=0
+	export READONLY=`getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$ROSQL | grep -v Password`
+
+	if [ $READONLY -ne 0 -a $READONLY -ne 1 ]
+	then
+		export HIGHRC=1
+		echo $READONLY >> $LOGFILE
+		echo "Unable to check read-only status of database $DBNAME" | tee -a $LOGFILE
+		echo "Skipping user add for database $DBNAME" | tee -a $LOGFILE
+		continue
+	fi
+
+	if [ $READONLY -eq 1 ]
+	then
+		echo "use master" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "sp_dboption $DBNAME,'read only',false" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	fi
+
+#------------------------------------------------------------------------------
+# Format SQL for each login in the list
+# 'use database' MUST come AFTER setting the dboption because that requires 'use master'
+# check for both user and alias
+#------------------------------------------------------------------------------
+	echo "use $DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	cat $LOGINLIST |
+	while read LOGIN
+	do
+		echo "if not exists (select * from $DBNAME..sysusers where name = \"$LOGIN\")" >> $SQLFILE
+		echo "and not exists (select * from $DBNAME..sysalternates where suser_name(suid) = \"$LOGIN\")" >> $SQLFILE
+		echo "begin" >> $SQLFILE
+		echo "print \"Adding USER ($LOGIN) to %1!:$DBNAME...\",@@servername" >> $SQLFILE
+		echo "execute sp_adduser $LOGIN" >> $SQLFILE
+		echo "end" >> $SQLFILE
+		echo "else" >> $SQLFILE
+		echo "print \"USER ($LOGIN) already exists in %1!:$DBNAME\",@@servername" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+#------------------------------------------------------------------------------
+# put the database back in read-only mode (if was originally in read-only mode)
+#------------------------------------------------------------------------------
+	if [ $READONLY -eq 1 ]
+	then
+		echo "use master" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "sp_dboption $DBNAME,'read only',true" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	fi
+
+done
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# Append the output to the logfile
+#------------------------------------------------------------------------------
+echo "`date` Adding the following users on $DBSERVER for $ROLENAME role:" >> $LOGFILE
+cat $LOGINLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+getPass $DBSERVER $EXEUSER | $ISQLEXE -U$EXEUSER -S$DBSERVER -w200 -i$SQLFILE > $SQLOUT
+
+cat $SQLOUT >> $LOGFILE
+#------------------------------------------------------------------------------
+# Check for errors
+#------------------------------------------------------------------------------
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	export HIGHRC=1
+fi
+
+echo "`date` END User add" >> $LOGFILE
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+        echo "\nUser add FAILED - output in $LOGFILE"
+        echo "\nREMINDER:  THIS SCRIPT MUST BE EXECUTED AGAINST BOTH ASES IN A REPLICATED ENVIRONMENT.\n"
+	exit 1
+else
+        echo "\nUser add SUCCESSFUL"
+        echo "\nREMINDER:  THIS SCRIPT MUST BE EXECUTED AGAINST BOTH ASES IN A REPLICATED ENVIRONMENT.\n"
+	exit 0
+fi

@@ -1,0 +1,66 @@
+#!/bin/sh -x
+#--------------------------------------------------------------------------
+#        Usage: getDatabaseOptions.scr
+#  Description: Get database options for each database server
+#     Location: /sccm/dba/sybase/scripts
+#  Modification History:
+#       06/22/04 K. Hess	Initial Script
+#       02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserver.lst.$$
+export DBLIST=/tmp/dblist.$$
+
+grep -v '^#' $ASEDIRLIST | cut -d" " -f1 > $DBSERVERLIST
+
+#--------------------------------------------------------------------------
+#  Define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+        test -f $DBLIST && \rm -f $DBLIST
+}
+ 
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Loop through list of servers and get database options for each server's
+# databases
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+
+	export RPTFILE=$RPTDIR/misc/$DBSERVER.databaseOptions.$DATETIME
+
+        #--------------------------------------------------------------------------
+        # Create a working dblist
+        #--------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases
+	order by name
+	go
+	!
+
+        #--------------------------------------------------------------------------
+        # Loop through list of databases from DBLIST and get database options
+        #--------------------------------------------------------------------------
+	cat $DBLIST |
+	while read DBNAME
+	do
+		export DBNAME	
+		$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password | sed -e 's/ //g' | sort >> $RPTFILE
+	        `getPass $DBSERVER $ADMINLOGIN`
+		sp_helpdb $DBNAME
+		go
+		!
+	done
+done

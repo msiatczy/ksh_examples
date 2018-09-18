@@ -1,0 +1,161 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: compareStats.scr -S1 <DBSERVER1> -S2 <DBSERVER2> -D <dbname>|all
+#
+#  Description: Compare stats between two ASEs
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	02/01/10 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S1 <DBSERVER1> -S2 <DBSERVER2> -D <dbname>|all"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S1)    export DBSERVER1=$2;shift 2;;
+                        -S2)    export DBSERVER2=$2;shift 2;;
+                        -D)     export DBSPEC=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER1" -o ! "$DBSERVER2" -o ! "$DBSPEC" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+export STATS1=/tmp/stats1.$$
+export STATS2=/tmp/stats2.$$
+export DBLIST1=/tmp/dblist1.$$
+export DBLIST2=/tmp/dblist2.$$
+export SQL1=/tmp/sql1.$$
+export SQL2=/tmp/sql2.$$
+export DIFFOUT=/tmp/diffout.$$
+
+export OUTFILE=$LOGDIR/stats/compare/${DBSERVER1}vs${DBSERVER2}.compareStats.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST1 && \rm -f $DBLIST1
+	test -f $DBLIST2 && \rm -f $DBLIST2
+	test -f $SQL1 && \rm -f $SQL1
+	test -f $SQL2 && \rm -f $SQL2
+	test -f $DIFFOUT && \rm -f $DIFFOUT
+	test -f $STATS1 && \rm -f $STATS1
+	test -f $STATS2 && \rm -f $STATS2
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# get list of databases for first ASE
+#------------------------------------------------------------------------------
+if [ "$DBSPEC" = "all"  ]
+then
+	getDbList -S $DBSERVER1 -user -xreadonly > $DBLIST1
+	getDbList -S $DBSERVER2 -user -xreadonly > $DBLIST2
+else
+	echo $DBSPEC > $DBLIST1
+	echo $DBSPEC > $DBLIST2
+fi
+
+#------------------------------------------------------------------------------
+# write headers
+#------------------------------------------------------------------------------
+> $OUTFILE
+echo "`date` - Compare stat differences between $DBSERVER1 and $DBSERVER2..." >> $OUTFILE
+echo "\n$DBSERVER1 database(s):" >> $OUTFILE
+cat $DBLIST1 >> $OUTFILE
+echo "\n$DBSERVER2 database(s):" >> $OUTFILE
+cat $DBLIST2 >> $OUTFILE
+echo "" >> $OUTFILE
+
+#------------------------------------------------------------------------------
+# format sql for each ASE
+#------------------------------------------------------------------------------
+> $SQL1
+cat $DBLIST1 |
+while read DB1
+do
+	echo "use $DB1" >> $SQL1
+	echo "go" >> $SQL1
+	echo "exec sp_liststats" >> $SQL1
+	echo "go" >> $SQL1
+done
+
+> $SQL2
+cat $DBLIST2 |
+while read DB2
+do
+	echo "use $DB2" >> $SQL2
+	echo "go" >> $SQL2
+	echo "exec sp_liststats" >> $SQL2
+	echo "go" >> $SQL2
+done
+
+#------------------------------------------------------------------------------
+# execute sql for each ASE
+#------------------------------------------------------------------------------
+getPass $DBSERVER1 $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER1 -w200 -b -i $SQL1 | egrep -v '(Password|return status)' | sed -e 's/^ //g' -e 's/  *//g' | sort | uniq > $STATS1
+checkSqlErr $STATS1
+if [ $? -ne 0 ]
+then
+	echo "ERROR - Unable to obtain stats info for $DBSERVER1"
+	exit 1
+fi
+
+getPass $DBSERVER2 $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER2 -w200 -b -i $SQL2 | egrep -v '(Password|return status)' | sed -e 's/^ //g' -e 's/  *//g' | sort | uniq > $STATS2
+checkSqlErr $STATS2
+if [ $? -ne 0 ]
+then
+	echo "ERROR - Unable to obtain stats info for $DBSERVER2"
+	exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Compare stats utilization
+#------------------------------------------------------------------------------
+sdiff -sw200 $STATS1 $STATS2 | grep '^[^0-9]' > $DIFFOUT
+
+if [ -s $DIFFOUT ]
+then
+# write outfile headers
+	echo "Stat differences FOUND between $DBSERVER1 and $DBSERVER2\n" | tee -a $OUTFILE
+	cat $DIFFOUT >> $OUTFILE
+else
+	echo "NO stat DIFFERENCES found between $DBSERVER1 and $DBSERVER2\n" | tee -a $OUTFILE
+fi
+echo "`date` - End of report" >> $OUTFILE
+
+echo "Report saved under $OUTFILE"
+
+#------------------------------------------------------------------------------
+# Exit with 0
+#------------------------------------------------------------------------------
+exit 0

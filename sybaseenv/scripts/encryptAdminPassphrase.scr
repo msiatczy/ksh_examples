@@ -1,0 +1,180 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: encryptAdminPassphrase.scr -login <login>
+#
+#  Description: Encrypt passphrase into a file
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<login> - login for which passphrase is encrypted
+#
+#  NOTE:  This file should be rwx for sybase user only.
+#
+#  Modification History:
+#	10/28/05 M. Siatczynski	Initial script
+#	11/07/05 M. Siatczynski	Fully qualify path to openssl
+#	09/13/06 M. Siatczynski	Redirect RPTFILE to useradmin subdir of RPTDIR
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -login <login>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -login)		export LOGIN=$2;shift 2;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$LOGIN" ]
+then
+        echo $USAGE
+        echo "ERROR - Login MUST be specified"
+        exit 1
+fi
+
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export PASSPHRASE=$CTLDIR/.passphrase.$LOGIN
+export BACKUPFILE=$CTLDIR/sybpw_bak/.passphrase.$LOGIN.$DATETIME
+
+export TMPFILE=/tmp/tmpfile.$$
+export OPENSSLOUT=/tmp/opensslout.$$
+export RPTFILE=$RPTDIR/useradmin/central/changeAdminPassword.$DATETIME
+# save the original stty settings
+export STTY_ORIG=`stty -g`
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TMPFILE && \rm -f $TMPFILE
+	test -f $OPENSSLOUT && \rm -f $OPENSSLOUT
+# reinstate the original stty settings
+        stty $STTY_ORIG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Prompt for passphrase
+#------------------------------------------------------------------------------
+export PHRASE1=""
+export PHRASE2=""
+
+PHRASE1=""
+while [ "$PHRASE1" = "" ]
+do
+        echo "Enter NEW passphrase:"
+        stty -echo
+        read PHRASE1
+        stty echo
+done
+PHRASE2=""
+while [ "$PHRASE2" = "" ]
+do
+        echo "Re-enter NEW passphrase:"
+        stty -echo
+        read PHRASE2
+        stty echo
+done
+if [ "$PHRASE1" = "$PHRASE2" ]
+then
+	export NEWPHRASE=$PHRASE1
+else
+	echo "ERROR - New passphrases entered do not match.  Exiting."
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# Write report headers
+#--------------------------------------------------------------------------
+> $RPTFILE
+chmod 600 $RPTFILE
+echo $CALLED >> $RPTFILE
+echo "`date` Changing passphrase file for $LOGIN" >> $RPTFILE
+
+export CPRC=0
+export MODRC=0
+
+#------------------------------------------------------------------------------
+# Save a copy of the current passphrase file--if one exists
+#------------------------------------------------------------------------------
+echo "$LOGIN - backing up $PASSPHRASE to $BACKUPFILE" | tee -a $RPTFILE
+
+if [ -f $PASSPHRASE ]
+then
+# chmod just in case perms were wrong to start with--perms will carry over to backup file, but chmod that too
+	chmod 600 $PASSPHRASE
+	cp -p $PASSPHRASE $BACKUPFILE
+	if [ $? -ne 0 ]
+	then
+		export CPRC=1
+		echo "$LOGIN - file backup FAILED - $PASSPHRASE WILL NOT BE CHANGED" | tee -a $RPTFILE
+		echo "$LOGIN - skipping to next server" | tee -a $RPTFILE
+		continue
+	else
+		echo "$LOGIN - file backup SUCCESSFUL" | tee -a $RPTFILE
+		chmod 600 $BACKUPFILE
+	fi
+else
+	echo "$LOGIN - $PASSPHRASE does not exist--new file will be created"
+# create and chmod the new password file before putting anything in it
+	touch $PASSPHRASE;chmod 600 $PASSPHRASE
+fi
+
+echo "$LOGIN - modifying $PASSPHRASE" | tee -a $RPTFILE
+
+#------------------------------------------------------------------------------
+# Store the encrypted passphrase in the file
+# A temp file is used to hold the passphrase because I can't figure out how to
+# encrypt a string directly into a target file.
+# stderr from the openssl commands is directed to a single output file
+#------------------------------------------------------------------------------
+touch $TMPFILE;chmod 600 $TMPFILE
+echo $NEWPHRASE > $TMPFILE
+
+> $OPENSSLOUT;chmod 600 $OPENSSLOUT
+echo "\n" | $SWBIN/openssl des3 -e -pass stdin -in $TMPFILE -out $PASSPHRASE >> $OPENSSLOUT 2>&1
+test -f $TMPFILE && \rm $TMPFILE
+
+if [ -s $OPENSSLOUT ]
+then
+	export MODRC=1
+	echo "$LOGIN - file modify FAILED" | tee -a $RPTFILE
+	cat $OPENSSLOUT >> $RPTFILE
+else
+	echo "$LOGIN - file modify SUCCESSFUL" | tee -a $RPTFILE
+fi
+
+#------------------------------------------------------------------------------
+# Exit with final status
+#------------------------------------------------------------------------------
+if [ $CPRC -eq 1 -o $MODRC -eq 1 ]
+then
+	echo "\nOVERALL SCRIPT STATUS: FAILED\n"
+	echo "Report file:  $RPTFILE"
+	exit 1
+else
+	echo "\nOVERALL SCRIPT STATUS: SUCCESSFUL\n"
+	echo "Report file:  $RPTFILE"
+	exit 0
+fi

@@ -1,0 +1,195 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: verifyThresholdOwner.scr -S <DBSERVER>|all -D <dbname|all> {-m <maildest>}
+#
+#  Description: Verify thresholds are owned by a login with proper authority (DBO, sa_role, or oper_role)
+#               (Technically, sa_role or oper_role is required.  However, in our current implementation,
+#               we want all owners to be sa or sybadmin.  This is subject to change.  The code is in place,
+#               for the role logic.)
+#
+#     Location:	/sccm/dba/sybase/scripts/verifyThresholdOwner.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - ASE
+#		<dbname> - database name
+#		<maildest> - override default maildest of dba
+#
+#  Modification History:
+#       03/30/05 M. Siatczynski Initial script
+#       05/03/06 M. Siatczynski Ignore offline databases (status2=16)
+#       12/22/06 M. Siatczynski Change FREESPACE datatype from smallint to int
+#       05/23/07 M. Siatczynski Change hardcoded sybadmin to ADMINLOGIN
+#       08/21/07 K. Hess	Update email message to include owner
+#       08/27/07 M. Siatczynski	Fixed quotes around sql statement, change sybadmin to ADMINLOGIN
+#       09/17/07 M. Siatczynski	Select FREESPACE as varchar(6) rather than varchar(5)
+#       05/29/09 M. Siatczynski	Updated to call getDbList function
+#       02/23/10 M. Siatczynski	Remove restriction that threshold be owned by sa or sybadmin, and allow ownership by sa_role or oper_role
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER>|all -D <database|all {-m <maildest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export ONEDBSERVER=$2;shift 2;;
+			-D)		export ONEDBNAME=$2;shift 2;;
+			-m)		export MAILDEST=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$ONEDBSERVER" -o ! "$ONEDBNAME" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export SQLFILE=/tmp/usersql.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBLIST=/tmp/dblist.$$
+export MAILFILE=/tmp/mailfile.$$
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export LOGFILE=$LOGDIR/useradmin/central/verifyThresholdOwner.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $DBLIST && \rm -f $DBLIST
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create working list of ASEs
+#------------------------------------------------------------------------------
+test "$ONEDBSERVER" = "all" && getAseList > $DBSERVERLIST || echo $ONEDBSERVER > $DBSERVERLIST
+
+#------------------------------------------------------------------------------
+# Do the following for each ASE in DBSERVERLIST...
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Verify threshold owners" >> $LOGFILE
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+
+#------------------------------------------------------------------------------
+# Create a working dblist
+# Exclude tempdbs and read-only databases (status=1024) and offline databases (status2=16)
+#------------------------------------------------------------------------------
+	if [ "$ONEDBNAME" = "all" ]
+	then
+		getDbList -S $DBSERVER -user -system -xreadonly > $DBLIST
+		if [ $? -eq 1 ]
+		then
+		        echo "ERROR - getting list of database names from $DBSERVER" | tee -a $LOGFILE
+		        cat $DBLIST >> $LOGFILE
+		        exit 1
+		fi
+	else
+		echo $ONEDBNAME > $DBLIST
+	fi
+
+#------------------------------------------------------------------------------
+# Format the SQL
+#------------------------------------------------------------------------------
+	> $SQLFILE
+	echo "set nocount on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "create table #thresh (DBSERVER varchar(12) not null,DBNAME varchar(30) not null, SEGMENT varchar(18) not null, FREESPACE int not null, PROCNAME varchar(22) not null,THRESHOWNER varchar(12) null, DBOWNER varchar(12) null)" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	cat $DBLIST |
+	while read DBNAME
+	do
+		export DBNAME
+		echo "use $DBNAME" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "insert #thresh" >> $SQLFILE
+		echo "select @@servername,db_name(),s.name,t.free_space,t.proc_name,suser_name(t.suid),suser_name(d.suid)" >> $SQLFILE
+		echo "from $DBNAME..systhresholds t, master..sysdatabases d, $DBNAME..syssegments s" >> $SQLFILE
+		echo "where d.name = \"$DBNAME\" and" >> $SQLFILE
+		echo "s.segment = t.segment and" >> $SQLFILE
+		echo "(d.suid <> t.suid) and" >> $SQLFILE
+## 02/23/10 - comment out following line which requires owner to be sa or ADMINLOGIN - sa_role or oper_role is OK
+#		echo "(suser_name(t.suid) not in (\"sa\",\"$ADMINLOGIN\") or suser_name(t.suid) is null)" >> $SQLFILE
+## leave the next line of code here for future use
+		echo "(t.suid not in (select distinct l.suid from master..sysloginroles l, master..syssrvroles s where s.name in ('sa_role','oper_role') and s.srid = l.srid))" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+
+	echo "if exists (select * from #thresh)" >> $SQLFILE
+	echo "begin" >> $SQLFILE
+	echo "select DBSERVER,DBNAME,SEGMENT,FREESPACE,PROCNAME,THRESHOWNER,DBOWNER from #thresh" >> $SQLFILE
+	echo "print \"\"" >> $SQLFILE
+	echo "select \"$SCRDIR/updThresholdOwner.scr -S \"+DBSERVER+\" -D \"+DBNAME+\" -segment \"+SEGMENT+\" -freespace \"+convert(varchar(6),FREESPACE)+\" -owner $ADMINLOGIN\" from #thresh" >> $SQLFILE
+	echo "end" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "drop table #thresh" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# Append the output to the logfile
+#------------------------------------------------------------------------------
+	echo "\n`date` $DBSERVER: Verifying threshold owners" >> $LOGFILE
+
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -i$SQLFILE | grep -v Password> $SQLOUT
+
+	cat $SQLOUT >> $LOGFILE
+#------------------------------------------------------------------------------
+# Check for errors
+#------------------------------------------------------------------------------
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "`date` $DBSERVER: SQL FAILED" >> $LOGFILE
+	else
+		if [ -s $SQLOUT ]
+		then
+			echo "`date` $DBSERVER: Threshold owners NOT properly configured" >> $LOGFILE
+			> $MAILFILE
+			echo "The threshold owner is NOT VALID for the following database(s)." >> $MAILFILE
+			echo "The threshold owner should be the same as the database owner or have sa_role or oper_role." >> $MAILFILE
+			echo "\nSee $LOGFILE for additional information.\n" >> $MAILFILE
+			echo "Use $SCRDIR/updThresholdOwner.scr to correct the threshold owners (syntax follows report).\n" >> $MAILFILE
+			cat $SQLOUT >> $MAILFILE
+			export MAILSUBJECT="$DBSERVER: Threshold Owner Verification FAILED"
+			sendMail
+		else
+			echo "`date` $DBSERVER: Threshold owners properly configured" >> $LOGFILE
+		fi
+	fi
+done
+
+echo "\n`date` END Verify threshold owners" >> $LOGFILE
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+test $HIGHRC -eq 1 && exit 1 || exit 0

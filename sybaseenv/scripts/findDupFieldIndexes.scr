@@ -1,0 +1,197 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findDupFieldIndexes.scr -S <DBSERVER> {-D <dbname>}
+#
+#  Description: Find indexes within one more more databases that start with the same first field.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	08/03/04 M. Siatczynski	Centralized script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/dblist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export LOGFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.dupFieldIndexes.$DATETIME
+
+> $LOGFILE
+echo "`date` Checking for duplicate first field indexes in $DBSERVER $ONEDBNAME\n" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+#--------------------------------------------------------------------------
+if [ "$ONEDBNAME" ]
+then
+	echo $ONEDBNAME > $DBLIST
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases order by name
+	go
+	!
+fi
+
+checkSqlErr $DBLIST
+if [ $? -eq 1 ]
+then
+	echo "ERROR - getting list of databases for $DBSERVER"
+	cat $DBLIST >> $LOGFILE
+	exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Format SQL to find duplicate indexes
+#------------------------------------------------------------------------------
+> $SQLFILE
+
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+echo "create table #temp_indexes (" >> $SQLFILE
+echo "tab_name varchar(30) NOT NULL," >> $SQLFILE
+echo "ind_name varchar(30) NOT NULL," >> $SQLFILE
+echo "indid	int NOT NULL," >> $SQLFILE
+echo "firstcol	varchar(30) NULL," >> $SQLFILE
+echo "keycnt	smallint NOT NULL)" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "create unique clustered index temp_indexI1" >> $SQLFILE
+echo "on #temp_indexes (tab_name, indid)" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+echo "create table #temp_result (" >> $SQLFILE
+echo "servername varchar(30) NOT NULL," >> $SQLFILE
+echo "dbname varchar(30) NOT NULL," >> $SQLFILE
+echo "tablename varchar(30) NOT NULL," >> $SQLFILE
+echo "firstcol	varchar(30) NOT NULL," >> $SQLFILE
+echo "numindexes int NOT NULL)" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+
+	echo "truncate table #temp_indexes" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "use $DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	echo "insert into #temp_indexes (tab_name, ind_name, indid, keycnt)" >> $SQLFILE
+	echo "select o.name, i.name, i.indid, i.keycnt" >> $SQLFILE
+	echo "from $DBNAME..sysindexes i, $DBNAME..sysobjects o" >> $SQLFILE
+	echo "where i.id = o.id" >> $SQLFILE
+	echo "and i.indid > 0" >> $SQLFILE
+	echo "and o.type = 'U'" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	echo "declare upd_cursor cursor for" >> $SQLFILE
+	echo "select tab_name, indid, keycnt" >> $SQLFILE
+	echo "from #temp_indexes" >> $SQLFILE
+	echo "for update" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	echo "declare @name varchar(30), @indid int, @keycnt smallint" >> $SQLFILE
+	echo "declare @firstcol varchar(30)" >> $SQLFILE
+	echo "open upd_cursor" >> $SQLFILE
+	echo "fetch upd_cursor into @name, @indid, @keycnt" >> $SQLFILE
+	echo "while (@@sqlstatus = 0)" >> $SQLFILE
+	echo "begin" >> $SQLFILE
+	echo "select @firstcol = index_col(@name, @indid, 1)" >> $SQLFILE
+
+	echo "update #temp_indexes set firstcol = @firstcol where current of upd_cursor" >> $SQLFILE
+
+	echo "fetch upd_cursor into @name, @indid, @keycnt" >> $SQLFILE
+	echo "end" >> $SQLFILE
+	echo "close upd_cursor" >> $SQLFILE
+	echo "deallocate cursor upd_cursor" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	echo "insert #temp_result select @@servername,db_name(),tab_name,firstcol,count(*)" >> $SQLFILE
+	echo "from #temp_indexes group by tab_name,firstcol having count(*) > 1" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+echo "select Server=convert(char(20),servername),\"Database\"=convert(char(20),dbname),\"Table\"=tablename,\"First Index Col\"=firstcol,\"Num Indexes\"=numindexes" >> $SQLFILE
+echo "from #temp_result order by servername, dbname, tablename" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+echo "drop table #temp_indexes" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "drop table #temp_result" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# pipe in the sql
+#------------------------------------------------------------------------------
+> $SQLOUT
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -i$SQLFILE | grep -v Password >> $SQLOUT
+
+#------------------------------------------------------------------------------
+# check for errors
+#------------------------------------------------------------------------------
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	cat $SQLOUT >> $LOGFILE
+	echo "Script FAILED"
+	echo "Review output in $LOGFILE"
+	exit 1
+else
+	cat $SQLOUT >> $LOGFILE
+	echo "Script SUCCESSFUL"
+	echo "Review output in $LOGFILE"
+	exit 0
+fi

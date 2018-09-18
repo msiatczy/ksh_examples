@@ -1,0 +1,51 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getBackupLoc.scr
+#
+#  Description: Format a file based on the aseBackupLoc.lst to be loaded
+#		to the infrastructure database.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	Autosys
+#
+#        Calls:	
+#   
+#  Modification History:
+#	12/13/04 K. Hess	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export BKUPLOC=/$CTLDIR/aseBackupLoc.lst
+export TMP1=/tmp/server.lst
+export TMP2=/tmp/date.lst
+export TRANSPFILE=/sccm/transparency/dba/nas_bckup_loc/syb_bckup_loc.txt
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TMP1 && \rm -f $TMP1
+	test -f $TMP2 && \rm -f $TMP2
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create lists and cat to backup location file
+#--------------------------------------------------------------------------
+> $TMP1
+> $TMP2
+
+grep -v '^#' $BKUPLOC >> $TMP1
+
+cat $TMP1 |
+while read LINE
+do
+        echo "`date +%D`" >> $TMP2
+done
+
+paste -d' ' $TMP1 $TMP2 | sed -e 's/ /||/g' -e 's/||||/||/g' > $TRANSPFILE

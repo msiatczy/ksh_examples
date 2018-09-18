@@ -1,0 +1,149 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getDbAccess.scr -S <DBSERVER> -U <user> {-D <dbname> -o <output path/file>}
+#
+#  Description: Get list of all users who have access to a specific database
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	/sccm/dba/sybase/scripts/operations/ops_getDbAccess.scr
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER>
+#              	<user> - login with which to connect to the DBSERVER
+#              	<dbname>
+#              	<output path/file> - full path and name of output file
+#
+#  NOTE: This script is used by Operations.
+#  Do not rename/move it without updating the script under the operations subdirectory.
+#
+#  Modification History:
+#	03/26/04 M. Siatczynski	Initial Script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -U <user> {-D <dbname> -o <output path/file}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -U)     export LOGIN=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -o)     export OUTFILE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$LOGIN" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/dblist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export TEMPOUT=/tmp/tempout.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $TEMPOUT && \rm -f $TEMPOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dblist of all non-system databases
+#--------------------------------------------------------------------------
+if [ "$DBNAME" ]
+then
+	echo $DBNAME > $DBLIST
+else
+	$ISQLEXE -U$LOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $LOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases
+	where name not in ('master','model','dba') and
+	name not like 'sybsystem%' and
+	name not like 'tempdb%' and
+	name not like 'dbcc%' and
+	name not like 'sybsecurity%'
+	order by name
+	go
+	!
+
+	checkSqlErr $DBLIST
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting DBLIST"
+		cat $DBLIST
+		exit 1
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# format sql to get list of users in each database in dblist
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	echo "use $DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "exec sp_all_dbaccess" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#------------------------------------------------------------------------------
+# pipe in the sql
+# check for errors
+# exit with final return code
+#------------------------------------------------------------------------------
+> $TEMPOUT
+getPass $DBSERVER $LOGIN | $ISQLEXE -U$LOGIN -S$DBSERVER -w200 -b -i$SQLFILE | egrep -v '(Password|return status)' >> $TEMPOUT
+
+checkSqlErr $TEMPOUT
+if [ $? -eq 1 ]
+then
+	echo "ERROR - executing SQL against $DBSERVER"
+	cat $TEMPOUT
+	exit 1
+else
+	if [ "$OUTFILE" ]
+	then
+		sed -e 's/^ //g' -e 's/  *$//g' $TEMPOUT > $OUTFILE
+		if [ $? -ne 0 ]
+		then
+			echo "ERROR - creating output file $OUTFILE"
+			exit 1
+		fi
+	else
+		sed -e 's/^ //g' -e 's/  *$//g' $TEMPOUT
+	fi
+	exit 0
+fi

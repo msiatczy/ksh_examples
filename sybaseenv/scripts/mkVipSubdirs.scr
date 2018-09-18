@@ -1,0 +1,108 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: mkVipSubdirs.scr {-d <directory path>} | {-V <VIP>}
+#
+#  Description: Make VIP subdirectories under a designated directory IF directory path is passed
+#		OR Make VIP subdirectory under each standard directory if a VIP is passed
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	DIRPATH - full directory path under which to make the subdirectories
+#
+#  Modification History:
+#	01/25/11 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 {-d <directory path>} | {-V <VIP>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -d)     export DIRPATH=$2;shift 2;;
+                        -V)     export ONEVIP=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+#--------------------------------------------------------------------------
+# validate parms
+#--------------------------------------------------------------------------
+export STDSUBDIRS=$CTLDIR/stdVipSubdirs.lst
+
+if [ "$DIRPATH" -a "$ONEVIP" ]
+then
+	echo "ERROR - DIRPATH and VIP are mutually exclusive--can only pass one parm"
+	exit 1
+fi
+
+# if a directory path is passed, it MUST be in the standard list AND it MUST physically exist
+if [ "$DIRPATH" ]
+then
+	grep ^${DIRPATH}$ $STDSUBDIRS > /dev/null
+	export GREPRC=$?
+	if [ $GREPRC -eq 0 ]
+	then
+# exists in standard list--make sure it physically exists
+		if [ ! -d $DIRPATH ]
+		then
+			echo "ERROR - $DIRPATH does not exist"
+			exit 1
+		fi
+	else
+# doesn't exist in standard list
+		echo "ERROR - $DIRPATH does not exist in $STDSUBDIRS"
+		echo "Add the path to $STDSUBDIRS and rerun this script"
+		exit 1
+	fi
+fi
+
+export VIPLIST=/tmp/vip.lst.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $VIPLIST && \rm -f $VIPLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Format list of VIPS
+#--------------------------------------------------------------------------
+test "$ONEVIP" && echo $ONEVIP > $VIPLIST || getVipList > $VIPLIST
+
+#--------------------------------------------------------------------------
+#  Make a VIP subdirectory for each VIP in $VIPLIST
+#--------------------------------------------------------------------------
+cat $VIPLIST |
+while read VIP
+do
+	cat $STDSUBDIRS |
+	while read SUBDIR
+	do
+		if [ -d $SUBDIR/$VIP ]
+		then
+			echo "$SUBDIR/$VIP already exists"
+		else
+			echo "Making directory $SUBDIR/$VIP..."
+			mkdir $SUBDIR/$VIP
+		fi
+	done
+done

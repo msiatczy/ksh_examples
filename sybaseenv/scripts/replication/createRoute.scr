@@ -1,0 +1,136 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: createRoute.scr -PRS <Primary RS> -RRS <Replicate RS> -fmt|-run {-noprompt}
+#
+#  Description: Create Route between Primary and Replicate Replication Server
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<Primary RS> - Source server that would be Primary Replication Server
+#              	<Replicate RS> - Destination server which would be Replicate Replication Server
+#
+#  Modification History:
+#	09/22/10 K. Sawant	Initial Script 
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Parameters
+#--------------------------------------------------------------------------
+
+export USAGE="\nERROR - Usage: $0 -PRS <Primary RS> -RRS <Replicate RS> -fmt|-run {-noprompt}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -PRS)   export PRS=$2;shift 2;;
+                        -RRS)   export RRS=$2;shift 2;;
+                        -fmt)   export FMT=1;shift 1;;
+                        -run)   export RUN=1;shift 1;;
+                        -noprompt)   export PROMPT=0;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$FMT" && export FMT=0
+test ! "$RUN" && export RUN=0
+test ! "$PROMPT" && export PROMPT=1
+
+#--------------------------------------------------------------------------
+#  Verify Parameters
+#--------------------------------------------------------------------------
+# fmt and/or run must be passed
+if [ $FMT -eq 0 -a $RUN -eq 0 ]
+then
+	echo "$USAGE"
+	echo "\n-fmt and/or -run MUST be passed\n"
+	exit 1
+fi
+
+# repserver must be passed
+if [ ! "$PRS" -o ! "$RRS" ]
+then
+	echo "$USAGE"
+	echo "\nboth repserver's MUST be passed\n"
+	exit 1
+fi
+
+export SQLFILE=$SQLDIR/replication/$PRS.createRoute.sql
+
+#--------------------------------------------------------------------------
+#  Format the sql
+#--------------------------------------------------------------------------
+if [ $FMT -eq 1 ]
+then
+	export ADMINPWD=`getPass $PRS $ADMINLOGIN`
+
+	> $SQLFILE
+
+	echo "create route to $RRS" >> $SQLFILE
+	echo "set username $ADMINLOGIN" >> $SQLFILE
+	echo "set password $ADMINPWD" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	
+	echo "\nSQL file(s) generated:"
+	echo "$SQLFILE"
+fi
+
+#--------------------------------------------------------------------------
+#  Run the SQL
+#--------------------------------------------------------------------------
+if [ $RUN -eq 1 ]
+then
+
+#--------------------------------------------------------------------------
+#  PROMPT TO CONTINUE
+#--------------------------------------------------------------------------
+	if [ $PROMPT -eq 1 ]
+	then
+		echo "\nYou are about to CREATE route on $PRS using SQL in $SQLFILE\n"
+		export CONTINUE=""
+		while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+		do
+			echo "DO YOU WISH TO CONTINUE? {y/n}"
+			read CONTINUE
+		done
+		if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+		then
+			echo "\nExiting - No SQL run against $PRS\n"
+			exit 0
+		fi
+	fi
+
+	echo "Running SQL in $SQLFILE..."
+	export OUTFILE=$LOGDIR/replication/$PRS/$PRS.createRoute.$DATETIME
+	> $OUTFILE
+	getPass $PRS $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$PRS -w200 -e -i$SQLFILE | grep -v Password >> $OUTFILE
+
+#--------------------------------------------------------------------------
+#  Check output
+#--------------------------------------------------------------------------
+	checkSqlErr $OUTFILE
+	if [ $? -ne 0 ]
+	then
+	        echo "Script FAILED"
+	        echo "\nReview output in $OUTFILE\n"
+	        exit 1
+	else
+	        echo "Script SUCCESSFUL"
+	        exit 0
+	fi
+fi
+
+exit 0

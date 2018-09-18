@@ -1,0 +1,65 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getDbOptions.scr
+#  Description: Get database options for each database server
+#     Location: /sccm/dba/sybase/adhoc/klh
+#  Modification History:
+#       06/22/04 K. Hess	Initial Script
+#       02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserver.lst.$$
+
+getAseList > $DBSERVERLIST
+
+#--------------------------------------------------------------------------
+#  Define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+}
+ 
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Loop through list of servers and get database options for each server's
+# databases
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+
+	export RPTFILE=$RPTDIR/misc/dbOptions.$DATETIME
+
+        #--------------------------------------------------------------------------
+        # 
+        #--------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w300 <<-! | grep -v Password >> $RPTFILE
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	use master
+	go
+	select @@servername as 'Server',name as 'Database',status as 'Status',status2 as 'Status2'
+	from master..sysdatabases
+	order by name
+	go
+	print ''
+	go
+	use model
+	go
+	select name as '$DBSERVER Model Sysusers' from sysusers where name not in ('public','dbo') and name not like '%role'
+	go
+	print ''
+	go
+	select name as '$DBSERVER Model Sysobjects' from sysobjects where name not like 'sys%'
+	go
+	print ''
+	go
+	!
+done

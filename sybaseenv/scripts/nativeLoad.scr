@@ -1,0 +1,423 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: nativeLoad.scr -S <SOURCE DBSERVER> {-T <TARGET DBSERVER> -D <database>|-L <list of databases> -full_only -file_asof '<file_asof datetime>' -log_asof   -pagedone <pagedest> -no_online -noprompt}
+#
+#  Description: Perform physical database recover of one or more databases from SOURCE DBSERVER to TARGET DBSERVER
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<SOURCE DBSERVER> - source dbserver and dbserver used to set environment
+#		<TARGET DBSERVER> - target dbserver
+#              	<database> - single database to recover
+#              	<file_asof datetime> - specify with single database to perform file_asof recovery - MUST be in single quotes
+#              	<log_asof datetime> - specify with single database to perform log point in time recovery - MUST be in single quotes
+#              	<full_only> - loads the full only. 
+#              	<list of database> - full path to list of databases to recover
+#
+#  Modification History:
+#	08/29/05 M. Siatczynski	Initial Script (copied from sqlbtBackup.scr)
+#	03/08/10 J. Aspenleiter	Took the original script from 8/29/05 and turned it into the "nativeLoad.scr" script.
+#	05/21/10 M. Siatczynski	If no dbname or list is passed, get list of all user/non-readonly databases for refresh
+#--------------------------------------------------------------------------
+
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+# Initialize Variables  
+#--------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <SOURCE DBSERVER> {-T <TARGET DBSERVER> -D <dbname>|-L <list of databases> -full_only -file_asof '<asof datetime>' -log_asof '<log asof datetime>' -pagedone <pagedest> -no_online -noprompt}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 2
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)		export SOURCE_DBSERVER=$2;shift 2;;
+	                -T)		export TARGET_DBSERVER=$2;shift 2;;
+	                -D)		export ONEDBNAME=$2;shift 2;;
+	                -L)		export DBLIST=$2;shift 2;;
+	                -file_asof)	export FILE_ASOF=$2;shift 2;;
+	                -log_asof)	export LOG_ASOF=$2;shift 2;;
+	                -pagedone)	export PAGEDONE=$2;shift 2;;
+	                -no_online)	export ONLINE=0;shift 1;;
+	                -full_only)	export FULLONLY=1;shift 1;;
+	                -noprompt)	export PROMPT=0;shift 1;;
+	                -*)		echo $USAGE;exit 2;;
+	                *)		echo $USAGE;exit 2;;
+	        esac
+	done
+fi
+
+
+#--------------------------------------------------------------------------
+# Validate parms/Initialize variables
+#--------------------------------------------------------------------------
+# SOURCE_DBSERVER MUST be passed
+if [ ! "$SOURCE_DBSERVER" ]
+then
+	echo "ERROR - Source dbserver MUST be passed."
+	exit 2
+fi
+
+# single dbname and list of databases is mutually exclusive
+if [ "$ONEDBNAME" -a "$DBLIST" ]
+then
+	echo "ERROR - Single dbname and list of databases are mutually exclusive."
+	exit 2
+fi
+
+if [ "$FULLONLY" -a "$LOG_ASOF" ]
+then
+	echo "ERROR - log_asof is for POINT IN TIME recoveries and therefore cannot be used along with full_only."
+	exit 2
+fi
+
+if [ "$FILE_ASOF" -a "$LOG_ASOF" ]
+then
+	echo "ERROR - file_asof and log_asof are mutually exclusive."
+	exit 2
+fi
+
+
+
+# set defaults
+test ! "$PROMPT" && export PROMPT=1
+test ! "$ONLINE" && export ONLINE=1
+test ! "$LOG_ASOF" && export LOG_ASOF="0" || export ASOFSPEC="@log_asof = '$LOG_ASOF'"
+test ! "$FILE_ASOF" && export FILE_ASOF="0" || export ASOFSPEC="@file_asof = '$FILE_ASOF'"
+test ! "$FULLONLY" && export FULLONLY=0
+
+
+#if a target server is passed, then it's treated an alternate server refresh.
+if [ "$TARGET_DBSERVER" ]
+then
+	export ALT_REFRESH=1
+else
+	export TARGET_DBSERVER=$SOURCE_DBSERVER
+	export ALT_REFRESH=0
+fi
+
+
+export PAGEMSG=/tmp/pagemsg.$$
+export TMPDBLIST=/tmp/dblist.$$
+export ONLINEDBLIST=/tmp/onlinedblist.$$
+export ONLINESQL=/tmp/onlinesql.$$
+export LOAD_SQL=/tmp/loadsql.$$
+export SQL_SYNTAX=/tmp/sqlsyntax.$$
+export SQLOUT=/tmp/sqlout.$$
+export LOGFILE=$LOGDIR/backup/$TARGET_DBSERVER/$TARGET_DBSERVER.nativeLoad.$$.$DATETIME
+
+> $LOGFILE
+> $TMPDBLIST
+
+# initialize return codes
+export LOADRC=0
+export EXITRC=0
+
+# if onedbname or list of databases passed, format list of control files, otherwise we'll use the whole control directory
+if [ "$ONEDBNAME" ]
+then
+	echo $ONEDBNAME >> $TMPDBLIST
+elif [ "$DBLIST" ]
+then
+	if [ ! -s $DBLIST ]
+	then
+		echo "WARNING - $DBLIST does not exist or is 0 bytes" >> $LOGFILE
+		exit 1
+	else
+		cat $DBLIST |
+		while read DBNAME
+		do
+			export DBNAME
+			echo $DBNAME >> $TMPDBLIST
+		done
+	fi
+else
+	getDbList -S $SOURCE_DBSERVER -user -xreadonly >> $TMPDBLIST
+fi
+#-------------------------------------------------------------------------
+# If restoring a single or list of databases, let's turn that into a string to use as an array.
+# Format the database string with separating space.
+# Turn the string into an array - set up the ulimmit of the array and set the counter.
+# This will be used later to loop through the array at any given time.  Code sample
+# is commented out in this section to show how it will be used.
+# special handleing required for first databse in dbstring...
+#--------------------------------------------------------------------------
+if [ -s $TMPDBLIST ]
+then
+	FIRST_DB=0
+	DBSTRING=""
+	cat $TMPDBLIST |
+	while read DBNAME
+	do
+		if [[ $FIRST_DB == 0 ]]
+		then
+			DBSTRING="$DBNAME"
+			FIRST_DB=1
+		else
+			DBSTRING="$DBSTRING $DBNAME"
+		fi
+
+	done
+
+	#SET THE ARRAY:
+	set -A ARRAY_DBNAMES $DBSTRING
+
+	#GET THE UPPER LIMIT OF THE ARRAY
+	export ULIMIT=${#ARRAY_DBNAMES[*]}
+
+	#ARRAYS START WITH 0 - SO TAKE ONE AWAY FROM THE UPPER LIMIT
+	((ULIMIT=ULIMIT - 1))
+	export CNT=0
+
+	########################################
+	#              CODE SAMPLE             #
+	########################################
+	#The following code will be used later in the script to loop
+	#through the database list:
+	########################################
+	#while (($CNT <= $ULIMIT))  
+	#do
+	#	echo ${ARRAY_DBNAMES[$CNT]}
+	#	((CNT=CNT + 1))
+	#	
+	#done
+	########################################
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $PAGEMSG && \rm -f $PAGEMSG
+	test $TMPDBLIST && \rm -f $TMPDBLIST
+	test $ONLINEDBLIST && \rm -f $ONLINEDBLIST
+	test $ONLINESQL && \rm -f $ONLINESQL
+	test $LOAD_SQL && \rm -f $LOAD_SQL
+	test $SQLOUT && \rm -f $SQLOUT
+	test $SQL_SYNTAX && \rm -f $SQL_SYNTAX
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Prompt for continuation
+# Recover the control files/directory
+# Get the highest return code from the log file (the sed cmd accounts for multiple spaces in the "highest return code was" line)
+#--------------------------------------------------------------------------
+# prompt for continuation
+if [ $PROMPT -eq 1 ]
+then
+        echo "\n**************************************************************************************\n"
+	if [ $ALT_REFRESH -eq 0 ]
+	then
+        	echo "WARNING:  YOU ARE ABOUT TO PERFORM A DATABASE RESTORE ON THE SOURCE ASE WITH THE FOLLOWING INFORMATION:\n"
+	else
+		echo "WARNING:  YOU ARE ABOUT TO PERFORM A DATABASE REFRESH FROM SOURCE ASE TO TARGET ASE WITH THE FOLLOWING INFORMATION:\n"
+	fi
+	echo "***SOURCE DBSERVER=	$SOURCE_DBSERVER"
+	echo "***TARGET DBSERVER=	$TARGET_DBSERVER"
+	echo "***    DATABASE(S)=	$DBSTRING"
+	if [ $FULLONLY -eq 1 ]
+	then
+		echo "*** LOAD FULL ONLY=	YES"
+	fi
+	if [[ "$FILE_ASOF" != "0" ]]
+	then
+		echo "***      FILE ASOF=	$FILE_ASOF"
+	fi
+	if [[ "$LOG_ASOF" != "0" ]]
+	then
+		echo "***       LOG ASOF=	$LOG_ASOF"
+	fi
+	echo "***         ONLINE=	$ONLINE"
+        echo "**************************************************************************************\n"
+
+        CONTINUE=""
+
+        while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+        do
+                echo "DO YOU WISH TO CONTINUE? {y/n}"
+                read CONTINUE
+        done
+
+        if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+        then
+                echo "\nScript exiting - no recover action taken on $TARGET_DBSERVER.\n" | tee -a $LOGFILE
+                exit 1
+        fi
+fi
+
+
+#--------------------------------------------------------------------------
+# RESTORE DATABASE(S) FOR NON ALTERNATE DB SERVER RESTORE:
+# CHECK TO SEE IF ONLINE IS TRUE - ONLINE DB.
+# Check for errors
+#--------------------------------------------------------------------------
+> $LOAD_SQL
+> $SQLOUT
+
+while (($CNT <= $ULIMIT))  
+do
+	LOADSPEC=""
+	REFRESHSPEC=""
+
+	if [ $ALT_REFRESH -eq 0 ]
+	then
+		LOADSPEC="exec sp_load_db ${ARRAY_DBNAMES[$CNT]}"
+	else
+		REFRESHSPEC="exec sp_load_syntax ${ARRAY_DBNAMES[$CNT]}"
+	fi	
+
+	if [ $FULLONLY -eq 1 ]
+	then
+		LOADSPEC="$LOADSPEC, @full_only = 1"
+		REFRESHSPEC="$REFRESHSPEC, @full_only = 1"
+	fi
+	if [ "$ASOFSPEC" ]
+	then
+		LOADSPEC="$LOADSPEC, $ASOFSPEC"
+		REFRESHSPEC="$REFRESHSPEC, $ASOFSPEC"
+	fi
+
+	if [ $ALT_REFRESH -eq 0 ]
+	then
+		echo "$LOADSPEC" >> $LOAD_SQL
+		echo "go" >> $LOAD_SQL
+	fi
+
+	#add the syntax to online it to ONLY the local load only - not the refresh.
+	if [ $ONLINE -eq 1 -a $ALT_REFRESH -eq 0 ]
+	then
+		echo "online database ${ARRAY_DBNAMES[$CNT]}" >> $LOAD_SQL
+		echo "go" >> $LOAD_SQL
+	fi
+
+	if [ $ALT_REFRESH -eq 1 ]
+	then
+		#If this is an alternate server restore, let's now connect to the SOURCE
+		#DB Server to get the LOAD syntax to run on the TARGET...
+		
+		#Reset the sql_syntax file
+		> $SQL_SYNTAX
+		echo $REFRESHSPEC >> $SQL_SYNTAX
+		echo "go" >> $SQL_SYNTAX
+		
+		getPass $SOURCE_DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$SOURCE_DBSERVER -b -w500 -i$SQL_SYNTAX | grep -v Password >> $LOAD_SQL
+
+		checkSqlErr $LOAD_SQL
+		if [ $? -ne 0 ]
+		then
+        		echo "ERROR - executing sp_load_syntax SQL against $SOURCE_DBSERVER" | tee -a $LOGFILE
+        		cat $LOAD_SQL >> $LOGFILE
+        		exit 1
+		fi
+
+		# add a go to the end of the file only if tran logs are getting applied.
+		# the sp_load_syntax puts a go after the full dump, but not after the tran logs...
+		if [ $FULLONLY -ne 1 ]
+		then
+			echo "go" >> $LOAD_SQL
+		fi
+
+
+	        #$ISQLEXE -U$ADMINLOGIN -S$SOURCE_DBSERVER -w200 -P"`getPass $SOURCE_DBSERVER $ADMINLOGIN`" <<-! >> $LOAD_SQL
+		#set nocount on
+		#go
+		#$REFRESHSPEC
+		#go
+		#!
+
+		#echo "go" >> $LOAD_SQL
+		
+		if [ $ONLINE -eq 1 ]
+		then
+			echo "online database ${ARRAY_DBNAMES[$CNT]}" >> $LOAD_SQL
+	                echo "go" >> $LOAD_SQL
+		fi
+	fi
+
+	
+
+
+	((CNT=CNT + 1))
+done
+
+
+
+
+
+#--------------------------------------------------------------------------
+# Execute LOAD
+# Check for errors
+#--------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+	echo "`date` BEGINNING LOAD(S) ON $TARGET_DBSERVER" | tee -a $LOGFILE
+else
+	echo "`date` BEGINNING LOAD(S) ON $TARGET_DBSERVER" >> $LOGFILE
+fi
+
+#get the load syntax used in the log file to show what is being run:
+cat $LOAD_SQL >> $LOGFILE
+
+
+getPass $TARGET_DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$TARGET_DBSERVER -b -w500 -i$LOAD_SQL | grep -v Password >> $SQLOUT
+
+checkSqlErr $SQLOUT
+
+export LOADRC=$?
+
+cat $SQLOUT >> $LOGFILE
+
+if [ $LOADRC -ne 0 ]
+then
+	if [ $PROMPT -eq 1 ]
+	then 
+    		echo "ERROR - executing sp_load SQL against $TARGET_DBSERVER" | tee -a $LOGFILE
+		echo "$LOGFILE"
+	else
+		echo "ERROR - executing sp_load SQL against $TARGET_DBSERVER" >> $LOGFILE
+	fi
+       	exit 1
+else
+	if [ $PROMPT -eq 1 ]
+	then
+		echo "`date` LOAD(S) FINISHED ON $TARGET_DBSERVER SUCCESSFULLY" | tee -a $LOGFILE
+	else
+		echo "`date` LOAD(S) FINISHED ON $TARGET_DBSERVER SUCCESSFULLY" >> $LOGFILE
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  Set the exit return code
+#  If load failed (LOADRC <> 0), set a non-zero return code
+#--------------------------------------------------------------------------
+if [ $LOADRC -ne 0 ]
+then
+        export EXITRC=1
+fi
+
+#--------------------------------------------------------------------------
+#  If PAGEDONE set, set appropriate page message and send page
+#--------------------------------------------------------------------------
+if [ "$PAGEDONE" ]
+then
+	test $EXITRC -eq 0 && export PAGESTATUS=SUCCESS || export PAGESTATUS="FAILURE/WARNING"
+	echo "`date` $TARGET_DBSERVER recovery completion status=$PAGESTATUS" > $PAGEMSG
+	export PAGEDEST=$PAGEDONE
+	sendPage
+fi
+
+#--------------------------------------------------------------------------
+# Exit
+#--------------------------------------------------------------------------
+exit $EXITRC

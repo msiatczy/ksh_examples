@@ -1,0 +1,148 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getDr.scr
+#
+#  Description: Run getDr*.scr scripts on each of the database server hosts
+#
+#     Location: /sccm/dba/sybase/scripts
+#
+#    Called by: AutoSys
+#
+#   Parameters: Pass single DBSERVER or -all for all database servers
+#
+#  Modification History:
+#       02/27/04 K. Hess        Initial script
+#	03/04/04 K. Hess	Updated report output
+#	03/31/04 K. Hess	Updated report output
+#	04/07/04 K. Hess	Added getMaster.scr
+#	04/16/04 K. Hess	Added getDrDbDDL.scr and getAseVersion.scr
+#	04/26/04 K. Hess	Added getOCVersion.scr
+#	06/21/04 M. Siatczynski	Added grep to ignore header in ASEDIRLIST
+#	12/17/04 K. Hess	Updated rsh to ssh
+#	12/21/06 M. Siatczynski	Updated to exclude servers in ASEEXCLUDELIST when processing all servers
+#	12/28/06 M. Siatczynski	Use getAseList function to get initial list of ASEs
+#	10/17/08 M. Siatczynski	Change RPTFILE to LOGFILE, change RPTDIR to LOGDIR
+#	02/16/10 M. Siatczynski	Add code to exclude Evergreen ASEs for now (no trusted connection)
+#	05/22/10 M. Siatczynski	Switch Sqlbt backup to native backup
+#	06/10/10 M. Siatczynski	Update echo associated with native full dump
+#				Comment out calls to getDrSqlbt.scr and getDrMaster.scr (these were SQLBT-specific)
+#	01/18/11 M. Siatczynski	Append stderr from ssh to LOGFILE (bypasses new WARNING message from /etc/banner with latest OS patch)
+#----------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Parameters:  DBSERVER or -all
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> | -all"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -all)   export ALL=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+ 
+test ! "$ALL" && export ALL=0
+
+if [ ! "$ONEDBSERVER" -a "$ALL" -eq 0 ]
+then
+        echo "ERROR - MUST pass either DBSERVER or -all"
+        echo $USAGE
+        exit 1
+fi
+ 
+if [ "$ONEDBSERVER" -a "$ALL" -eq 1 ]
+then
+        echo "ERROR - DBSERVER and -all are mutually exclusive"
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserver.lst.$$
+export TMPLIST=/tmp/tmp.lst.$$
+ 
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+        test -f $TMPLIST && \rm -f $TMPLIST
+}
+ 
+trap 'tempCleanup' EXIT INT TERM
+ 
+#--------------------------------------------------------------------------
+#  Create dbserver list
+#  Append ^ to beginning of TMPLIST and " " to end
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" ]
+then
+	grep "^${ONEDBSERVER} " $ASEDIRLIST | cut -d" " -f1,2 > $DBSERVERLIST
+else
+	getAseList | sed -e 's/^/\^/g' -e 's/$/ /g' > $TMPLIST
+        egrep -f $TMPLIST $ASEDIRLIST | cut -d" " -f1,2 > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# Run DR scripts on each of the database server service names
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER SN
+do
+#  DR Report
+	export LOGFILE=$LOGDIR/dr/$DBSERVER/$DBSERVER.getDr.$MMDDYYYY
+	
+# EXCLUDE Evergreen ASEs for now (no trusted connection
+	echo $SN | grep 'evergreeninsite' > /dev/null
+	if [ $? -eq 0 ]
+	then
+		echo "$DBSERVER - No trusted connection to evergreeninsite, skipping DR collection" >> $LOGFILE
+		continue
+	fi
+
+	echo "***********************************" >> $LOGFILE
+	echo "*** DR REPORT for $DATETIME ***" >> $LOGFILE
+	echo "***********************************" >> $LOGFILE
+	echo "" >> $LOGFILE
+	echo "Running getDrAse.scr for $DBSERVER" >> $LOGFILE
+	/usr/local/bin/ssh -n $SN $SCRDIR/getDrAse.scr -S $DBSERVER >> $LOGFILE 2>&1
+	echo "" >> $LOGFILE
+	echo "Running getDrBcp.scr for $DBSERVER" >> $LOGFILE
+	/usr/local/bin/ssh -n $SN $SCRDIR/getDrBcp.scr -S $DBSERVER >> $LOGFILE 2>&1
+	echo "" >> $LOGFILE
+##	echo "Running getDrSqlbt.scr for $DBSERVER" >> $LOGFILE
+##	/usr/local/bin/ssh -n $SN $SCRDIR/getDrSqlbt.scr -S $DBSERVER >> $LOGFILE
+##	echo "" >> $LOGFILE
+	echo "Running nativeFullDump.scr for master on $DBSERVER" >> $LOGFILE
+	/usr/local/bin/ssh -n $SN $SCRDIR/nativeFullDump.scr -S $DBSERVER -D master >> $LOGFILE 2>&1
+	echo "" >> $LOGFILE
+##	echo "Running getDrMaster.scr for $DBSERVER" >> $LOGFILE
+##	/usr/local/bin/ssh -n $SN $SCRDIR/getDrMaster.scr -S $DBSERVER >> $LOGFILE
+##	echo "" >> $LOGFILE
+	echo "Running getDrDbDDL.scr for $DBSERVER" >> $LOGFILE
+	/usr/local/bin/ssh -n $SN $SCRDIR/getDrDbDDL.scr -S $DBSERVER -forload >> $LOGFILE 2>&1
+	echo "" >> $LOGFILE
+	echo "Running getAseVersion.scr for $DBSERVER" >> $LOGFILE
+	/usr/local/bin/ssh -n $SN $SCRDIR/getAseVersion.scr -S $DBSERVER >> $LOGFILE 2>&1
+	echo "" >> $LOGFILE
+	echo "Running getOCVersion.scr for $DBSERVER" >> $LOGFILE
+	/usr/local/bin/ssh -n $SN $SCRDIR/getOCVersion.scr -S $DBSERVER >> $LOGFILE 2>&1
+	echo "" >> $LOGFILE
+done
+
+#--------------------------------------------------------------------------
+#  Exit with 0
+#--------------------------------------------------------------------------
+exit 0

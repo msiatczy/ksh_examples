@@ -1,0 +1,97 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getDrMaster.scr
+#  Description: Get master native dump and master info from SQL-BackTrack
+#		master database backup
+#     Location: /sccm/dba/sybase/scripts
+#    Called by: AutoSys
+#   Parameters: DBSERVER
+#  Modification History:
+#       04/02/04 K. Hess        Initial script
+#       08/17/04 M. Siatczynski Copy native master dump and masterinfo to generic DBSERVER directory
+#       03/15/06 M. Siatczynski Replace hardcoded sbackups.physical with $DT_PHYSICAL (std env variable)
+#       02/12/07 K. Hess	Adding error checking to catch errors with dtsrecover of master
+#       10/17/08 M. Siatczynski Remove RPTFILE, leaving only LOGFILE and change LOGFILE filename to include script name and $DATETIME stamp
+#----------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Parameters:  Database server
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>"
+ 
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+ 
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export SETDBSERVER=$DBSERVER
+
+. /sccm/dba/sybase/.dbaSybProfile
+ 
+export LOGFILE=$LOGDIR/dr/$DBSERVER/$DBSERVER.getDrMaster.$DATETIME
+export HIGHRC=0
+
+#----------------------------------------------------------------------------
+#  Verify dr directory exists; if not, create the directory
+#  Verify sqlbt sub-directory exists; if not, create the directory
+#----------------------------------------------------------------------------
+test ! -d $DBSERVER_DRDIR && mkdir $DBSERVER_DRDIR
+test ! -d $SQLBT_DRDIR && mkdir $SQLBT_DRDIR
+test ! -d $SQLBT_DRDIR/$DBSERVER && mkdir $SQLBT_DRDIR/$DBSERVER
+test ! -d $SQLBT_DRDIR/$DBSERVER$MMDDYYYY && mkdir $SQLBT_DRDIR/$DBSERVER$MMDDYYYY
+
+#--------------------------------------------------------------------------
+#  Init LOGFILE
+#  Header for DR Report
+#--------------------------------------------------------------------------
+echo "--MASTER native dump and info for $DBSERVER on $DATETIME" >> $LOGFILE
+
+#----------------------------------------------------------------------------
+# Extract native Sybase dump for master and extract master info
+# from current SQL-BackTrack backup for master 
+# Copy the native dump and masterinfo to the generic DBSERVER directory
+#----------------------------------------------------------------------------
+$DT_SBACKTRACK_HOME/bin/dtsrecover $DT_PHYSICAL/$DBSERVER/master -sybasedump $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/$DBSERVER.master.dmp -masterinfo $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/$DBSERVER.masterinfo.out >> $LOGFILE
+export RC=$?
+
+test $HIGHRC -lt $RC && export HIGHRC=$RC
+
+if [ $RC -ne 0 ]
+then
+        echo "ERROR - SQLBT RECOVERY of $DBSERVER master database FAILED.  Review errors in $LOGFILE" >> $LOGFILE
+        export HIGHRC=1
+else
+        echo "SQLBT RECOVERY of $DBSERVER master database SUCCESSFUL" >> $LOGFILE
+fi
+
+test -f $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/$DBSERVER.master.dmp && cp -p $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/$DBSERVER.master.dmp $SQLBT_DRDIR/$DBSERVER/$DBSERVER.master.dmp
+test -f $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/$DBSERVER.masterinfo.out && cp -p $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/$DBSERVER.masterinfo.out $SQLBT_DRDIR/$DBSERVER/$DBSERVER.masterinfo.out
+
+#--------------------------------------------------------------------------
+#  Exit based on the highest return code
+#--------------------------------------------------------------------------
+if [ $HIGHRC -ne 0 ]
+then
+        echo "\nERROR - $DBSERVER master database dr job FAILED\n" >> $LOGFILE
+	export MAILFILE=$LOGFILE
+	export MAILSUBJECT="$DBSERVER: Master DR SQLBT Errors"
+	sendMail
+        exit 1
+else
+        echo "\n$DBSERVER master database dr job SUCCESSFUL\n" >> $LOGFILE
+        exit 0
+fi
+

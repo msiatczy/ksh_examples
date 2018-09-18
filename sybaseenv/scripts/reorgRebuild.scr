@@ -1,0 +1,262 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: reorgRebuild.scr -S <DBSERVER> -D <dbname> -L <table list> -fmt -run {-sibc -m <maildest> -p <pagedest> -pagedone <pagedest>}
+#
+#  Description: Generate and execute SQL to run reorg rebuild for a list of tables.
+#		Table list gets sorted so reorgs start with smallest tables.
+#		reorg rebuild can be run on APL or DOL table (APL in ASE 15 only)
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	DBSERVER - ASE name
+#              	DBNAME - database name
+#              	table list - list of tables
+#              	SIBC - flag to enable select into/bulkcopy -- should ONLY be passed for databases where this option is NOT currently set (because it will be disabled at the end)
+#
+#  Modification History:
+#	10/02/08 M. Siatczynski	Initial script (copied from rebuildClusteredIndexes.scr)
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname> -L <table list> -fmt -run {-sibc -m <maildest> -p <pagedest> -pagedone <pagedest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -L)     export TABLELIST=$2;shift 2;;
+                        -fmt)   export FMT=1;shift 1;;
+                        -run)   export RUN=1;shift 1;;
+                        -sibc)  export SIBC=1;shift 1;;
+                        -m)     export MAILTO=$2;shift 2;;
+                        -p)     export PAGETO=$2;shift 2;;
+                        -pagedone)     export PAGEDONE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$FMT" && export FMT=0
+test ! "$RUN" && export RUN=0
+# flag for 'select into/bulkcopy' database option
+test ! "$SIBC" && export SIBC=0
+
+if [ ! "$DBSERVER" -o ! "$DBNAME" -o ! "$TABLELIST" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ ! -s "$TABLELIST" ]
+then
+	echo "ERROR - $TABLELIST does not exists or is 0 bytes"
+	exit 1
+fi
+
+# fmt and/or run must be passed
+if [ $FMT -eq 0 -a $RUN -eq 0 ]
+then
+	echo "$USAGE"
+	echo "\n-fmt and/or -run MUST be passed\n"
+	exit 1
+fi
+
+## reset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+## reset the centrally-set MAILDEST variable if a different maildest was passed
+test "$PAGETO" && export PAGEDEST=$PAGETO || unset PAGEDEST
+test "$MAILTO" && export MAILDEST=$MAILTO
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export TEMPSQL=/tmp/tempsql.$$
+export SIZELIST=/tmp/sizelist.$$
+export WORKLIST=/tmp/worklist.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export RPTFILE=$RPTDIR/reorg/$DBSERVER/$DBSERVER.$DBNAME.reorgRebuild.$DATETIME
+
+> $RPTFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#  If PAGEDONE set, set appropriate page message and send page
+#--------------------------------------------------------------------------
+function tempCleanup {
+	if [ "$PAGEDONE" ]
+	then
+		test $REORGRC -eq 0 && export PAGESTATUS=SUCCESS || export PAGESTATUS="FAILURE"
+		echo "`date` $DBSERVER $DBNAME reorg status=$PAGESTATUS" > $PAGEMSG
+		export PAGEDEST=$PAGEDONE
+		sendPage
+	fi
+	test -f $TEMPSQL && \rm -f $TEMPSQL
+	test -f $SIZELIST && \rm -f $SIZELIST
+	test -f $WORKLIST && \rm -f $WORKLIST
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# If FMT=1 then format the sql for reorg rebuild
+# Format and run sql to get list of tables by size
+# Output is sorted by reserved column
+# Check for isql errors
+#--------------------------------------------------------------------------
+if [ $FMT -eq 1 ]
+then
+	echo "`date` FORMAT SQL" >> $RPTFILE
+	> $TEMPSQL
+	echo "use $DBNAME" >> $TEMPSQL
+	echo "go" >> $TEMPSQL
+	echo "set nocount on" >> $TEMPSQL
+	echo "go" >> $TEMPSQL
+
+	cat $TABLELIST |
+	while read TABLE
+	do
+		export TABLE
+		echo "if exists (select * from $DBNAME..sysobjects where name = \"$TABLE\")" >> $TEMPSQL
+		echo "exec sp_spaceused $TABLE" >> $TEMPSQL
+		echo "else" >> $TEMPSQL
+		echo "print \"$TABLE does not exist in $DBNAME\"" >> $TEMPSQL
+		echo "go" >> $TEMPSQL
+	done
+
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$TEMPSQL | egrep -v '(Password:|return status)' | sed -e 's/^ //g' -e 's/  */ /g' | sort -n +2 > $SIZELIST
+
+	checkSqlErr $SIZELIST
+	if [ $? -eq 1 ]
+	then
+		echo $CALLED | tee -a $RPTFILE
+		echo "ERROR - getting space information for tables" | tee -a $RPTFILE
+		cat $SIZELIST | tee -a $RPTFILE
+		exit 1
+	fi
+
+#------------------------------------------------------------------------------
+# Pull the table names from the size list into a work list
+#------------------------------------------------------------------------------
+	cut -d" " -f1 $SIZELIST > $WORKLIST
+
+#------------------------------------------------------------------------------
+# Format the reorg SQL
+# Separate file generated for EACH table
+#------------------------------------------------------------------------------
+	if [ -s $WORKLIST ]
+	then
+		cat $WORKLIST |
+		while read TABLE
+		do
+			export TABLE
+			export REORGSQL=$SQLDIR/$DBSERVER/$DBSERVER.$DBNAME.$TABLE.reorg.sql
+
+			> $REORGSQL
+			if [ $SIBC -eq 1 ]
+			then
+				echo "use master" >> $REORGSQL
+				echo "go" >> $REORGSQL
+				echo "exec sp_dboption $DBNAME,bulkcopy,true" >> $REORGSQL
+				echo "go" >> $REORGSQL
+			fi
+			echo "use $DBNAME" >> $REORGSQL
+			echo "go" >> $REORGSQL
+			echo "exec sp_dbfull $DBNAME" >> $REORGSQL
+			echo "go" >> $REORGSQL
+
+			echo "exec sp_spaceused $TABLE,1" >> $REORGSQL
+			echo "go" >> $REORGSQL
+			echo "select convert(char,getdate(),9)" >> $REORGSQL
+			echo "go" >> $REORGSQL
+			echo "reorg rebuild $TABLE" >> $REORGSQL
+			echo "go" >> $REORGSQL
+			echo "select convert(char,getdate(),9)" >> $REORGSQL
+			echo "go" >> $REORGSQL
+			echo "exec sp_spaceused $TABLE,1" >> $REORGSQL
+			echo "go" >> $REORGSQL
+
+##			echo "exec sp_recompile $TABLE" >> $REORGSQL
+##			echo "go" >> $REORGSQL
+
+			echo "exec sp_dbfull $DBNAME" >> $REORGSQL
+			echo "go" >> $REORGSQL
+			if [ $SIBC -eq 1 ]
+			then
+				echo "use master" >> $REORGSQL
+				echo "go" >> $REORGSQL
+				echo "exec sp_dboption $DBNAME,bulkcopy,false" >> $REORGSQL
+				echo "go" >> $REORGSQL
+			fi
+		done
+	else
+		echo "No tables in worklist" | tee -a $RPTFILE
+	fi
+	echo "`date` FORMAT SQL COMPLETE" >> $RPTFILE
+fi
+
+#------------------------------------------------------------------------------
+# If RUN=1, execute the SQL to run reorg rebuild - use sqlTimer.scr
+# Check for errors -- always send mail, send page if page flag set
+# If error occurs, stop at that point and don't try to do any more tables---because they will probably fail too
+#------------------------------------------------------------------------------
+if [ $RUN -eq 1 ]
+then
+	echo "`date` EXECUTE SQL" >> $RPTFILE
+	echo "`date` Reorging the following tables (in order listed):" >> $RPTFILE
+	cat $WORKLIST >> $RPTFILE
+	if [ -s $WORKLIST ]
+	then
+		cat $WORKLIST |
+		while read TABLE
+		do
+			echo "`date` REORGING $TABLE" >> $RPTFILE
+			export REORGSQL=$SQLDIR/$DBSERVER/$DBSERVER.$DBNAME.$TABLE.reorg.sql
+			export REORGOUT=$LOGDIR/reorg/$DBSERVER/$DBSERVER.$DBNAME.$TABLE.reorg.$DATETIME
+
+			export REORGRC=0
+			> $REORGOUT
+			$SCRDIR/sqlTimer.scr -S $DBSERVER -i $REORGSQL -o $REORGOUT -m $MAILFILE
+			if [ $? -ne 0 ]
+			then
+				export REORGRC=1
+				cat $REORGOUT >> $RPTFILE
+				echo "ERROR reorging $DBSERVER:$DBNAME:$TABLE" >> $RPTFILE
+				export MAILSUBJECT="ERROR reorging $DBSERVER:$DBNAME:$TABLE"
+				cat $REORGOUT > $MAILFILE
+				sendMail
+
+				if [ "$PAGEDEST" ]
+				then
+					echo "ERROR reorging $DBSERVER:$DBNAME:$TABLE" > $PAGEMSG
+					sendPage
+				fi
+				echo "`date` ABORTING reorgs for database $DBNAME" >> $RPTFILE
+				exit 1
+			else
+				cat $REORGOUT >> $RPTFILE
+			fi
+		done
+	fi
+
+	echo "`date` EXECUTE SQL COMPLETE" >> $RPTFILE
+	exit 0
+else
+	exit 0
+fi

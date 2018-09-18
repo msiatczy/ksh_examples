@@ -1,0 +1,184 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getLastLoginDate.scr -S <DBSERVER>|all -L <login|list of logins>
+#
+#  Description: Get the last login date for one or more logins on one or more DBSERVERs
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - DBSERVER|all
+#		<login|list> - single login or path to list of logins to check
+#
+#  Modification History:
+#       11/03/09 M. Siatczynski Initial script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER>|all -L <login|list of logins>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export ONEDBSERVER=$2;shift 2;;
+			-L)		export LOGINSPEC=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$ONEDBSERVER" -o ! "$LOGINSPEC" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserver.lst.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export LOGINLIST=/tmp/loginlist.$$
+export HIGHRC=0
+export LOGFILE=$LOGDIR/useradmin/central/getLastLoginDate.$DATETIME
+
+#--------------------------------------------------------------------------
+#  Build server list
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAse15List > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $LOGINLIST && \rm -f $LOGINLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# format list of logins
+#------------------------------------------------------------------------------
+# make sure control file exists and has entries
+if [ -f $LOGINSPEC ]
+then
+	if [ -s $LOGINSPEC ]
+	then
+		cat $LOGINSPEC > $LOGINLIST
+	else
+		echo "ERROR - $LOGINSPEC is 0 bytes"
+		exit 1
+	fi
+else
+# make sure the loginspec doesn't contain slashes--otherwise it may be an invalid file reference
+	echo $LOGINSPEC | grep '/' > /dev/null
+	if [ $? -eq 0 ]
+	then
+		echo "ERROR - $LOGINSPEC is not valid--possible invalid filename?"
+		exit 1
+	else
+		echo $LOGINSPEC > $LOGINLIST
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Check last login date on the following ASEs:" >> $LOGFILE
+cat $DBSERVERLIST >> $LOGFILE
+echo "\nFor the following list of logins:" >> $LOGFILE
+cat $LOGINLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Format the SQL
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "use master" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+echo "select @@servername,name,lastlogindate" >> $SQLFILE
+echo "from master..syslogins" >> $SQLFILE
+echo "where name in (" >> $SQLFILE
+export FIRSTLOGIN=1
+cat $LOGINLIST |
+while read LOGIN
+do
+	test $FIRSTLOGIN -eq 0 && echo ",\"$LOGIN\"" >> $SQLFILE || echo "\"$LOGIN\"" >> $SQLFILE
+	test $FIRSTLOGIN -eq 1 && export FIRSTLOGIN=0
+done
+
+echo ")" >> $SQLFILE
+echo "order by name" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# Execute the SQL on each DBSERVER
+# append the output to the logfile
+#------------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password: | sed -e 's/^ //g'  > $SQLOUT
+
+#------------------------------------------------------------------------------
+# Check for errors
+#------------------------------------------------------------------------------
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+	fi
+
+#------------------------------------------------------------------------------
+# write trailers for ASE
+#------------------------------------------------------------------------------
+	if [ ! -s $SQLOUT ]
+	then
+		echo "$DBSERVER - Login(s) not valid on this ASE." >> $LOGFILE
+	else
+		cat $SQLOUT >> $LOGFILE
+	fi
+done
+
+#------------------------------------------------------------------------------
+# write final trailer 
+#------------------------------------------------------------------------------
+echo "\n`date` END Check last login date" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+        echo "Script FAILED - output in $LOGFILE"
+        exit 1
+else
+        echo "Script SUCCESSFUL - output in $LOGFILE"
+	cat $LOGFILE
+        exit 0
+fi

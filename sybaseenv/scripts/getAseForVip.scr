@@ -1,0 +1,141 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getAseForVip.scr -U <user> -V <VIP>|all {-o <output file>}
+#
+#  Description: Get the actual ASE name associated with a virtual name
+#
+#     Location:	/sccm/dba/sybase/scripts/getAseForVip.scr
+#
+#    Called by:	DBM_dba_sybGetAseForVip
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<user> - login of the user running the add
+#		<login> - login to be added
+#		<password> - password for the newly added login
+#
+#  NOTE:  This script should be executable by anyone (world).
+#
+#  Modification History:
+#	01/16/04 M. Siatczynski	Initial Script
+#	06/21/04 M. Siatczynski	Include space after grep of server from VIPSERVERLIST
+#	09/22/05 M. Siatczynski	Changed USER to EXEUSER (USER is a unix env variable)
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	03/02/06 M. Siatczynski	Eliminate PWDFILE and code for checking user=sa, convert -all to -V parm value
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -U <user> -V <VIP>|all {-o <output file>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-U)		export EXEUSER=$2;shift 2;;
+			-V)		export ONEVIP=$2;shift 2;;
+			-o)		export OUTFILE=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+#------------------------------------------------------------------------------
+# Validate parameters
+#------------------------------------------------------------------------------
+
+# highest return code
+export HIGHRC=0
+
+# user  and VIP must be passed
+if [ ! "$EXEUSER" -o ! "$ONEVIP" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#-------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/getAseForVip.$MMYYYY
+export SQLOUT=/tmp/sqlout.$$
+export VIPLIST=/tmp/viplist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLOUT && \rm -f $SQLOUT
+	test $VIPLIST && \rm -f $VIPLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Generate list of servers to process
+#--------------------------------------------------------------------------
+
+if [ "$ONEVIP" = "all" ]
+then   
+        getVipList > $VIPLIST
+else
+        grep "^${ONEVIP} " $VIPSERVERLIST | cut -d" " -f1 > $VIPLIST
+	if [ ! -s $VIPLIST ]
+	then
+		echo "ERROR - $ONEVIP is not a valid virtual server in $VIPSERVERLIST"
+		exit 1
+	fi
+fi
+ 
+#------------------------------------------------------------------------------
+# If an output file was specified, initialize it.
+# Run the sql to get the ASE name(s)
+#------------------------------------------------------------------------------
+test "$OUTFILE" && > $OUTFILE
+
+cat $VIPLIST |
+while read VIP
+do
+	export VIP
+
+	$ISQLEXE -U$EXEUSER -S$VIP -w200 -b <<-! | grep -v Password | sed 's/^ //g' > $SQLOUT
+	`getPass $VIP $EXEUSER`
+	set nocount on
+	go
+	select "$VIP"+","+@@servername+","+"Sybase"
+	go
+	!
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		test "$OUTFILE" && echo "$VIP,Unknown,Sybase" >> $OUTFILE || echo "$VIP,Unknown,Sybase"
+	else
+		test "$OUTFILE" && cat $SQLOUT >> $OUTFILE || cat $SQLOUT
+	fi
+
+# write the results to the log file regardless of success or failure
+	print -n "`date '+%D %T'` Getting ASE for $VIP : " >> $LOGFILE
+	cat $SQLOUT >> $LOGFILE
+done
+
+#------------------------------------------------------------------------------------------
+# exit with final return code
+#------------------------------------------------------------------------------------------
+if [ $HIGHRC -eq 0 ]
+then
+        exit 0
+elif [ $HIGHRC -eq 1 ]
+then
+        exit 1
+else
+        echo "HIGHRC unknown"
+fi

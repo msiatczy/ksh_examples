@@ -1,0 +1,218 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: manageDir.scr -dir <directory> {-pctalarm <alarm pct> -days <days to keep> -size <size of file #c> -m <maildest> -p <pagedest> -clean -mailrpt}
+#
+#  Description: Manage filesystems used in the Sybase environment
+#		Monitor and alarm on space usage
+#		Cleanup old files - only valid when days or size is specified
+#		Report on files which meet criteria
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<dir> - directory to check
+#              	<pctalarm> - FS pct full threshold at which to alarm
+#              	<days> - check for files older than n days
+#              	<size> - check for files equal to n size - size must be specified in format compatible with find format
+#		<clean> - remove files - only valid with days or size
+#		<maildest> - override default maildest
+#		<pagedest> - send page for pctalarm only - no page will be sent if parm not supplied
+#		<mailrpt> - mail report of files which match criteria - usually NOT used with -clean
+#
+#  Modification History:
+#	10/01/10 M. Siatczynski	Rewrite cleanDir.scr
+#	02/15/11 M. Siatczynski	Profile source accommodates AMG East
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+## unset the centrally-set PAGEDEST variables - setting determines whether or not to send page
+unset PAGEDEST
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -dir <directory> {-pctalarm <alarm pct> -days <days to keep> -size <size of file #c> -m <maildest> -p <pagedest> -clean -mailrpt}\nIn addition to -dir, at least one of the following MUST be passed: -pctalarm, -days, -size"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -dir)		export DIR=$2;shift 2;;
+                        -days)		export NUMDAYS=$2;shift 2;;
+                        -size)		export FSIZE=$2;shift 2;;
+                        -pctalarm)	export PCTALARM=$2;shift 2;;
+                        -m)		export MAILDEST=$2;shift 2;;
+                        -p)		export PAGEDEST=$2;shift 2;;
+                        -clean)		export CLEAN=1;shift 1;;
+                        -mailrpt)	export MAILRPT=1;shift 1;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+# Validate the directory passed
+if [ ! "$DIR" ]
+then
+        echo $USAGE
+        exit 1
+else
+	if [ ! -d $DIR ]
+	then
+		echo "ERROR - $DIR is not a valid directory"
+		exit 1
+	fi
+fi
+
+# Validate parms - at least one of these 3 must be passed
+if [ ! "$PCTALARM" -a ! "$FSIZE" -a ! "$NUMDAYS" ]
+then
+        echo $USAGE
+	echo "ERROR - At least one parm MUST be passed: -days, -size, -pctalarm"
+	exit 1
+fi
+
+test ! "$CLEAN" && export CLEAN=0
+
+# CLEAN=1 only valid with NUMDAYS or FSIZE
+if [ $CLEAN -eq 1 ]
+then
+	if [ ! "$NUMDAYS" -a ! "$FSIZE" ]
+	then
+		echo "ERROR - clean only valid with -days or -size"
+		exit 1
+	fi
+fi
+
+test ! "$MAILRPT" && export MAILRPT=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/manageDir.$DATETIME.$$
+export TMPLIST=/tmp/tmplist.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TMPLIST && \rm -f $TMPLIST
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Write headers
+#  Only remove files if -clean is passed
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` $CALLED\n" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+#  Format execution string
+#  Exclude .shapshot directory from search
+#  If -days or -size passed, format execution string based on these parms
+#  If not passed, all we're doing is a space check -- farther below
+#  If -clean passed, append rm to string
+#  Include $HOST in mail and pages
+#--------------------------------------------------------------------------
+if [ "$NUMDAYS" -o "$FSIZE" ]
+then
+	export EXESTRING="find $DIR -name .snapshot -prune -o -type f"
+	test "$NUMDAYS" && export EXESTRING="$EXESTRING -mtime +$NUMDAYS"
+	test "$FSIZE" && export EXESTRING="$EXESTRING -size $FSIZE"
+	export EXESTRING="$EXESTRING -print"
+
+#  If -clean passed, append rm to string
+#  Get the disk usage before any cleanup
+	if [ $CLEAN -eq 1 ]
+	then
+# NOTE: fully qualify call to rm to avoid alias overrides
+		export EXESTRING="$EXESTRING -exec /bin/rm -f {} \;"
+		echo "\nDisk usage:\n" >> $LOGFILE
+		df -k $DIR >> $LOGFILE
+		echo "\nclean parameter passed - files will be REMOVED\n" >> $LOGFILE
+	fi
+
+# execute string
+# NOTE:  eval must be used to find string is interpretted correctly
+	echo "Executing $EXESTRING" >> $LOGFILE
+	eval $EXESTRING > $TMPLIST
+	test $? -gt $HIGHRC && export HIGHRC=$?
+
+	if [ -s $TMPLIST ]
+	then
+		echo "\nThe following files meet the search criteria:" >> $LOGFILE
+		cat $TMPLIST >> $LOGFILE
+# if this was a clean request, check disk space after
+		if [ $CLEAN -eq 1 ]
+		then
+			echo "\nDisk usage:\n" >> $LOGFILE
+			df -k $DIR >> $LOGFILE
+		fi
+
+# if -mailrpt specified, send email of matching files
+		if [ $MAILRPT -eq 1 ]
+		then
+			echo "\nSending report to $MAILDEST" >> $LOGFILE
+			export MAILSUBJECT="REPORT: $HOST:$DIR file management"
+			export MAILFILE=$LOGFILE
+			sendMail
+		fi
+	else
+		echo "\nNo files meet search criteria" >> $LOGFILE
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  If parm passed, check percent full for filesystem
+#  If percent full > PCTALARM then send mail. If PAGEDEST set, send page.
+#  Include $HOST in message - this helps indicate which NFS env is affected.
+#--------------------------------------------------------------------------
+if [ "$PCTALARM" ]
+then
+#  Get the disk usage, if not already performed above with CLEAN=1
+	if [ $CLEAN -eq 0 ]
+	then
+		echo "\nDisk usage:" >> $LOGFILE
+		df -k $DIR >> $LOGFILE
+	fi
+	export PCTFULL=`df -k $DIR | grep -v '^Filesystem' | sed -e 's/  */ /g' | cut -d" " -f5 | sed -e 's/%//g'`
+
+	if [ $PCTFULL -gt $PCTALARM ]
+	then
+		echo "\nWARNING: Filesystem usage (${PCTFULL}%) exceeds threshold (${PCTALARM}%)" >> $LOGFILE
+		export MAILSUBJECT="WARNING: $HOST:$DIR > ${PCTALARM}%"
+		export MAILFILE=$LOGFILE
+		sendMail
+
+		if [ "$PAGEDEST" ]
+		then
+			echo "`date` WARNING: $HOST:$DIR usage ${PCTFULL}% > ${PCTALARM}%" > $PAGEMSG
+			sendPage
+		fi
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# Exit with return status from find command
+#--------------------------------------------------------------------------
+echo "\n`date` Script END (HIGHRC=$HIGHRC)" >> $LOGFILE
+exit $HIGHRC

@@ -1,0 +1,23 @@
+#!/bin/ksh
+
+# Backup control directory before running!!!
+
+export SEDFILE=/tmp/sed.file.$$
+export SQLBTCTLDIR=/dbms/syb/IDTDEV/sqlbt4.6/sbackups.physical/IDTDEV
+
+#> $SEDFILE
+#echo '/dumpcommand=dtsdump $type $server $database/a\' >> $SEDFILE
+#echo '  dumpoptions=-compress' >> $SEDFILE
+
+#exit
+
+cd $SQLBTCTLDIR
+ls |
+while read FILE
+do
+	export FILE
+	echo $FILE
+	sed -e 's/default_backup_pool=EBS/default_backup_pool=Tape_to_900/g' $FILE > $FILE.new
+#	sed -f $SEDFILE $FILE > $FILE.new
+	mv $FILE.new $FILE
+done

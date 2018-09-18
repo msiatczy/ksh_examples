@@ -1,0 +1,185 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: RSadminDiskSpace.scr -S <repserver> {-m <maildest> -p <pagedest> -qpct <queue pct full>}
+#
+#  Description: Report on stable device utilization for the Rep Server
+#
+#     Location:	/sccm/dba/sybase/scripts/RSadminDiskSpace.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<REPSERVER> - Rep Server
+#
+#
+#  Modification History:
+#	02/10/03 M. Siatczynski	Rewrite original script
+#	02/19/03 M. Siatczynski	"Ping" the repserver before trying to query it
+#	04/02/04 M. Siatczynski	Reformat the mail report so we only get the section
+#				which exceeds space limits, not the whole report to date
+#				Update to use sendMail and sendPage
+#				Replace separate ping with checkSqlErr
+#	08/23/04 M. Siatczynski	Write report to repserver subdirectory
+#	03/22/05 M. Siatczynski	Added -qpct flag for the queue full pct at which dba should be notified
+#	04/08/05 M. Siatczynski	Change page/mail message to send actual pct full
+#	08/02/05 M. Siatczynski	Changed RPTFILE location
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+export USAGE="ERROR - Usage: $0 -S <REPSERVER> {-m <maildest> -p <pagedest> -qpct <queue pct full>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export REPSERVER=$2;shift 2;;
+	                -m)	export MAILDEST=$2;shift 2;;
+	                -p)	export PAGEDEST=$2;shift 2;;
+	                -qpct)	export QPCT=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+# repserver must be passed
+if [ ! $REPSERVER ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+# default queue pct full to 50 if not passed
+test ! "$QPCT" && export QPCT=50
+
+#--------------------------------------------------------------------------
+#  Initialize variable and write report headers
+#--------------------------------------------------------------------------
+
+#integer USED TOTALUSED CONFIGURED 
+
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export TEMPDS=/tmp/ds.$$
+export SQLOUT=/tmp/sqlout.$$
+export TEMPFILE=/tmp/tempfile.$$
+export RPTFILE=$RPTDIR/replication/adminDiskSpace/$REPSERVER/$REPSERVER.RSadminDiskSpace.$MMDDYYYY
+
+#--------------------------------------------------------------------------
+# Write report headers to temp file
+#--------------------------------------------------------------------------
+> $TEMPFILE
+echo "REPORT START `date`\n" >> $TEMPFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TEMPDS && \rm -f $TEMPDS
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $TEMPFILE && \rm -f $TEMPFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Get stable queue usage
+#  If any errors, send mail and exit
+#--------------------------------------------------------------------------
+$ISQLEXE -U$ADMINLOGIN -S$REPSERVER -b -w500 <<-! | grep -v Password > $SQLOUT
+	`getPass $REPSERVER $ADMINLOGIN`
+	admin disk_space
+	go
+	!
+
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	> $MAILFILE
+	echo "`date`:  Unable to connect to $REPSERVER" >> $MAILFILE
+	cat $SQLOUT >> $MAILFILE
+	cat $MAILFILE >> $RPTFILE
+	export MAILSUBJECT="$REPSERVER Unable to get disk_space"
+	sendMail
+	exit 1
+else
+	cut -c256-500 $SQLOUT > $TEMPDS
+	cat $TEMPDS >> $TEMPFILE
+fi
+
+#--------------------------------------------------------------------------
+#  Calculate usage
+#  If any single queue is >= 1800 set flag to send an email
+#--------------------------------------------------------------------------
+MAILFLAG=0
+TOTAL_USED=0
+TOTAL_CONFIGURED=0
+
+cat $TEMPDS |
+while read LINE
+do
+	export LINE
+	export CONFIGURED=`echo $LINE | nawk '{print $3}'`
+	export USED=`echo $LINE | nawk '{print $4}'`
+	export TOTAL_CONFIGURED=`expr $TOTAL_CONFIGURED + $CONFIGURED`
+	export TOTAL_USED=`expr $TOTAL_USED + $USED`
+	test $USED -gt 1800 && export MAILFLAG=1
+done
+
+export PERCENT=`echo "$TOTAL_USED*100/$TOTAL_CONFIGURED" | bc`
+
+#--------------------------------------------------------------------------
+#  Write report trailers
+#--------------------------------------------------------------------------
+echo "\n\n         TOTAL SEGMENTS USED [MB]:      $TOTAL_USED\n" >> $TEMPFILE
+echo "         TOTAL SEGMENTS CONFIGURED[MB]: $TOTAL_CONFIGURED\n" >> $TEMPFILE
+echo "         --------------------------------------\n" >> $TEMPFILE
+echo "         TOTAL PERCENT:                 ${PERCENT}%\n" >> $TEMPFILE
+echo "\nREPORT END `date`" >> $TEMPFILE
+echo "-----------------------------------------------------------------------------------------" >> $TEMPFILE
+
+#--------------------------------------------------------------------------
+#  Concatenate the temp report to the running report file
+#--------------------------------------------------------------------------
+cat $TEMPFILE >> $RPTFILE
+
+#--------------------------------------------------------------------------
+#  Send email/page, if threshold exceeded or mailflag set
+#--------------------------------------------------------------------------
+if [ $PERCENT -gt $QPCT ]
+then
+	export MAILFLAG=1
+
+	if [ "$PAGEDEST" ]
+	then
+		echo "`date` $REPSERVER Queue usage = $PERCENT%" > $PAGEMSG 
+		sendPage
+	fi
+fi
+
+if [ $MAILFLAG -eq 1 ]
+then
+	cat $TEMPFILE > $MAILFILE
+	export MAILSUBJECT="$REPSERVER Queue usage = $PERCENT%"
+	sendMail
+fi
+
+#--------------------------------------------------------------------------
+#  Always exit with 0 if a report was successfully generated
+#--------------------------------------------------------------------------
+exit 0

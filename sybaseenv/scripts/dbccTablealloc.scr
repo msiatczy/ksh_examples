@@ -1,0 +1,154 @@
+#!/bin/ksh 
+#--------------------------------------------------------------------------
+#        Usage: dbccTablealloc -S <DBSERVER> -D <dbname> -T <table> {-single -nofix -m <maildest> -p <pagedest>}
+#
+#  Description: Run dbcc tablealloc against specific database/table
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	DBSERVER - database server
+#              	DBNAME - database name
+#              	TABLE - list of databases
+#              	SINGLE - flag to put database in single user mode
+#              	FIX - flag to specify fix option
+#              	MAILDEST - override default maildest of dba
+#              	PAGEDEST - page destination/flag
+#
+#
+#  Modification History:
+#	02/25/05 M. Siatczynski	Original script (copied from checkstorage)
+#	04/28/05 M. Siatczynski	Add -fix parm
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname> -T <table> {-single -nofix -m <maildest> -p <pagedest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -T)     export TABLE=$2;shift 2;;
+                        -single)     export SINGLE=1;shift 1;;
+                        -nofix)   export FIX=0;shift 1;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -p)     export PAGEDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBNAME" -o ! "$TABLE" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+test ! "$SINGLE" && export SINGLE=0
+test ! "$FIX" && export FIX=1
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export ERRORFLAG=0
+export DBCCSQL=/tmp/dbccsql.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export LOGFILE=$LOGDIR/dbcc/$DBSERVER/$DBSERVER.$DBNAME.dbccTablealloc.$DATETIME
+
+> $LOGFILE
+> $MAILFILE
+
+echo "SCRIPT START: `date`" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBCCSQL && \rm -f $DBCCSQL
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Execute tablealloc
+#  This single user logic should be improved--the database will still be checked
+#  even if the database can't be put in single user mode, but the output will report errors.
+#  If FIX=0, then specify nofix (default is fix)
+#  Default mode is currently full (parm would need to be added to accommodate other modes)
+#--------------------------------------------------------------------------
+> $DBCCSQL
+if [ $SINGLE -eq 1 ]
+then
+	echo "use master" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+	echo "sp_dboption $DBNAME,single,true" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+	echo "use $DBNAME" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+	echo "checkpoint" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+
+	test $FIX -eq 0 && echo "dbcc tablealloc ($TABLE,full,nofix)" >> $DBCCSQL || echo "dbcc tablealloc ($TABLE)" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+
+	echo "use master" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+	echo "sp_dboption $DBNAME,single,false" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+	echo "use $DBNAME" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+	echo "checkpoint" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+else
+	echo "use $DBNAME" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+	test $FIX -eq 0 && echo "dbcc tablealloc ($TABLE,full,nofix)" >> $DBCCSQL || echo "dbcc tablealloc ($TABLE)" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+fi
+
+$SCRDIR/sqlTimer.scr -S $DBSERVER -i $DBCCSQL -o $LOGFILE -m $MAILFILE
+if [ $? -ne 0 ]
+then
+	export ERRORFLAG=1
+fi
+
+echo "SCRIPT END: `date`" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# If there were any failures, send email
+# If a page destination is set, then send a page
+#--------------------------------------------------------------------------
+if [ $ERRORFLAG -eq 1 ]
+then
+	echo "\nNOTE: Check $LOGFILE for further details.\n" >> $MAILFILE
+	export MAILSUBJECT="$DBSERVER DBCC TABLEALLOC FAILED"
+	sendMail
+	if [ "$PAGEDEST" ]
+	then
+		echo "$DBSERVER DBCC TABLEALLOC FAILED" > $PAGEMSG
+		sendPage
+	fi
+	exit 1
+else
+	exit 0
+fi

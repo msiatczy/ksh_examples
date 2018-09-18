@@ -1,0 +1,295 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: bcpIn.scr -S <DBSERVER> -D <dbname> -T <table>|<list of tables> -datdir <datdir> {-datfile <filename> -trunc -b <batch size> -F <first row> -A <packet size> -pagedone <pagedest>}
+#
+#  Description: truncate and bcp in one or more tables in a database
+#
+#  NOTE:  defaults:  character format, columns delimted by "^^", rows detlimited by "++\n", batch size defaults to 1000
+#
+#     Location:	/sccm/dba/sybase/scripts/bcpIn.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - short description of parm if not obvious
+#              	<dbname> - database name
+#              	<T> - single table or list of tables
+#              	<datdir> - directory where data file resides
+#              	<datdir> - specific data file name - allows for rerun of job
+#              	<trunc> - flag to truncate tables
+#              	<b> - batch size
+#              	<A> - packet size
+#
+#  Modification History:
+#	05/25/05 M. Siatczynski	Original script
+#       11/03/05 M. Siatczynski Added ++\n as row delimiter so this can be used for most tables
+#       02/13/06 M. Siatczynski Implement ISQLEXE, getPass, ADMINLOGIN
+#       02/21/06 M. Siatczynski Add -X to bcp (security)
+#       07/03/06 M. Siatczynski Add -D <dbname> parm
+#	12/29/06 M. Siatczynski	Change -L parm to -T parm and allow for single table or list of tables, add -A parm, change -from to -datdir, add -datfile, add -b parm
+#	06/18/07 M. Siatczynski	Add -F parm to allow copy to start from n row in the input file
+#	09/29/08 M. Siatczynski	Add -e <errfile> to bcp command for troubleshooting purposes
+#	12/04/08 M. Siatczynski	Change exits to 2 (error) and 1 (warning), to allow warning for empty bcp file
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname> -T <table>|<list of tables> -datdir <datdir> {-datfile <filename> -trunc -b <batch size> -F <first row> -A <packet size> -pagedone <pagedest>}"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 2
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -T)     export TABLESPEC=$2;shift 2;;
+                        -datdir)  export DATDIR=$2;shift 2;;
+                        -datfile)   export DATFILESPEC=$2;shift 2;;
+                        -trunc) export TRUNC=1;shift 1;;
+                        -b)	export BATCHSIZE=$2;shift 2;;
+                        -F)	export FIRSTROW=$2;shift 2;;
+                        -A)	export PKTSIZE=$2;shift 2;;
+                        -pagedone)  export PAGEDONE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 2;;
+                        *)      echo $USAGE;exit 2;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBNAME" -o ! "$TABLESPEC" -o ! "$DATDIR" ]
+then
+	echo $USAGE
+	exit 2
+fi
+
+if [ ! -d $DATDIR ]
+then
+	echo "ERROR - $DATDIR is not a valid directory"
+	exit 2
+fi
+
+# if batch size is specified, format BATCHSPEC
+if [ "$BATCHSIZE" ]
+then
+	export BATCHSPEC="-b $BATCHSIZE"
+else
+	export BATCHSPEC="-b 1000"
+fi
+
+# if first row is specified, format FIRSTROWSPEC
+if [ "$FIRSTROW" ]
+then
+	export FIRSTROWSPEC="-F $FIRSTROW"
+else
+	export FIRSTROWSPEC=""
+fi
+
+# if packet size is specified, format PACKETSPEC
+if [ "$PKTSIZE" ]
+then
+	export PACKETSPEC="-A $PKTSIZE"
+else
+	export PACKETSPEC=""
+fi
+
+test ! "$TRUNC" && export TRUNC=0
+
+#--------------------------------------------------------------------------
+#  Initialize and validate Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.$DBNAME.bcpIn.$DATETIME
+export HIGHRC=0
+
+export TEMPOUT=/tmp/tempout.$$
+export TABLELIST=/tmp/tablelist.$$
+export TRUNCSQL=/tmp/truncsql.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export ERRFILE=/tmp/errfile.$$
+
+
+# validate single table or list of tables
+if [ "$TABLESPEC" ]
+then
+# if the login spec is a file, validate the file contains something
+        if [ -f $TABLESPEC ]
+        then
+                if [ -s $TABLESPEC ]
+                then
+                        cat $TABLESPEC > $TABLELIST
+# if the tablelist is valid, verify a specific datfile name was not passed -- only valid with single table
+                        if [ "$DATFILESPEC" ]
+			then
+                        	echo "ERROR - datfile name can only be specified when single table is passed"
+	                        exit 2
+			fi
+                else
+                        echo "WARNING - $TABLESPEC is 0 bytes"
+                        exit 1
+                fi
+        else
+# make sure the loginspec doesn't contain slashes--otherwise it may be an invalid file reference
+# if it doesn't contain slashes, then it's probably a login name
+                echo $TABLESPEC | grep '/' > /dev/null
+                if [ $? -eq 0 ]
+                then
+                        echo "ERROR - $TABLESPEC is not valid--possible invalid filename?"
+                        exit 1
+                else
+                        echo $TABLESPEC > $TABLELIST
+                fi
+        fi
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $TEMPOUT && \rm -f $TEMPOUT
+	test $TABLELIST && \rm -f $TABLELIST
+	test $TRUNCSQL && \rm -f $TRUNCSQL
+	test $PAGEMSG && \rm -f $PAGEMSG
+	test $ERRFILE && \rm -f $ERRFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+> $LOGFILE
+#------------------------------------------------------------------------------------
+# if truncate flag passed, format and execute truncate sql
+# check for errors
+#------------------------------------------------------------------------------------
+if [ $TRUNC -eq 1 ]
+then
+	echo "`date` TRUNCATE the following tables:" >> $LOGFILE
+	cat $TABLELIST >> $LOGFILE
+
+	> $TRUNCSQL
+
+	cat $TABLELIST |
+	while read TABLE
+	do
+		echo "use $DBNAME" >> $TRUNCSQL
+		echo "go" >> $TRUNCSQL
+		echo "truncate table $DBNAME..$TABLE" >> $TRUNCSQL
+		echo "go" >> $TRUNCSQL
+	done
+
+	> $TEMPOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e -i $TRUNCSQL | grep -v Password >> $TEMPOUT
+
+	cat $TEMPOUT >> $LOGFILE
+
+	checkSqlErr $TEMPOUT
+	if [ $? -eq 1 ]
+	then
+	        echo "Truncate FAILED" >> $LOGFILE
+	        export HIGHRC=2
+	else
+	        echo "Truncate SUCCESSFUL" >> $LOGFILE
+	fi
+
+	echo "`date` TRUNCATE COMPLETE" >> $LOGFILE
+else
+	echo "`date` Tables will NOT be truncated." >> $LOGFILE
+fi
+
+#------------------------------------------------------------------------------------
+# bcp in
+# only attempt bcp in if HIGHRC=0, otherwise, it means truncate failed
+# check for bcp errors
+#------------------------------------------------------------------------------------
+if [ $HIGHRC -eq 0 ]
+then
+	echo "`date` START BCP IN of the following tables to $DBSERVER.$DBNAME:" >> $LOGFILE
+	cat $TABLELIST >> $LOGFILE
+
+	cat $TABLELIST |
+	while read TABLE
+	do
+		export TABLE
+		if [ "$DATFILESPEC" ]
+		then
+			export DATFILE=$DATDIR/$DATFILESPEC
+		else
+			export DATFILE=$DATDIR/$DBSERVER.$DBNAME.$TABLE.dat
+		fi
+# validate DATFILE
+                if [ -f $DATFILE ]
+		then
+	                if [ ! -s $DATFILE ]
+			then
+				echo "WARNING - TABLE:$TABLE DATFILE:$DATFILE IS EMPTY" >> $LOGFILE
+				export HIGHRC=1
+				continue
+			fi
+		else
+			echo "ERROR - TABLE:$TABLE DATFILE:$DATFILE DOES NOT EXIST" >> $LOGFILE
+			export HIGHRC=2
+			continue
+		fi
+
+		> $TEMPOUT
+		> $ERRFILE
+		echo "\n`date` START bcp in TABLE:$TABLE using DATFILE:$DATFILE" >> $LOGFILE
+		getPass $DBSERVER $ADMINLOGIN | $OCSBIN/bcp ${DBNAME}..${TABLE} in ${DATFILE} -c -t"^^" -r"++\n" $BATCHSPEC $FIRSTROWSPEC $PACKETSPEC -X -e $ERRFILE -U$ADMINLOGIN -S$DBSERVER >> $TEMPOUT
+
+		cat $TEMPOUT >> $LOGFILE
+
+		checkBcpErr $TEMPOUT
+		if [ $? -eq 1 ]
+		then
+			echo "\n`date` END bcp in FAILED for TABLE:$TABLE" >> $LOGFILE
+			if [ -s $ERRFILE ]
+			then
+				echo "The following rows were recorded in the ERROR FILE:" >> $LOGFILE
+				cat $ERRFILE >> $LOGFILE
+			fi
+		        export HIGHRC=2
+		else
+			echo "\n`date` END bcp in SUCCESSFUL for TABLE:$TABLE" >> $LOGFILE
+		fi
+	done
+else
+	echo "`date` Truncate FAILED - NO bcp in will be attempted" >> $LOGFILE
+fi
+
+#------------------------------------------------------------------------------
+# send page(s) if applicable
+# format the pagemsg
+# if pagedone, send appropriate page
+#------------------------------------------------------------------------------
+
+if [ "$PAGEDONE" ]
+then
+	if [ $HIGHRC -eq 2 ]
+	then
+		echo "bcpIn FAILED against $DBSERVER.$DBNAME" > $PAGEMSG
+	elif [ $HIGHRC -eq 1 ]
+	then
+		echo "bcpIn WARNINGS against $DBSERVER.$DBNAME" > $PAGEMSG
+	else
+		echo "bcpIn SUCCESSFUL against $DBSERVER.$DBNAME" > $PAGEMSG
+	fi
+        export PAGEDEST=$PAGEDONE
+        sendPage
+fi
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 2 ]
+then
+	echo "`date` END BCP IN COMPLETED with ERRORS" >> $LOGFILE
+	exit 2
+elif [ $HIGHRC -eq 1 ]
+then
+	echo "`date` END BCP IN COMPLETED with WARNINGS" >> $LOGFILE
+	exit 1
+else
+	echo "`date` END BCP IN COMPLETED SUCCESSFULLY" >> $LOGFILE
+	exit 0
+fi

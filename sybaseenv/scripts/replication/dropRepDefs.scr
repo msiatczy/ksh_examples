@@ -1,0 +1,111 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dopRepDefs.scr -RS <REPSERVER> -run
+#
+#  Description: Get list of all replication definitions from latest report file, format and execute drops
+#
+#     Location:	/sccm/dba/sybase/scripts/replication
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<REPSERVER> - repserver
+#
+#  Modification History:
+#	07/08/08 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -RS <REPSERVER> {-run}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -RS)		export REPSERVER=$2;shift 2;;
+	                -run)		export RUN=1;shift 1;;
+	                -*)		echo $USAGE;exit 1;;
+	                *)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+test ! "$RUN" && export RUN=0
+
+if [ ! "$REPSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+export SQLFILE=$SQLDIR/replication/$REPSERVER/$REPSERVER.drop.repDefs.sql
+export LOGFILE=$LOGDIR/replication/$REPSERVER/$REPSERVER.drop.repDefs.$DATETIME
+
+#-----------------------------------------------------------------------
+# Get RSSD name from repDirectory and use it to find the latest report file
+# If generating a control file, remove leading space and convert multiple spaces to single space
+#-----------------------------------------------------------------------
+export RSSD=`grep "^$REPSERVER " $REPDIRLIST | cut -d" " -f9`
+export RPTMASKDIR=$RPTDIR/replication/repDefs/$REPSERVER
+
+if [ ! -d $RPTMASKDIR ]
+then
+	echo "ERROR - $RPTMASKDIR directory does not exist"
+	exit 1
+else
+	if [ ! -z `ls $RPTMASKDIR` ]
+	then
+		export RPTFILE=`ls -tr $RPTMASKDIR/$REPSERVER.$RSSD.repDefs.* | tail -1`
+		if [ ! -f $RPTFILE ]
+		then
+			echo "ERROR - $RPTFILE does not exist"
+			exit 1
+		fi
+	else
+		echo "ERROR - $RPTMASKDIR is empty"
+		exit 1
+	fi
+fi
+
+#-----------------------------------------------------------------------
+# Format sql file
+#-----------------------------------------------------------------------
+> $SQLFILE
+grep 'create replication definition' $RPTFILE | sed -e 's/create replication/drop replication/g' | while read LINE
+do
+	echo $LINE >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#-----------------------------------------------------------------------
+# execute sql file against the replication server
+#-----------------------------------------------------------------------
+if [ $RUN -eq 1 ]
+then
+	echo "Executing SQL to drop repdefs on $REPSERVER..."
+	> $LOGFILE
+	getPass $REPSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$REPSERVER -w200 -i$SQLFILE | grep -v Password >> $LOGFILE
+	
+	checkSqlErr $LOGFILE
+	if [ $? -ne 0 ]
+	then
+	        echo "\nDrop of repdefs FAILED"
+	        echo "Review errors in $LOGFILE\n"
+	        exit 1
+	else
+	        echo "\nDrop of repdefs SUCCESSFUL"
+		exit 0
+	fi
+else
+	echo "SQL FILE created but not executed:  $SQLFILE"
+	exit 0
+fi

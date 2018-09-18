@@ -1,0 +1,71 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkCpu.scr -S <DBSERVER> -d <mmddyy>
+#
+#  Description: Grep average cpu utilization from sysmon files for specific DBSERVER/date
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER>
+#              	<date> - mmddyy
+#
+#  Modification History:
+#	10/18/07 M. Siatczynski	Original script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -d <mmddyy>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -d)    export FILEDATE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$FILEDATE" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export FILEMASK=$PERFDIR/sysmon/$DBSERVER/$DBSERVER.sysmon.*$FILEDATE*.*
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+#function tempCleanup {
+#	test -f $MAILFILE && \rm -f $MAILFILE
+#}
+
+#trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# grep from the sysmon files
+#--------------------------------------------------------------------------
+grep '^                  Average       ' $FILEMASK
+
+#--------------------------------------------------------------------------
+# exit
+#--------------------------------------------------------------------------
+exit 0

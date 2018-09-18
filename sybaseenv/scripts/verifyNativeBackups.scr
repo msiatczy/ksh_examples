@@ -1,0 +1,268 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: verifyNativeBackups.scr -S <DBSERVER>|all | {-m <maildest>}
+#
+#  Description: Verify backups are being run via native backup process for one or more dbservers.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	05/25/10	M. Siatczynski	Initial Script (modified original verifyBackups.scr for SQLBT)
+#  	04/26/11	B. Meggitt	Added logic to check sybdb..dl_dump_opt for missing entries
+#   05/03/11	B. Meggitt  Changed the flow of the program to output only if there is something to report
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|all {-m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserver.lst.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export DUMPSQL=/tmp/dumpsql.$$
+export TRANSQL=/tmp/transql.$$
+export NOBKUPSQL=/tmp/nobkupsql.$$
+export MISSSQL=/tmp/misssql.$$
+
+
+echo "set nocount on" > $MISSSQL
+echo "go" >> $MISSSQL
+echo "exec sybdb.dbo.sp_getDbsMissingDlopts" >> $MISSSQL
+echo "go" >> $MISSSQL
+
+
+echo "set nocount on" >> $DUMPSQL
+echo "go" >> $DUMPSQL
+echo "select convert(char(15),@@servername),convert(char(20),dbname),start_dt,finish_dt,duration_mm=datediff(mi,start_dt,finish_dt),action_type,dump_type" >> $DUMPSQL
+echo "from sybdb..dl_hist h, master..sysdatabases d" >> $DUMPSQL
+echo "where d.name = h.dbname" >> $DUMPSQL
+echo "and action_type = 'DUMP'" >> $DUMPSQL
+echo "and dump_type = 'FULL'" >> $DUMPSQL
+echo "group by dbname having start_dt = max(start_dt) order by dbname, start_dt" >> $DUMPSQL
+echo "go" >> $DUMPSQL
+
+
+echo "set nocount on" >> $TRANSQL
+echo "go" >> $TRANSQL
+echo "select convert(char(15),@@servername),convert(char(20),dbname),start_dt,finish_dt,duration_mm=datediff(mi,start_dt,finish_dt),action_type,dump_type" >> $TRANSQL
+echo "from sybdb..dl_hist h, master..sysdatabases d" >> $TRANSQL
+echo "where d.name = h.dbname" >> $TRANSQL
+echo "and action_type = 'DUMP'" >> $TRANSQL
+echo "and dump_type = 'TRAN'" >> $TRANSQL
+echo "group by dbname having start_dt = max(start_dt) order by dbname, start_dt" >> $TRANSQL
+echo "go" >> $TRANSQL
+
+
+echo "set nocount on" >> $NOBKUPSQL
+echo "go" >> $NOBKUPSQL
+echo "select convert(char(15),@@servername),convert(char(20),name)" >> $NOBKUPSQL 
+echo "from master..sysdatabases" >> $NOBKUPSQL 
+echo "where name not like 'tempdb%' and name not in (select distinct dbname from sybdb..dl_hist) order by name" >> $NOBKUPSQL
+echo "go" >> $NOBKUPSQL
+
+
+export TMPRPT=/tmp/tmprpt.$$
+export MAILFILE=/tmp/mailfile.$$
+export MISSFILE=/tmp/missfile.$$
+export DUMPSTAT=/tmp/dumpstat.$$
+export TRANFILE=/tmp/tranfile.$$
+export NOBKUP=/tmp/nobkup.$$
+
+export RPTFILE=$RPTDIR/backup/central/verifyNativeBackups.$DATETIME
+
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+#  Define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+        test -f $SQLFILE && \rm -f $SQLFILE
+        test -f $SQLOUT && \rm -f $SQLOUT
+        test -f $TMPRPT && \rm -f $TMPRPT
+        test -f $MAILFILE && \rm -f $MAILFILE
+        test -f $MISSFILE && \rm -f $MISSFILE
+        test -f $DUMPSTAT && \rm -f $DUMPSTAT
+        test -f $TRANFILE && \rm -f $TRANFILE
+        test -f $NOBKUP && \rm -f $NOBKUP
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create working list of ASEs
+# Ignore Evergreen ASEs - not currently using this native backup solution
+#------------------------------------------------------------------------------
+test "$ONEDBSERVER" = "all" && getAse15List | egrep -v odydb01 > $DBSERVERLIST || echo $ONEDBSERVER > $DBSERVERLIST
+
+#--------------------------------------------------------------------------
+# Format SQL to check backup information
+# Get most recent full backup
+# Report on databases that do not have an entry in dl_dump_opt for FULL backup
+# Get most recent tran log backup
+# Report on databases that do not have an entry in dl_dump_opt for TRAN backup
+#--------------------------------------------------------------------------
+> $SQLFILE
+> $MISSFILE
+> $DUMPSTAT
+> $TRANFILE
+> $NOBKUP
+
+#--------------------------------------------------------------------------
+# Init report file
+# Execute the SQL against each ASE
+#--------------------------------------------------------------------------
+> $RPTFILE
+> $TMPRPT
+
+
+echo "`date` Verifying native backup info for the following list of ASEs..." >> $RPTFILE
+cat $DBSERVERLIST >> $RPTFILE
+
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+
+> $DUMPSTAT
+> $TRANFILE
+> $MISSFILE
+> $NOBKUP
+
+	export DBSERVER
+
+	#-------------------------------------------
+	#- Running SQL for Dump status
+	#-------------------------------------------
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w500 -i$DUMPSQL | grep -v Password: >> $DUMPSTAT
+
+	checkSqlErr $DUMPSTAT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "`date` Dump Status FAILED for $DBSERVER" | tee -a $RPTFILE
+	fi
+
+	if [ -s $DUMPSTAT ]
+	then
+		echo " " >> $TMPRPT
+		echo "select 'Dump status for the following databases...'" >> $TMPRPT
+		echo " " >> $TMPRPT
+		cat $DUMPSTAT >> $TMPRPT
+	fi
+
+	#-------------------------------------------
+	#- Running SQL for NO Dumps 
+	#-------------------------------------------
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w500 -i$NOBKUPSQL | grep -v Password: >> $NOBKUP
+
+	checkSqlErr $NOBKUP
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "`date` No Dumps FAILED for $DBSERVER" | tee -a $RPTFILE
+	fi
+
+	if [ -s $NOBKUP ] 
+	then
+		echo " " >> $TMPRPT
+		echo "Databases with NO backup..." >> $TMPRPT
+		echo " " >> $TMPRPT
+		cat $NOBKUP >> $TMPRPT
+	fi
+
+	#-------------------------------------------
+	#- Running SQL for Tran log Dumps 
+	#-------------------------------------------
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w500 -i$TRANSQL | grep -v Password: >> $TRANFILE
+
+	checkSqlErr $TRANFILE
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "`date` Backup report FAILED for $DBSERVER" | tee -a $RPTFILE
+	fi
+
+	if [ -s $TRANFILE ] 
+	then
+		echo " " >> $TMPRPT
+		echo "Tran dump status for databases with out trunc log on chkpt turned on..." >> $TMPRPT
+		echo " " >> $TMPRPT
+		cat $TRANFILE >> $TMPRPT
+	fi
+
+	#-------------------------------------------
+	#- Running SQL for Missing dump options 
+	#-------------------------------------------
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w500 -i$MISSSQL | grep -v Password: >> $MISSFILE
+
+	checkSqlErr $MISSFILE
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "`date` Backup report FAILED for $DBSERVER" | tee -a $RPTFILE
+	fi
+
+	if [ -s $MISSFILE ] 
+	then
+		echo " " >> $TMPRPT
+		echo "The following databases do not have an entry in sybdb..dl_dump_opt..." >> $$TMPRPT
+		cat $MISSFILE >> $TMPRPT
+		echo " " >> $TMPRPT
+	fi
+
+done
+
+
+#--------------------------------------------------------------------------
+#  Mail report
+#--------------------------------------------------------------------------
+if [ -s "$TMPRPT" ]
+then
+	> $MAILFILE
+#	echo "\nThe following databases DO NOT have an entry in sybdb..dl_dump_opt...\n" >> $MAILFILE
+	cat $TMPRPT >> $MAILFILE
+	echo "\nFull report found in $RPTFILE" >> $MAILFILE
+
+	export MAILSUBJECT="REPORT: Sybase Native Backups"
+	sendMail
+fi
+
+#------------------------------------------------------------------------------
+# Exit
+#------------------------------------------------------------------------------
+exit $HIGHRC

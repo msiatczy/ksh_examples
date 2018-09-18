@@ -1,0 +1,180 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: monitorLockedLogins.scr -S <DBSERVER> -ctlfile <ctlfile>
+#
+#  Description: Using a control file, monitor specific logins to see if they are locked and notify based on ctl file
+#		Using the control file specified, notify via email when specific logins have become locked out
+#		More than one email address can be notified.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - DBSERVER
+#		<ctlfile> - ctlfile which contains logins/emails of accounts to check
+#
+#  Modification History:
+#       08/17/06 M. Siatczynski Initial script
+#       09/13/06 M. Siatczynski Change email subject/text format
+#       07/26/07 M. Siatczynski Rename script monitorIdtLockedLogins.scr to monitorLockedLogins.scr
+#				Change text and other references to make generic for any server, not just WCM servers
+#       10/04/07 M. Siatczynski 4th column added to ctl file; 4th column is now PAGEGROUP, 3rd column is SUPPORT
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> -ctlfile <ctlfile>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export DBSERVER=$2;shift 2;;
+			-ctlfile)	export CTLFILE=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$DBSERVER" -o ! "$CTLFILE" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# make sure control file exists and has entries
+if [ ! -s $CTLFILE ]
+then
+	echo "ERROR - $CTLFILE does not exist or is 0 bytes"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export LOCKEDLIST=/tmp/lockedlist.$$
+export MAILFILE=/tmp/mailfile.$$
+export CHECKLIST=/tmp/checklist.$$
+export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.monitorLockedLogins.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $LOCKEDLIST && \rm -f $LOCKEDLIST
+	test $MAILFILE && \rm -f $MAILFILE
+	test $CHECKLIST && \rm -f $CHECKLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Format the SQL to check the list of logins
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+grep -v '^#' $CTLFILE | cut -d':' -f1 > $CHECKLIST
+
+cat $CHECKLIST |
+while read LOGIN
+do
+	echo "select name+';'+convert(char(19),pwdate)+';'+" >> $SQLFILE
+	echo "case when status&2=2 then 'ACCOUNTISLOCKED'" >> $SQLFILE
+	echo "else 'ACCOUNTISOPEN'" >> $SQLFILE
+	echo "end" >> $SQLFILE
+	echo "from master..syslogins where name = \"$LOGIN\"" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+done
+
+#------------------------------------------------------------------------------
+# write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Monitor locked logins on $DBSERVER" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# append the output to the logfile
+# Check for errors
+#------------------------------------------------------------------------------
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password: | sed -e 's/^ //g' > $SQLOUT
+
+cat $SQLOUT >> $LOGFILE
+
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	export HIGHRC=1
+	echo "`date` Query FAILED for $DBSERVER" >> $LOGFILE
+	echo "Continuing with next ASE (if any)" >> $LOGFILE
+	continue
+fi
+
+#------------------------------------------------------------------------------
+# Get the locked accounts
+# for each locked account, get the corresponding email and support team from the control file
+#------------------------------------------------------------------------------
+grep 'ACCOUNTISLOCKED' $SQLOUT | cut -d";" -f1,2 > $LOCKEDLIST
+
+if [ -s $LOCKEDLIST ]
+then
+	cat $LOCKEDLIST |
+	while read LINE
+	do
+		export LINE
+		export LOGIN=`echo $LINE | cut -d";" -f1`
+		export PWDATE=`echo $LINE | cut -d";" -f2`
+
+# unset MAILSUBJECT and MAILDEST so they don't accidentally get reused from previous record
+		unset MAILSUBJECT
+		unset MAILDEST
+
+		export EMAILSUPPORT=`grep ^$LOGIN: $CTLFILE | cut -d":" -f2-`
+# NOTE:  following parsed fields don't correspond directly to fields in ctl file, as these are parsed from EMAILSUPPORT variable and not ctl file
+		export EMAIL=`echo $EMAILSUPPORT | cut -d":" -f1`
+		export SUPPORT=`echo $EMAILSUPPORT | cut -d":" -f2`
+		export PAGEGROUP=`echo $EMAILSUPPORT | cut -d":" -f3`
+
+# format and send mail message
+		> $MAILFILE
+		echo "Sybase instance: $DBSERVER  Application: $SUPPORT  Account: $LOGIN  Last Pwd Chg: $PWDATE" >> $MAILFILE
+		export MAILSUBJECT="PAGE $PAGEGROUP OnCall - Sybase account locked, Instance: $DBSERVER"
+		export MAILDEST=$EMAIL
+		sendMail -noheader
+	done
+else
+	echo "`date` No accounts are locked on $DBSERVER" >> $LOGFILE
+fi
+
+echo "`date` END Monitor locked logins" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+        echo "Script FAILED - output in $LOGFILE"
+        exit 1
+else
+        exit 0
+fi

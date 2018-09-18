@@ -1,0 +1,65 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: moveAseCfgFiles.scr
+#  Description: Move old configuration files for DBSERVER
+#     Location: /sccm/dba/sybase/scripts
+#    Called by: AutoSys
+#   Parameters: DBSERVER
+#  Modification History:
+#       12/11/06	K. Hess		Initial script
+#----------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Parameters:  Database server
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>"
+ 
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+ 
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export SETDBSERVER=$DBSERVER
+
+. /sccm/dba/sybase/.dbaSybProfile
+ 
+export RPTFILE=$RPTDIR/misc/$DBSERVER/$DBSERVER.moveAseCfg.$MMDDYYYY
+export CFGBAKDIR=$SYBASE/$SYBASE_ASE/cfg_bak_`date '+%m'`
+
+#----------------------------------------------------------------------------
+#  Verify the cfg_bak_## directory exists; if not, create the directory
+#----------------------------------------------------------------------------
+test ! -d $CFGBAKDIR && mkdir $CFGBAKDIR
+echo $CFGBAKDIR > $RPTFILE
+
+#----------------------------------------------------------------------------
+# Print cfg files to move to current month's backup directory
+#----------------------------------------------------------------------------
+find $SYBASE/$SYBASE_ASE/* -prune -type f -name "$DBSERVER.[0-9][0-9][0-9]" -print >> $RPTFILE
+
+#----------------------------------------------------------------------------
+# Move previous cfg files to current month's backup directory
+#----------------------------------------------------------------------------
+find $SYBASE/$SYBASE_ASE/* -prune -type f -name "$DBSERVER.[0-9][0-9][0-9]" -exec mv {} $CFGBAKDIR/. \;
+
+#--------------------------------------------------------------------------
+#  Cleanup of old files
+#--------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------
+# Exit 0
+#-----------------------------------------------------------------------
+exit 0

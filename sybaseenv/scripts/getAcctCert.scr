@@ -1,0 +1,185 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getAcctCert.scr -S all|<DBSERVER> {-D <dbname> -o <output path/file>}
+#
+#  Description: Get list of all users who have access to a specific database
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER>
+#              	<user> - login with which to connect to the DBSERVER
+#              	<dbname>
+#              	<output path/file> - full path and name of output file
+#
+#  Modification History:
+#	09/26/07 M. Siatczynski	Initial Script
+#	12/27/07 M. Siatczynski	Add LOGFILE, set perms on OUTFILE
+#	05/28/09 M. Siatczynski	Ignore offline databases (status2=16), and databases created for load (status=32)
+#				(status=32 accommodates archive databases not yet loaded)
+#	05/29/09 M. Siatczynski	Updated to call getDbList 
+#	02/16/10 M. Siatczynski	Exclude ASEs in transparencyExclude.lst (to exclude Evergreen ASEs and sandboxes from acct cert process)
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S all|<DBSERVER> {-D <dbname> -o <output path/file}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -o)     export OUTFILE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/dblist.$$
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export EXCLUDE_LIST=$CTLDIR/transparencyExclude.lst
+export SQLFILE=/tmp/sqlfile.$$
+export TEMPOUT=/tmp/tempout.$$
+export LOGFILE=$LOGDIR/useradmin/central/getAcctCert.$DATETIME
+export HIGHRC=0
+
+# if outfile is passed, initialize it and change group ownership/perms
+if [ "$OUTFILE" ]
+then
+	> $OUTFILE
+	chgrp devel $OUTFILE
+	chmod 640 $OUTFILE
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $TEMPOUT && \rm -f $TEMPOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dbserverlist
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+        getAseList | egrep -vf $EXCLUDE_LIST > $DBSERVERLIST
+else
+        echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# Write headers
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Getting Sybase account perms for the following ASEs:" >> $LOGFILE
+cat $DBSERVERLIST >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# For each DBSERVER...
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+
+#--------------------------------------------------------------------------
+# Create a working dblist of all user databases
+#--------------------------------------------------------------------------
+	if [ "$DBNAME" ]
+	then
+		echo $DBNAME > $DBLIST
+	else
+		getDbList -S $DBSERVER -user > $DBLIST
+		if [ $? -eq 1 ]
+		then
+			echo "ERROR - getting DBLIST on $DBSERVER" >> $LOGFILE
+			cat $DBLIST >> $LOGFILE
+			export HIGHRC=1
+			continue
+		fi
+	fi
+
+#------------------------------------------------------------------------------
+# format sql to get list of users in each database in dblist
+#------------------------------------------------------------------------------
+	> $SQLFILE
+	echo "set nocount on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	cat $DBLIST |
+	while read DBNAME
+	do
+		export DBNAME
+		echo "use $DBNAME" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "exec sp_acct_cert" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+
+#------------------------------------------------------------------------------
+# pipe in the sql
+# check for errors
+#------------------------------------------------------------------------------
+	> $TEMPOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | egrep -v '(Password|return status)' >> $TEMPOUT
+
+	checkSqlErr $TEMPOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - executing SQL against $DBSERVER" >> $LOGFILE
+		cat $TEMPOUT >> $LOGFILE
+		export HIGHRC=1
+		continue
+	else
+		if [ "$OUTFILE" ]
+		then
+			sed -e 's/^ //g' -e 's/  *$//g' $TEMPOUT >> $OUTFILE
+			if [ $? -ne 0 ]
+			then
+				echo "ERROR - creating output file $OUTFILE" >> $LOGFILE
+				export HIGHRC=1
+				continue
+			fi
+		else
+			sed -e 's/^ //g' -e 's/  *$//g' $TEMPOUT
+		fi
+	fi
+done
+
+#------------------------------------------------------------------------------
+# exit with final return code
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 0 ]
+then
+	exit 0 
+else
+	echo "Script FAILED - review output in $LOGFILE"
+	exit 1
+fi

@@ -1,0 +1,199 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: parseDeadlockInfo.scr -S <DBSERVER> {-v 12|15 -G <errorlog generation>}
+#
+#  Description: Parse deadlock info for a specific dbserver
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - dbserver
+#              	<errorlog generation> - generation of the errorlog to parse
+#
+#  Modification History:
+#	02/10/04 M. Siatczynski	Initial Script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	10/10/07 M. Siatczynski	Add parm for version, all needed info is in ASE 15 errorlog, no need for dbcc page cmds
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-v 12|15 -G <errorlog generation>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -G)     export GEN=$2;shift 2;;
+                        -v)     export ASEVERSION=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$ASEVERSION" && export ASEVERSION=12
+
+# source profile after setting SETDBSERVER
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+test "$GEN" && export ERRORLOG=$SYBASE/$SYBASE_ASE/install/errorlog_${DBSERVER}.$GEN || export ERRORLOG=$SYBASE/$SYBASE_ASE/install/errorlog_${DBSERVER}
+if [ ! -f $ERRORLOG ]
+then
+	echo "ERROR - $ERRORLOG does not exist"
+	exit 1
+fi
+
+export DEADLOCKLINES=/tmp/deadlocklines.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBIDS=/tmp/dbids.$$
+export INDIDS=/tmp/indids.$$
+
+export DRANGESTART=`head -1 $ERRORLOG | cut -d" " -f1,2 | cut -d":" -f4-`
+export DRANGEEND=`tail -1 $ERRORLOG | cut -d" " -f1,2 | cut -d":" -f4-`
+
+export STARTMM=`echo $DRANGESTART | cut -d" " -f1 | cut -d'/' -f2`
+export STARTDD=`echo $DRANGESTART | cut -d" " -f1 | cut -d'/' -f3`
+export STARTYYYY=`echo $DRANGESTART | cut -d" " -f1 | cut -d'/' -f1`
+
+export ENDMM=`echo $DRANGEEND | cut -d" " -f1 | cut -d'/' -f2`
+export ENDDD=`echo $DRANGEEND | cut -d" " -f1 | cut -d'/' -f3`
+export ENDYYYY=`echo $DRANGEEND | cut -d" " -f1 | cut -d'/' -f1`
+
+export PAGETABLEINFO=$LOGDIR/misc/$DBSERVER/$DBSERVER.deadlockPageTableInfo.${STARTMM}${STARTDD}${STARTYYYY}-${ENDMM}${ENDDD}${ENDYYYY}
+export LOCKINFO=$LOGDIR/misc/$DBSERVER/$DBSERVER.deadlockDetailByObjid.${STARTMM}${STARTDD}${STARTYYYY}-${ENDMM}${ENDDD}${ENDYYYY}
+export SUMMFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.deadlockSummaryByObject.${STARTMM}${STARTDD}${STARTYYYY}-${ENDMM}${ENDDD}${ENDYYYY}
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DEADLOCKLINES && \rm -f $DEADLOCKLINES
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $DBIDS && \rm -f $DBIDS
+	test -f $INDIDS && \rm -f $INDIDS
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# get the deadlock lines from the errorlog
+# strip off the unnecessary details
+#--------------------------------------------------------------------------
+grep '^Deadlock Id' $ERRORLOG | grep waiting | grep -v intent > $DEADLOCKLINES
+if [ $ASEVERSION -eq 12 ]
+then
+	sed -e 's/^.* lock on page //g' -e 's/ of the ./ /g' -e 's/. table in database / /g' -e 's/ but process .*$//g' -e '/address/d' $DEADLOCKLINES | sort -n > $PAGETABLEINFO
+else
+	sed -e 's/^.* lock on page .* of the //g' -e 's/. table in database / /g' -e 's/ but process .*$//g' -e '/address/d' $DEADLOCKLINES | sort -n > $PAGETABLEINFO
+fi
+
+#--------------------------------------------------------------------------
+# format sql to run dbcc page commands
+# pre 15 only
+#--------------------------------------------------------------------------
+if [ $ASEVERSION -eq 12 ]
+then
+	> $SQLFILE
+	echo "dbcc traceon(3604)" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	uniq $PAGETABLEINFO |
+	while read PAGE TABLE DBID
+	do
+		export PAGE TABLE DBID
+		echo "dbcc page($DBID,$PAGE,0)" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+
+	echo "dbcc traceoff(3604)" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+#--------------------------------------------------------------------------
+# execute the sql
+# check for errors
+# Parse out the object id and index id lines
+# pre 15 only
+#--------------------------------------------------------------------------
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -i$SQLFILE | grep -v Password > $SQLOUT
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting dbcc page info"
+#		cat $SQLOUT
+		cat $SQLOUT > /tmp/mjs
+		exit 1
+	fi
+
+	grep dbid $SQLOUT | sed -e 's/  */ /g' -e 's/^ //g' | cut -d" " -f4 > $DBIDS
+	egrep '(objid|indid)' $SQLOUT | paste -s -d" \n" - | cut -d" " -f1,4,9 > $INDIDS
+
+	paste $DBIDS $INDIDS > $LOCKINFO
+
+
+#--------------------------------------------------------------------------
+# format the SQL to get the object names
+# pre 15 only
+#--------------------------------------------------------------------------
+	> $SQLFILE
+	echo "set nocount on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+# get count of distinct dbid,objid,indid combinations
+	expand $LOCKINFO | sed -e 's/  */ /g' -e 's/=/ /g' | cut -d" " -f2,6,8 | sort | uniq -c |
+	while read COUNT DBID OBJID INDEXID
+	do
+		export COUNT OBJID INDEXID
+		echo "select $COUNT,db_name($DBID),object_name($OBJID,$DBID),\"indid=$INDEXID\"" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -i$SQLFILE -b | grep -v Password > $SQLOUT
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting object names"
+		cat $SQLOUT
+		exit 1
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# create the summary file
+# exit
+#--------------------------------------------------------------------------
+> $SUMMFILE
+echo "Deadlock info for $DBSERVER between $DRANGESTART and $DRANGEEND" >> $SUMMFILE
+echo "Parsed from errorlog:  $ERRORLOG" >> $SUMMFILE
+if [ $ASEVERSION -eq 12 ]
+then
+	cat $SQLOUT >> $SUMMFILE
+else
+	uniq -c $PAGETABLEINFO >> $SUMMFILE
+fi
+
+echo "Summary in $SUMMFILE"
+
+exit 0

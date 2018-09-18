@@ -1,0 +1,220 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: grantMaintGroupPerms.scr [ -S <DBSERVER> {-D <dbname>} | -all ] {-m <maildest>}
+#
+#  Description: Grant permissions to maint_grp group
+#		grant insert,update,delete,select on all user tables and views
+#		grant execute on all stored procs
+#
+#     Location:	/sccm/dba/sybase/scripts/grantMaintGroupPerms.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	-S DBSERVER
+#              	-D DBNAME
+#              	-all process all dbservers 
+#              	-m maildest override
+#
+#  Modification History:
+#	05/21/02 M. Siatczynski	Initial Script
+#	04/15/03 M. Siatczynski	Remove local DATETIME variable - use global
+#	09/10/03 M. Siatczynski	Exclude all tempdb databases
+#	09/23/03 M. Siatczynski	Exclude cif091303 database
+#	09/25/03 M. Siatczynski	Set replication off since this is run on all ASEs
+#	02/20/04 M. Siatczynski	Exclude cif101703 database
+#	05/12/04 M. Siatczynski	Centralized script, ignore read only databases, add error checking
+#	06/04/04 M. Siatczynski	Recoded script based on grantInquiryPerms.scr
+#	09/29/05 M. Siatczynski	Only reference OUTFILE in email--don't include content--too big
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	05/03/06 M. Siatczynski	Ignore offline databases (status2=16)
+#	07/19/06 M. Siatczynski	Do not grant if already granted to maint_grp or public
+#	07/15/07 M. Siatczynski	User -w500 on isql call to accommodate longer identifiers in ASE15
+#	05/29/09 M. Siatczynski	Updated to call getDbList function
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 [ -S <DBSERVER> {-D <dbname>} | -all ] {-m <maildest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export ONEDBSERVER=$2;shift 2;;
+	                -D)	export ONEDBNAME=$2;shift 2;;
+	                -m)	export MAILDEST=$2;shift 2;;
+	                -all)	export ALL=1;shift 1;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+test ! "$ALL" && export ALL=0
+
+#--------------------------------------------------------------------------
+#  Validate parms
+#--------------------------------------------------------------------------
+if [ "$ONEDBNAME" -a ! "$ONEDBSERVER" ]
+then
+	echo $USAGE
+	echo "DBSERVER must be passed with DBNAME"
+	exit 1
+fi
+
+if [ "$ONEDBSERVER" -a $ALL -eq 1 ]
+then
+	echo $USAGE
+	echo "DBSERVER and -all are mutually exclusive"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Use this to describe major sections of code
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/serverlist.$$
+export DBLIST=/tmp/dbnamelist.$$
+export SQL1=/tmp/perm.sql1.$$
+export SQL2=/tmp/perm.sql2.$$
+export MAILFILE=/tmp/mailfile.$$
+
+export HIGHRC=0
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQL1 && \rm -f $SQL1
+	test $SQL2 && \rm -f $SQL2
+	test $DBLIST && \rm -f $DBLIST
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Initialize list of dbservers
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" ]
+then
+	echo "$ONEDBSERVER" > $DBSERVERLIST
+else
+	getAseList > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# Process each DBSERVER separately
+# If a single dbname is passed, put it in the list, otherwise generate a 
+# list of all DBs on the server (excluding system dbs and read only dbs)
+# Also set OUTFILE, depending on DBNAME
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	if [ "$ONEDBNAME" ]
+	then
+		echo $ONEDBNAME > $DBLIST
+		export OUTFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.$ONEDBNAME.grantMaintGroupPerms.$DATETIME
+	else
+		export OUTFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.grantMaintGroupPerms.$DATETIME
+		getDbList -S $DBSERVER -user -xreadonly > $DBLIST
+		if [ $? -eq 1 ]
+		then
+			export HIGHRC=1
+			echo "ERROR - getting list of databases for $DBSERVER"
+			echo "Skipping maint_grp grants for $DBSERVER"
+			cat $DBLIST
+			continue
+		fi
+	fi
+
+#--------------------------------------------------------------------------
+# Format the sql statements to generate the grant perm sql statements
+# action 224 = execute
+# action 193 = select
+# action 195 = insert
+# action 196 = delete
+# action 197 = update
+# the group by and having is needed to check if ALL perms exist
+#--------------------------------------------------------------------------
+	> $SQL1
+	cat $DBLIST |
+	while read DBNAME
+	do
+		export DBNAME
+		echo "use $DBNAME" >> $SQL1
+		echo "go" >> $SQL1
+		echo "set nocount on" >> $SQL1
+		echo "go" >> $SQL1
+		echo "select \"use $DBNAME\"" >> $SQL1
+		echo "select \"go\"" >> $SQL1
+
+		echo "select \"if not exists (select name from $DBNAME..sysusers where name = 'maint_grp')\"" >> $SQL1
+		echo "select \"begin\"" >> $SQL1
+		echo "select \"print 'Adding maint_grp group to $DBSERVER: $DBNAME'\"" >> $SQL1
+		echo "select \"execute sp_addgroup maint_grp\"" >> $SQL1
+		echo "select \"end\"" >> $SQL1
+		echo "select \"go\"" >> $SQL1
+
+                echo "select \"grant insert,update,delete,select on \",user_name(uid)+\".\"+name,\" to maint_grp\",convert(char(1),0xa)+\"go\"" >> $SQL1
+                echo "from sysobjects" >> $SQL1
+                echo "where type in ('U','V')" >> $SQL1
+                echo "and id not in (select id from sysprotects where (uid=user_id(\"maint_grp\") or uid=user_id(\"public\")) and action in (193,195,196,197) group by id having count(*) = 4)" >> $SQL1
+                echo "order by name" >> $SQL1
+		echo "go" >> $SQL1
+
+                echo "select \"grant execute on \",user_name(uid)+\".\"+name,\" to maint_grp\",convert(char(1),0xa)+\"go\"" >> $SQL1
+                echo "from sysobjects" >> $SQL1
+                echo "where type = 'P'" >> $SQL1
+                echo "and id not in (select id from sysprotects where (uid=user_id(\"maint_grp\") or uid=user_id(\"public\")) and action = 224)" >> $SQL1
+                echo "order by name" >> $SQL1
+		echo "go" >> $SQL1
+	done
+
+#--------------------------------------------------------------------------
+# Execute the sql statements that will generate the grant perm statements
+#--------------------------------------------------------------------------
+	> $SQL2
+	echo "set replication off" >> $SQL2
+	echo "go" >> $SQL2
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w500 -i$SQL1 | grep -v Password | sed 's/^ //g' >> $SQL2
+	checkSqlErr $SQL2
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "ERROR - querying $DBSERVER"
+		echo "Skipping maint_grp grants for $DBSERVER"
+		cat $SQL2
+		continue
+	fi
+
+#--------------------------------------------------------------------------
+# Pipe in the sql to grant the perms
+# If errors, send email
+#--------------------------------------------------------------------------
+	> $OUTFILE
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w500 -e -i$SQL2 | grep -v Password >> $OUTFILE
+	checkSqlErr $OUTFILE
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "ERROR - granting maint_grp perms on $DBSERVER"
+		echo "See $OUTFILE for error details" > $MAILFILE
+		export MAILSUBJECT="$DBSERVER: ERRORS granting maint_grp group perms"
+		sendMail
+		continue
+	fi
+done
+
+#--------------------------------------------------------------------------
+# Exit
+#--------------------------------------------------------------------------
+exit $HIGHRC

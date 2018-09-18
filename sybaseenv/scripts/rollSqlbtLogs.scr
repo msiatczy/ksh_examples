@@ -1,0 +1,78 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: rollSqlbtLogs.scr -S <DBSERVER> {-G <generations>}
+#
+#  Description: Rotate the errorlogs for SQLBT.
+#		keeping n generations (default 8 generations).
+#
+#     Location:	/sccm/dba/sybase/scripts/rollSqlbtLogs.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	-S <DBSERVER> - database server
+#		-G <generations> - number of generations to keep
+#
+#  Modification History:
+#	06/11/02 M. Siatczynski	Initial Script
+#	03/31/03 M. Siatczynski	Code enhancements/simplification
+#	02/12/04 M. Siatczynski	Centralized script
+#	05/14/04 M. Siatczynski	Updated to use rollGenerations function
+#--------------------------------------------------------------------------
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-G <generations>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -G)	export GENERATIONS=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# NOTE:  SETDBSERVER must be set AFTER case statement and .dbaSybProfile must be sourced AFTER case statement
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.miscfunctions
+
+test ! "$GENERATIONS" && export GENERATIONS=8
+
+export SQLBTLOG=$DT_SBACKTRACK_HOME/log/datatools.log
+
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# If there is not a current log file, then the environment is probably not set correctly.
+# Roll the SQLBT errorlogs and clear the current one.
+# If any generation cannot be copied of moved, exit the script with non-0 RC.
+#--------------------------------------------------------------------------
+if [ -f $SQLBTLOG ]
+then
+	rollGenerations $SQLBTLOG $GENERATIONS
+else
+	echo "$SQLBTLOG does not exist--check variables in SYBASE.ksh for $DBSERVER"	
+	export HIGHRC=1
+fi
+
+#--------------------------------------------------------------------------
+# Exit with 0 if all above commands were successful
+#--------------------------------------------------------------------------
+exit $HIGHRC

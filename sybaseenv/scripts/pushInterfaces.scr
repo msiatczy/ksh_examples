@@ -1,0 +1,222 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: pushInterfaces.scr -central -prod -nonprod
+#
+#  Description: Pushes /sccm/dba/sybase/dist/interfaces/interfaces
+#		out to all Sybase database and replication servers in
+#		aseDirectory.lst and repDirectory.lst.
+#		Makes a copy of the current file before pushing out the 
+#		new file.
+#
+#     Location: /sccm/dba/sybase/scripts/pushInterfaces.scr
+#
+#  Modification History:
+#       10/16/01 K. Hess      Initial Script
+#       12/05/01 K. Hess      Updated LIST to ctl rather than lists dir
+#       01/17/02 M. Siatczynski  Added time to DATE variable
+#	01/30/02 K. Hess	Updated variables to use .sybProfile;
+#				sourced .sybProfile
+#	03/22/02 M. Siatczynski Updated to push to internal list (minus grover) and
+#				print comment about manually servers in dmz list
+#	04/11/02 M. Siatczynski Added push to central interfaces under /sccm/sybase/ocs12.5*
+#	04/26/02 M. Siatczynski Updated to push to test and production copies of central interfaces
+#	05/02/02 M. Siatczynski Changed grover to hawk (grover machine was renamed to hawk)
+#	07/16/02 M. Siatczynski Updated to use sybDirectory.lst
+#	08/22/02 M. Siatczynski Updated to automate push to DMZ machines
+#	10/16/02 M. Siatczynski changed sybDirectory.lst to aseDirectory.lst
+#	10/16/02 K. Hess	Changed INTLIST to ASELIST; added REPLIST
+#				and push of interfaces to REPLIST
+#	02/20/03 M. Siatczynski Added logic to update central linux interfaces
+#	03/28/03 M. Siatczynski No longer exclude hawk - ONS is only production mode
+#	06/24/03 M. Siatczynski Changed name of DMZ list to dmzMachine.lst
+#	06/21/04 M. Siatczynski Update for proper use of aseDirectory.lst and repDirectory.lst
+#	08/04/04 M. Siatczynski Centralized script
+#	12/17/04 K. Hess	Update rsh to ssh; rcp to scp
+#	05/24/05 M. Siatczynski	Updated MACHINE to SN in cases where we ssh to service name rather than machine (done for clarity)
+#	10/12/05 K. Hess	Per V. Carpenter, DMZ machines no longer need interfaces updates. Removing DMZLIST.
+#	10/22/05 M. Siatczynski	Add -central -prod -nonprod parms to target push dest
+#	12/14/06 M. Siatczynski	Update central directory names--only OCS_PROD and OCS_TEST exist now
+#	01/11/07 M. Siatczynski Add final echo to remind about update of other NFS environments
+#	04/04/08 M. Siatczynski Add code to push to OCS15 copy, change text to distinguish OCS 12.5.1 from OCS 15
+#	02/24/09 M. Siatczynski Update code to push to OCS15_32 and OCS15_64
+#	01/11/11 M. Siatczynski Exclude Evergreen Odyssey ASEs from push list
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -central -prod -nonprod"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -central)	export CENTRAL=1;shift 1;;
+                        -prod)		export PROD=1;shift 1;;
+                        -nonprod)	export NONPROD=1;shift 1;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$CENTRAL" && export CENTRAL=0
+test ! "$PROD" && export PROD=0
+test ! "$NONPROD" && export NONPROD=0
+
+export PARMSUM=`expr $CENTRAL + $PROD + $NONPROD`
+
+if [ $PARMSUM -eq 0 ]
+then
+	echo $USAGE
+	echo "ERROR - at least one parameter must be specified (-central -prod -nonprod)"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export PRODLIST=/tmp/prodlist.$$
+export NONPRODLIST=/tmp/nonprodlist.$$
+export TMPASE=/tmp/tmpase.$$
+export TMPREP=/tmp/tmprep.$$
+
+export ASELIST=$CTLDIR/aseDirectory.lst
+export REPLIST=$CTLDIR/repDirectory.lst
+export SOURCEFILE=$DISTDIR/interfaces/interfaces
+export TESTDIR=/sccm/sybase/OCS_TEST
+export PRODDIR=/sccm/sybase/OCS_PROD
+export LINUXPROD=/sccm/sybase/linux/OCS_PROD
+export LINUXTEST=/sccm/sybase/linux/OCS_TEST
+export OCS15DIR32=/sccm/sybase/OCS15_32
+export OCS15DIR64=/sccm/sybase/OCS15_64
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $PRODLIST && \rm -f $PRODLIST
+	test -f $NONPRODLIST && \rm -f $NONPRODLIST
+	test -f $TMPASE && \rm -f $TMPASE
+	test -f $TMPREP && \rm -f $TMPREP
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Gen prod/nonprod lists
+#  Exclude ODY DB servers from list, as these do not need same interfaces as AMG West
+#--------------------------------------------------------------------------
+> $TMPASE
+> $TMPREP
+
+if [ $PROD -eq 1 ]
+then
+#	grep -v '^#' $ASELIST | cut -d" " -f1-5 | grep -v nonprod >> $TMPASE
+	grep -v '^#' $ASELIST | cut -d" " -f1-5 | grep -v nonprod | grep -v 'odydb01' >> $TMPASE
+	grep -v '^#' $REPLIST | cut -d" " -f1-4,7 | grep -v nonprod >> $TMPREP
+fi
+
+if [ $NONPROD -eq 1 ]
+then
+#	grep -v '^#' $ASELIST | cut -d" " -f1-5 | grep nonprod >> $TMPASE
+	grep -v '^#' $ASELIST | cut -d" " -f1-5 | grep nonprod | grep -v 'odydb01' >> $TMPASE
+	grep -v '^#' $REPLIST | cut -d" " -f1-4,7 | grep nonprod >> $TMPREP
+fi
+
+#--------------------------------------------------------------------------
+#  Make copy of local ASE interfaces file and push out master interfaces file
+#--------------------------------------------------------------------------
+cat $TMPASE |
+while read DBSERVER SN SYBDIR ASEDIR STATUS
+do
+	export DBSERVER SN SYBDIR ASEDIR
+	export DESTFILE=$SYBDIR/interfaces
+	echo "Updating $SN:$DESTFILE...\n"
+	ssh -n $SN cp -p $DESTFILE $DESTFILE.$DATETIME
+	scp -p $SOURCEFILE $SN:$DESTFILE 
+done
+
+#--------------------------------------------------------------------------
+#  Make copy of local REP interfaces file and push out master interfaces file
+#--------------------------------------------------------------------------
+cat $TMPREP |
+while read REPSERVER SN RSDIR REPDIR STATUS
+do
+	export REPSERVER SN RSDIR REPDIR
+	export DESTFILE=$RSDIR/interfaces
+	echo "Updating $SN:$DESTFILE...\n"
+	ssh -n $SN cp -p $DESTFILE $DESTFILE.$DATETIME
+	scp -p $SOURCEFILE $SN:$DESTFILE 
+done
+
+#--------------------------------------------------------------------------
+#  Save copies of central interfaces files and copy new (OCS 12.5.1)
+#  Also does central linux copy
+#  Also does central OCS15 (32-bit and 64-bit) copies
+#--------------------------------------------------------------------------
+if [ $CENTRAL -eq 1 ]
+then
+	echo "\nUPDATING CENTRAL OCS 12.5.1...\n"
+	if [ $TESTDIR -ef $PRODDIR ]
+	then
+		echo "Test and production are same copy"
+		echo "Updating $PRODDIR/interfaces"
+		cp -p $PRODDIR/interfaces $PRODDIR/interfaces.$DATETIME
+		cp -p $SOURCEFILE $PRODDIR/interfaces
+	else
+		echo "Test and production are different copies"
+		echo "Updating $TESTDIR/interfaces"
+		cp -p $TESTDIR/interfaces $TESTDIR/interfaces.$DATETIME
+		cp -p $SOURCEFILE $TESTDIR/interfaces
+
+		echo "Updating $PRODDIR/interfaces"
+		cp -p $PRODDIR/interfaces $PRODDIR/interfaces.$DATETIME
+		cp -p $SOURCEFILE $PRODDIR/interfaces
+	fi
+
+	echo "\nUPDATING CENTRAL Linux...\n"
+	if [ $LINUXTEST -ef $LINUXPROD ]
+	then
+		echo "Test and production (linux) are same copy"
+		echo "Updating $LINUXPROD/interfaces"
+		cp -p $LINUXPROD/interfaces $LINUXPROD/interfaces.$DATETIME
+		cp -p $SOURCEFILE $LINUXPROD/interfaces
+	else
+		echo "Test and production (linux) are different copies"
+		echo "Updating $LINUXTEST/interfaces"
+		cp -p $LINUXTEST/interfaces $LINUXTEST/interfaces.$DATETIME
+		cp -p $SOURCEFILE $LINUXTEST/interfaces
+
+		echo "Updating $LINUXPROD/interfaces"
+		cp -p $LINUXPROD/interfaces $LINUXPROD/interfaces.$DATETIME
+		cp -p $SOURCEFILE $LINUXPROD/interfaces
+	fi
+
+	echo "\nUPDATING CENTRAL OCS 15 (32-bit) COPY...\n"
+	echo "Updating $OCS15DIR32/interfaces"
+	cp -p $OCS15DIR32/interfaces $OCS15DIR32/interfaces.$DATETIME
+	cp -p $SOURCEFILE $OCS15DIR32/interfaces
+
+	echo "\nUPDATING CENTRAL OCS 15 (64-bit) COPY...\n"
+	echo "Updating $OCS15DIR64/interfaces"
+	cp -p $OCS15DIR64/interfaces $OCS15DIR64/interfaces.$DATETIME
+	cp -p $SOURCEFILE $OCS15DIR64/interfaces
+fi
+
+#--------------------------------------------------------------------------
+#  Exit
+#--------------------------------------------------------------------------
+echo "\nPUSH IS COMPLETE.\n"
+echo "\n\n\n****************************************************************************"
+echo "REMEMBER TO UPDATE THE interfaces DISTRIBUTION COPY IN ALL NFS ENVIRONMENTS:"
+echo "scp -p $DISTDIR/interfaces/interfaces <host>:/sccm/dba/sybase/dist/interfaces/."
+echo "\nTHEN EXECUTE pushInterfaces.scr -central FROM ALL REMAINING NFS ENVIRONMENTS."
+echo "****************************************************************************\n\n\n"
+exit 0

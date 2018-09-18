@@ -1,0 +1,90 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dbccExcludeRpt.scr
+#
+#  Description: Report on databases excluded from DBCCs
+#
+#     Location:	/sccm/dba/sybase/scripts/dbccExcludeRpt.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	02/24/03 M. Siatczynski	Initial Script
+#	11/19/03 M. Siatczynski	Centralized 
+#	03/17/08 M. Siatczynski	Keep track of previous exclusions, only report differences, but always report weekly (DOW=1)
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SERVERLIST=/tmp/serverlist.$$
+export MAILFILE=/tmp/mailfile.$$
+export DIFFFILE=/tmp/excldiff.$$
+export RPTFILE=$RPTDIR/dbcc/central/dbccExcludeRpt.$DATETIME
+export DOW=`date +%w`
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SERVERLIST && \rm -f $SERVERLIST
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $DIFFFILE && \rm -f $DIFFFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Get list of servers
+#--------------------------------------------------------------------------
+getAseList | sort > $SERVERLIST
+
+#--------------------------------------------------------------------------
+#  Query each server for excluded DBs
+#  Compare the DBSERVERs exclude file against the previous one
+#  If different, email dba
+#  Always report weekly (on Monday)
+#--------------------------------------------------------------------------
+cat $SERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	export EXFILE=$CTLDIR/$DBSERVER/$DBSERVER.dbccExclude.lst
+
+	if [ -s $EXFILE ]
+	then
+		export PREVEXFILE=$CTLDIR/$DBSERVER/$DBSERVER.dbccExclude.lastcheck
+		test ! -f $PREVEXFILE && touch $PREVEXFILE
+		diff $EXFILE $PREVEXFILE > $DIFFFILE
+# if there are differences or it's Monday, email dba
+		if [ -s $DIFFFILE -o $DOW -eq 1 ]
+		then
+			if [ ! -s $RPTFILE ]
+			then
+			        > $RPTFILE
+			        echo `date` >> $RPTFILE
+				echo "The following databases are EXCLUDED from DBCCs:" >> $RPTFILE	
+			fi
+			echo "\n--------$DBSERVER--------" >> $RPTFILE
+			cat $EXFILE >> $RPTFILE
+		fi
+		cp -p $EXFILE $PREVEXFILE
+	fi
+done
+
+#--------------------------------------------------------------------------
+#  If there are any exclusions, mail dba
+#--------------------------------------------------------------------------
+if [ -s $RPTFILE ]
+then
+	cat $RPTFILE > $MAILFILE
+	export MAILSUBJECT="REPORT: DBCC Exclusions"
+	sendMail
+fi

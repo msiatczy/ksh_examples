@@ -1,0 +1,130 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: wrapManageDir.scr -L <ctllist> {-clean -mailrpt}
+#
+#  Description: Wrapper script to call manageDir.scr for a list of directories in a control file
+#		Optional parms for cleanup and email reporting.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<ctlfile> - list of directories to process
+#		<clean> - remove files which match criteria
+#		<mailrpt> - mail report of files that match criteria
+#
+#  Modification History:
+#	10/07/10 M. Siatczynski	New script - replaces wrapper scripts cleanBackupDir.scr and cleanCentDir.scr
+#	02/15/11 M. Siatczynski	Profile source accommodates AMG East
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -L <ctlfile> {-clean -mailrpt}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -L)	export CTLFILE=$2;shift 2;;
+			-clean)	export CLEAN=1;shift 1;;
+			-mailrpt)	export MAILRPT=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! -s $CTLFILE ]
+then
+	echo "ERROR - $CTLFILE does not exist or is 0 bytes"
+	exit 1
+fi
+
+test ! "$CLEAN" && export CLEAN=0
+test ! "$MAILRPT" && export MAILRPT=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/wrapManageDir.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+#  Write report headers
+#--------------------------------------------------------------------------
+> $LOGFILE
+date >> $LOGFILE
+echo "Executed $CALLED\n" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+#  Read the control file
+#  Format of control file should be
+#  directory:{alarm_pct}:{days_to_keep}:{size}:{maildest}:{pagedest}
+#  Format the execution string
+#  Execute the string
+#--------------------------------------------------------------------------
+export EXESTRING=""
+grep -v '^#' $CTLFILE | while read LINE
+do
+# unset all the local variables before parsing input
+	unset DIRSPEC
+	unset PCTSPEC
+	unset DAYSPEC
+	unset SIZESPEC
+	unset MAILSPEC
+	unset PAGESPEC
+
+# parse input and set local variables
+	export LINE
+	export DIRSPEC=`echo $LINE | cut -d":" -f1`
+	export PCTSPEC=`echo $LINE | cut -d":" -f2`
+	export DAYSPEC=`echo $LINE | cut -d":" -f3`
+	export SIZESPEC=`echo $LINE | cut -d":" -f4`
+	export MAILSPEC=`echo $LINE | cut -d":" -f5`
+	export PAGESPEC=`echo $LINE | cut -d":" -f6`
+
+#format execution string
+	export EXESTRING="$SCRDIR/manageDir.scr -dir $DIRSPEC"
+	test "$PCTSPEC" && export EXESTRING="$EXESTRING -pctalarm $PCTSPEC"
+	test "$DAYSPEC" && export EXESTRING="$EXESTRING -days $DAYSPEC"
+	test "$SIZESPEC" && export EXESTRING="$EXESTRING -size $SIZESPEC"
+	test "$MAILSPEC" && export EXESTRING="$EXESTRING -m $MAILSPEC"
+	test "$PAGESPEC" && export EXESTRING="$EXESTRING -p $PAGESPEC"
+	test $CLEAN -eq 1 && export EXESTRING="$EXESTRING -clean"
+	test $MAILRPT -eq 1 && export EXESTRING="$EXESTRING -mailrpt"
+
+	echo "Executing $EXESTRING" >> $LOGFILE
+
+#execute string
+	eval $EXESTRING >> $LOGFILE
+
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - Execution FAILED for $DIRSPEC" >> $LOGFILE
+		export HIGHRC=1
+	else
+		echo "Execution SUCCESSFUL for $DIRSPEC" >> $LOGFILE
+	fi
+	echo "`date`\n" >> $LOGFILE
+done
+
+#--------------------------------------------------------------------------
+# Exit with highest return status
+#--------------------------------------------------------------------------
+exit $HIGHRC

@@ -1,0 +1,111 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: evgCommitRun.scr -S <DBSERVER> {-R <REPOSITORY> -G <GROUP>}
+#
+#  Description: Check sybase baseline compliance using COMMIT software
+#		Special script to execute against EVG server from remote host
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#
+#  Modification History:
+#	07/01/10 M. Siatczynski	Original script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-R <REPOSITORY> -G <GROUP>}"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)		export DBSERVER=$2;shift 2;;
+                        -R)		export REPOSITORY=$2;shift 2;;
+                        -G)		export GROUP=$2;shift 2;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$REPOSITORY" && export REPOSITORY=PREDWOOD
+test ! "$GROUP" && export GROUP=EVG_ASE15X
+
+# override COMMITDIR - different directory for EVG servers
+export COMMITDIR=/opt/dba
+export LOGFILE=$LOGDIR/audit/$DBSERVER/$DBSERVER.evgCommitRun.$DATETIME
+export CTRUNOUT=/tmp/ctrun.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# get target host for ASE
+#--------------------------------------------------------------------------
+export SN=`grep "^$DBSERVER " $ASEDIRLIST | cut -d" " -f2`
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $CTRUNOUT && \rm -f $CTRUNOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START - Sybase COMMIT run for $DBSERVER" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Execute ct_run.pl
+# When executing remotely, return code is not easy to capture
+#------------------------------------------------------------------------------
+echo "\n`date` Executing ct_run.pl for $DBSERVER, COMMIT group $GROUP" >> $LOGFILE
+
+> $CTRUNOUT
+ssh -n $SN " $COMMITDIR/sybadmin/tools/ct_run.pl -S $DBSERVER -R $REPOSITORY -G $GROUP" >> $CTRUNOUT 2>&1
+
+# if this line is found, grep result will be 0 = SUCCESS
+grep '^Compliance Run .* Complete - Result is' $CTRUNOUT > /dev/null
+export CTRUNRC=$?
+
+if [ $CTRUNRC -ne 0 ]
+then
+	export HIGHRC=1
+fi
+
+cat $CTRUNOUT >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Write trailers
+#------------------------------------------------------------------------------
+echo "\n`date` END - Sybase COMMIT run for $DBSERVER" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# check for errors
+#------------------------------------------------------------------------------
+if [ $HIGHRC -ne 0 ]
+then
+	exit 1
+else
+	exit 0
+fi

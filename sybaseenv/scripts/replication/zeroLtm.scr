@@ -1,0 +1,195 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: zeroLtm.scr -L <control list> -RS <REPSERVER> | -PDS <primary DBSERVER> -D <dbname> -RS <REPSERVER> {-noprompt}
+#
+#  Description: Zero out the LTM in the RSSD for one or more PDS databases
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<control list> - input list of servers and databases
+#              	<REPSERVER> - replication server
+#              	<primary DBSERVER> - source database server
+#              	<dbname> - database
+#
+#   NOTE:  -L <control list> and other parameters are mutually exclusive.
+#
+#  Modification History:
+#	05/13/03 M. Siatczynski	Initial Script
+#	07/23/04 M. Siatczynski	Centralized script
+#	03/17/05 M. Siatczynski	Add RSSD prefix to LOGFILE
+#	02/21/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	03/17/06 M. Siatczynski	Comment out echoes to console
+#	05/17/07 M. Siatczynski	Replace RSASE and RSSD parms with RS parm
+#	07/10/08 M. Siatczynski	Changes to accommodate ERSSD, add -noprompt
+#       09/24/10 K. Sawant      Added tertiary connection related to MSA
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+#  Initialize Parameters
+#--------------------------------------------------------------------------
+export USAGE="\nERROR - Usage: $0 -L <control list> -RS <REPSERVER> | -PDS <from DBSERVER> -D <dbname> -RS <REPSERVER> {-noprompt}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -L)     export LISTFILE=$2;shift 2;;
+                        -RS)	export REPSERVER=$2;shift 2;;
+                        -PDS)   export PDS=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -noprompt)   export PROMPT=0;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$PROMPT" && export PROMPT=1
+
+#--------------------------------------------------------------------------
+#  Verify Parameters
+#--------------------------------------------------------------------------
+if [ "$LISTFILE" ]
+then
+
+#LISTFILE cannot be passed with any other parameters
+	if [ "$PDS" -o "$DBNAME" ]
+	then
+		echo "$USAGE"
+		echo "\ncontrol list and other parameters are mutually exclusive\n"
+		exit 1
+	fi
+
+#REPSERVER must be passed if LISTFILE is valid
+        if [ ! "$REPSERVER" ]
+        then
+                echo "$USAGE"
+                echo "\nRS must be specified with control list\n"
+                exit 1
+        fi
+
+#LISTFILE must exist under central control directory
+	CTLFILE=$CTLDIR/replication/$LISTFILE
+	if [ ! -s $CTLFILE ]
+	then
+	        echo "\nERROR - $CALLED"
+	        echo "\n$CTLFILE does not exist or is 0 bytes\n"
+	        exit 1
+	fi
+else
+#if LISTFILE wasn't passed, all other parameters must be passed
+	if [ ! "$PDS" -o ! "$DBNAME" -o ! "$REPSERVER" ]
+	then
+		echo "$USAGE"
+		echo "\nIf control list is not passed, ALL other parameters MUST be passed."
+		exit 1
+	fi
+fi
+
+#-----------------------------------------------------------------------
+# Get RSASE and RSSD based on REPSERVER
+# Make sure they are set to something
+#-----------------------------------------------------------------------
+grep "^$REPSERVER " $REPDIRLIST | cut -d" " -f8,9 | read RSASE RSSD
+if [ ! "$RSASE" -o ! "$RSSD" ]
+then
+	echo "ERROR - RSASE or RSSD not properly set"
+	exit 1
+fi
+
+export TEMPFILE=/tmp/tempfile.$$
+export LOGFILE=$LOGDIR/replication/$REPSERVER/$RSSD.zeroLtm.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TEMPFILE && \rm -f $TEMPFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Format SQL statements
+#--------------------------------------------------------------------------
+
+if [ "$LISTFILE" ]
+then
+	cat $CTLFILE > $TEMPFILE
+else
+	echo "$PDS $DBNAME dummy" > $TEMPFILE
+fi
+
+for PDS in `cut -d" " -f1 $TEMPFILE | sort | uniq`
+do
+        export SQLFILE=$SQLDIR/replication/$RSSD.$PDS.zeroLtm.sql
+	test -f $SQLFILE && \rm $SQLFILE
+##	echo "use $RSSD" >> $SQLFILE
+##	echo "go" >> $SQLFILE
+done
+
+cat $TEMPFILE |
+while read PDS DBNAME RDS LDS LDB TDS
+do
+	export PDS DBNAME RDS LDS LDB TDS
+        export SQLFILE=$SQLDIR/replication/$RSSD.$PDS.zeroLtm.sql
+
+	echo "rs_zeroltm $PDS,$DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#------------------------------------------------------------------------------
+# PROMPT to continue
+#------------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+	echo "\nYou are about to ZERO LTM(s) in $RSSD using SQL in $SQLFILE\n"
+	export CONTINUE=""
+	while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+	do
+		echo "DO YOU WISH TO CONTINUE? {y/n}"
+		read CONTINUE
+	done
+	if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+	then
+		echo "\nExiting - No SQL run against $RSSD\n"
+		exit 0
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# Run the SQL
+# Can't use -X option for ERSSD, add -D to accommodate ERSSD
+#------------------------------------------------------------------------------
+> $LOGFILE
+
+for PDS in `cut -d" " -f1 $TEMPFILE | sort | uniq`
+do
+	echo "Zeroing LTMs for $PDS" >> $LOGFILE
+        export SQLFILE=$SQLDIR/replication/$RSSD.$PDS.zeroLtm.sql
+        getPass $RSASE $ADMINLOGIN | $OCSBIN/isql -U$ADMINLOGIN -S$RSASE -D$RSSD -w200 -e -i $SQLFILE >> $LOGFILE
+done
+ 
+#------------------------------------------------------------------------------
+# check output
+#------------------------------------------------------------------------------
+checkSqlErr $LOGFILE
+if [ $? -ne 0 ]
+then
+        echo "$0 FAILED - output in $LOGFILE"
+        exit 1
+else
+	test $PROMPT -eq 1 && echo "Script SUCCESSFUL"
+        exit 0
+fi

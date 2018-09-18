@@ -1,0 +1,210 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findPublicPerms.scr -S <DBSERVER>|all -D <dbname>|all|user> {-m <maildest> -summary}
+#
+#  Description: Look for databases with permissions granted to public
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	03/02/06 M. Siatczynski	Initial Script
+#	05/18/06 M. Siatczynski	Exclude rs_ objects
+#	07/31/06 M. Siatczynski	Add parms for DBSERVER, dbname, and maildest
+#	09/15/06 M. Siatczynski	Exclude SQR objects, add code to sendMail
+#	09/25/06 M. Siatczynski	Ignore offline databases
+#	01/26/07 M. Siatczynski	Only send email if public perms are granted
+#	05/29/09 M. Siatczynski	Updated to use getDbList function
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+# unset MAILDEST and use only parm specified on command line
+unset MAILDEST
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|all -D <dbname>|all|user> {-m <maildest> -summary}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -summary) export SUMMARY=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" -o ! "$ONEDBNAME" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$SUMMARY" && export SUMMARY=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export DBLIST=/tmp/dbnamelist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export MAILFILE=/tmp/mailfile.$$
+export LOGFILE=$LOGDIR/useradmin/central/findPublicPerms.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  For each ASE...
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START find public perms" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# Create a working dbserverlist
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# For each DBSERVER
+# create a working dbnamelist
+# format sql
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+#--------------------------------------------------------------------------
+# Create a working dblist
+# Ignore offline databases (status2=16)
+#--------------------------------------------------------------------------
+	if [ "$ONEDBNAME" = "all" ]
+	then
+		getDbList -S $DBSERVER -user -system > $DBLIST
+		if [ $? -eq 1 ]
+		then
+			echo "ERROR - getting list of databases from $DBSERVER" | tee -a $LOGFILE
+			cat $DBLIST >> $LOGFILE
+			export HIGHRC=1
+			continue
+		fi
+
+	elif [ "$ONEDBNAME" = "user" ]
+	then
+		getDbList -S $DBSERVER -user > $DBLIST
+		if [ $? -eq 1 ]
+		then
+			echo "ERROR - getting list of databases from $DBSERVER" | tee -a $LOGFILE
+			cat $DBLIST >> $LOGFILE
+			export HIGHRC=1
+			continue
+		fi
+	else
+		echo $ONEDBNAME > $DBLIST
+	fi
+
+#--------------------------------------------------------------------------
+# format SQL
+# execute SQL
+# check for errors
+#--------------------------------------------------------------------------
+	> $SQLFILE
+	echo "set nocount on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	for DBNAME in `cat $DBLIST`
+	do
+		export DBNAME
+		echo "use $DBNAME" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		if [ $SUMMARY -eq 1 ]
+		then
+			echo "if exists (select * from sysprotects where uid = user_id('public') and id > 99 and object_name(id) <> 'repmon' and object_name(id) not like 'rs[_]%' and object_name(id) not like 'SQR%')" >> $SQLFILE
+			echo "select @@servername,db_name(),'GRANTED'" >> $SQLFILE
+			echo "else" >> $SQLFILE
+			echo "select @@servername,db_name(),'OK'" >> $SQLFILE
+		else
+			echo "select @@servername,db_name(),object_name(id),action,columns from sysprotects where uid = user_id('public') and id > 99 and object_name(id) <> 'repmon' and object_name(id) not like 'rs[_]%' and object_name(id) not like 'SQR%'" >> $SQLFILE
+		fi
+		echo "go" >> $SQLFILE
+	done
+
+	echo "`date` Checking $DBSERVER..." >> $LOGFILE
+
+	> $SQLOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w999 -i$SQLFILE -b | grep -v Password >> $SQLOUT
+	cat $SQLOUT >> $LOGFILE
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+	        echo "$DBSERVER:  SQL FAILED" >> $LOGFILE
+	        export HIGHRC=1
+	        continue
+	else
+	        echo "$DBSERVER:  SQL SUCCESSFUL" >> $LOGFILE
+	fi
+#--------------------------------------------------------------------------
+# Send mail if MAILDEST is set
+# Only send mail if public perms are GRANTED
+# NOTE:  the set of PERMSGRANTED MUST immediately follow the grep, 0=perms granted 
+#--------------------------------------------------------------------------
+	if [ "$MAILDEST" ]
+	then
+		export PERMSGRANTED=0
+		grep 'GRANTED' $SQLOUT > /dev/null
+		export PERMSGRANTED=$?
+		if [ $PERMSGRANTED -eq 0 ]
+		then 
+			cat $SQLOUT > $MAILFILE
+			export MAILSUBJECT="$DBSERVER - Summary of public permissions"
+			sendMail
+		fi
+	fi
+done
+
+#--------------------------------------------------------------------------
+# Exit with final status
+#--------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+	echo "\nScript FAILED"
+	echo "Review output in $LOGFILE\n"
+	exit 1
+else
+	exit 0
+fi

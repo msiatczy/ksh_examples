@@ -1,0 +1,127 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getAutosysJil.scr -E <PRD|TST|SIT|DVL> {-G <retention days> -m <maildest>}
+#
+#  Description: Get Autosys jil for all DBM% jobs from an autosys environment(PRD,TST,SIT,DVL)
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	02/27/04 M. Siatczynski	Initial Script
+#	09/15/05 M. Siatczynski	Changed output file format from *MMDDYYYY to *YYYYMMDD
+#	11/28/06 M. Siatczynski	Updated find pattern to leave first day of month (pattern was wrong--finding January)
+#	12/07/06 M. Siatczynski	Write autosys jil to /sccm/dba/autosysjil/DBM/$AUTOENV
+#				Only get level 0 jobs so we don't duplicate entries
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -E <PRD|TST|SIT|DVL> {-G <retention days> -m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -E)     export AUTOENV=$2;shift 2;;
+                        -G)     export DAYS=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -flag)  export FLAG=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+# if number of days not passed, default to 45
+test ! "$DAYS" && export DAYS=45
+
+if [ ! "$AUTOENV" ]
+then
+        echo $USAGE
+        exit 1
+elif [ "$AUTOENV" != "PRD" -a "$AUTOENV" != "TST" -a "$AUTOENV" != "DVL" -a "$AUTOENV" != "SIT" ]
+then
+	echo $USAGE
+	echo "ERROR - Autosys environment must be PRD, TST, SIT, or DVL"
+	exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export OUTDIR=/sccm/dba/autosysjil/DBM/$AUTOENV
+export FILEBASE=DBM_Jil
+export OUTFILE=$OUTDIR/$FILEBASE.$YYYYMMDD
+export MAILFILE=/tmp/mailfile.$$
+
+export AUTOUSER=/opt/sccm/autouser
+
+if [ "$AUTOENV" = "PRD" ]
+then
+	export SRCFILE=autoprd
+elif [ "$AUTOENV" = "TST" ]
+then
+	export SRCFILE=autotst
+elif [ "$AUTOENV" = "SIT" ]
+then
+	export SRCFILE=autosit
+elif [ "$AUTOENV" = "DVL" ]
+then
+	export SRCFILE=autodvl
+fi
+
+# validate autosys environment for this machine
+# (this code sample was based on /opt/sccm/autouser/bin/auto)
+if [ ! -f $AUTOUSER/config.$AUTOENV ]
+then
+	echo "ERROR - $AUTOENV is not a valid Autosys environment on `hostname`"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Clean up daily log files, leaving the file from the first day of the month
+#------------------------------------------------------------------------------
+find $OUTDIR -name "$FILEBASE.*" \! -name "$FILEBASE.??????01" -mtime +$DAYS -exec \rm {} \;
+
+#------------------------------------------------------------------------------
+# Source autosys environment file (pipe to /dev/null to avoid "--" written to standard out
+# Capture jil
+# Check for errors
+# Exit with appropriate code
+#------------------------------------------------------------------------------
+. $AUTOUSER/bin/$SRCFILE > /dev/null
+
+$AUTOSYS/bin/autorep -J DBM_% -q -L 0 > $OUTFILE
+export RC=$?
+
+if [ $RC -ne 0 ]
+then
+	export MAILSUBJECT="Errors getting DBM jil in Autosys env $AUTOENV"
+	cat $OUTFILE > $MAILFILE
+	sendmail
+	exit 1
+else
+	exit 0
+fi

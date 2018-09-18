@@ -1,0 +1,172 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findBackupsBehind.scr -S <DBSERVER> {-D <dbname> -days <older than n days> -m <maildest>}
+#
+#  Description: Find databases which have not had a full backup in the last n days (24-hour periods)
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - DBSERVER
+#              	<dbname> - database name
+#              	<days> - older than n days (actually n 24-hour periods)
+#
+#  NOTE:  This script MUST run on the host where the sqlbt control files are currently mounted.
+#
+#  Modification History:
+#	06/12/06 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname> -days <older than n days> -m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+                        -days)  export DAYSOLD=$2;shift 2;;
+                        -m)	export MAILDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$DAYSOLD" && export DAYSOLD=1
+
+# source the profile after setting DBSERVER so the correct DT variables get set
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.datefunctions
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DTSOUT=/tmp/dtsout.$$
+export DBLIST=/tmp/dblist.$$
+export LASTFULL=/tmp/lastfull.$$
+export TMPOUT=/tmp/tmpout.$$
+export LOGFILE=$LOGDIR/backup/$DBSERVER/$DBSERVER.findBackupsBehind.$DATETIME
+
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DTSOUT && \rm -f $DTSOUT
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $LASTFULL && \rm -f $LASTFULL
+	test -f $TMPOUT && \rm -f $TMPOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------
+# Format list of databases
+#------------------------------------------------------------------------
+if [ "$ONEDBNAME" ]
+then
+	echo $ONEDBNAME > $DBLIST
+else
+	ls $DT_PHYSICAL/$DBSERVER | grep -v '\.skip' > $DBLIST
+fi
+
+#------------------------------------------------------------------------
+# Generate a dtsreport for DBSERVER/dbname
+# Verify the control file contains dump info (not just the header), otherwise
+# dtsreport will hang waiting for user response.
+#------------------------------------------------------------------------
+> $TMPOUT
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	export CTLFILE=$DT_PHYSICAL/$DBSERVER/$DBNAME
+	if [ -f $CTLFILE ]
+	then
+		grep '^begin dump' $CTLFILE > /dev/null
+		if [ $? -eq 0 ]
+		then
+			dtsreport -path $CTLFILE -output $DBADIR/tempdata -listorder L -template $DT_SBACKTRACK_HOME/templates/template.csv > $DTSOUT
+			export RPTFILE=`grep 'To:' $DTSOUT | cut -d" " -f2`
+			if [ -f $RPTFILE ]
+			then
+				grep 'Full' $RPTFILE | tail -1 | cut -d"," -f13,14,2,3 > $LASTFULL
+				export BACKUPDBSERVER=`cat $LASTFULL | nawk -F"," '{print $1}'`
+				export BACKUPDBNAME=`cat $LASTFULL | nawk -F"," '{print $2}'`
+				export BACKUPDATE=`cat $LASTFULL | nawk -F"," '{print $3}'`
+				export BACKUPTIME=`cat $LASTFULL | nawk -F"," '{print $4}'`
+				export BACKUPHHMM=`echo $BACKUPTIME | nawk -F":" '{print $1$2}'`
+
+				# current date variables - used to compare dates
+				export CURRENTDATE=`date +'%m/%d/%Y'`
+				export CURRENTHHMM=`date +'%H%M'`
+				export DAYSDIFF=`getDaysBetween $BACKUPDATE $CURRENTDATE`
+				if [ $DAYSDIFF -gt $DAYSOLD ]
+				then
+					echo "$BACKUPDBSERVER $BACKUPDBNAME $BACKUPDATE $BACKUPTIME" >> $TMPOUT
+				elif [ $DAYSDIFF -eq $DAYSOLD -a $BACKUPHHMM -lt $CURRENTHHMM ]
+				then
+					echo "$BACKUPDBSERVER $BACKUPDBNAME $BACKUPDATE $BACKUPTIME" >> $TMPOUT
+				fi
+			else
+				echo "ERROR - a valid report file was not generated"
+				cat $DTSOUT
+				export HIGHRC=1
+			fi
+		else
+			echo "ERROR - $CTLFILE does not contain any dump information"
+			export HIGHRC=1
+		fi
+	else
+		echo "ERROR - $CTLFILE does not exist"
+		export HIGHRC=1
+	fi
+done
+
+if [ -s $TMPOUT ]
+then
+	echo "$DBSERVER - the following backups are older than $DAYSOLD 24-hour period(s) asof $CURRENTDATE $CURRENTHHMM" >> $LOGFILE
+	cat $TMPOUT >> $LOGFILE
+	echo "" >> $LOGFILE
+fi
+
+#--------------------------------------------------------------------------
+#  Mail report
+#--------------------------------------------------------------------------
+if [ -s "$LOGFILE" ]
+then
+        export MAILFILE=$LOGFILE
+        export MAILSUBJECT="REPORT: Sybase Full Backups Behind"
+        sendMail
+fi
+
+#------------------------------------------------------------------------------------------
+# exit with final return code
+#------------------------------------------------------------------------------------------
+if [ $HIGHRC -eq 0 ]
+then
+        exit 0
+else
+	echo "ERROR - Checking backups behind"
+        exit 1
+fi

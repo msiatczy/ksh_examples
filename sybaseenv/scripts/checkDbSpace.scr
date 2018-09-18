@@ -1,0 +1,146 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkDbSpace.scr -S <DBSERVER|ase15|all> {-pctfull <pct full> -m <maildest>}
+#
+#  Description: Check database space for one or more instances
+#		Originally designed for ASE 15 instances, but can be used for any instance
+#		Report databases over n% full
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	09/24/07 K. Hess	Initial Script
+#	11/14/07 M. Siatczynski	Updated to call sp_gettingfull proc
+#	03/11/08 M. Siatczynski	Make DBSERVER and PCTFULL parms, all -m parm
+#	02/23/09 M. Siatczynski	If doing all servers, just run getAseList--this includes ASE15 instances
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER|ase15|all> {-pctfull <pct full> -m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -pctfull)     export PCTFULL=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserver.list.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export LOGFILE=$LOGDIR/misc/checkDbSpace.$DATETIME
+export SORTFILE=/tmp/checkDbSpace_sort.$$
+export REPORT=$RPTDIR/misc/checkDbSpace.$DATETIME
+export HIGHRC=0
+test ! "$PCTFULL" && export PCTFULL=90
+
+# format DBSERVERLIST
+> $DBSERVERLIST
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList >> $DBSERVERLIST
+elif [ "$ONEDBSERVER" = "ase15" ]
+then
+	getAse15List >> $DBSERVERLIST
+else
+	echo $ONEDBSERVER >> $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  For each ASE...
+#--------------------------------------------------------------------------
+> $LOGFILE
+
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	echo "\n*** $DBSERVER" >> $LOGFILE
+
+	# Format the SQL
+	> $SQLFILE
+	echo "set nocount on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "set proc_return_status off" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "use master">> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "sp_gettingfull $PCTFULL" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+# Execute the SQL...
+	> $SQLOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -i$SQLFILE -b | grep -v Password >> $SQLOUT
+
+# Check for errors
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+	        echo "$DBSERVER:  SQL FAILED" >> $LOGFILE
+	        export HIGHRC=1
+	fi
+	cat $SQLOUT >> $LOGFILE
+done
+
+#--------------------------------------------------------------------------
+#  Mail report
+#--------------------------------------------------------------------------
+if [ -s "$LOGFILE" ]
+then
+        > $REPORT
+        echo `date` >> $REPORT
+        echo "\n$0 executed by user $USER on `hostname`" >> $REPORT
+        echo "\n*******Report on databases over ${PCTFULL}% full********\n" >> $REPORT
+        test -s $LOGFILE && cat $LOGFILE >> $REPORT
+
+        export MAILFILE=$REPORT
+        export MAILSUBJECT="REPORT: Database Space Report"
+        sendMail
+fi
+
+#--------------------------------------------------------------------------
+# Exit with final status
+#--------------------------------------------------------------------------
+exit $HIGHRC

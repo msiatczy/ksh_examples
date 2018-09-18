@@ -1,0 +1,140 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: addUser.scr -U <user> -login <user to be added> -S <DBSERVER>,<DBSERVER>,etc -db <dbname> {-group <group>}
+#
+#  Description: Add a new user to a single database on one or more ASEs
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<user> - login of the user running the add
+#		<login> - user to be added
+#		<db> - database to add the user to
+#		<group> - group to add the user to (defaults to public)
+#
+#  Modification History:
+#       02/21/07 M. Siatczynski Initial script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -U <user> -login <user to be added> -S <DBSERVER>,<DBSERVER>,etc -db <dbname> {-group <group>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-U)		export EXEUSER=$2;shift 2;;
+			-login)		export LOGIN=$2;shift 2;;
+			-S)		export DBSERVERSPEC=$2;shift 2;;
+			-db)		export DBNAME=$2;shift 2;;
+			-group)		export GROUP=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# user and login and db must be passed
+if [ ! "$EXEUSER" -o ! "$LOGIN" -o ! "$DBSERVERSPEC" -o ! "$DBNAME" ]
+then
+	echo $USAGE
+	exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/useradmin/central/addUser.$DATETIME.$$
+export SQLFILE=/tmp/usersql.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Format serverlist 
+#--------------------------------------------------------------------------
+export DBSERVERLIST=`echo $DBSERVERSPEC | sed -e 's/,/ /g'`
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Adding USER $LOGIN to DB $DBNAME on the following ASEs:" >> $LOGFILE
+echo $DBSERVERLIST >> $LOGFILE
+
+#--------------------------------------------------------------------------
+#  Validate parms
+#  If group not passed, default to public
+#--------------------------------------------------------------------------
+if [ ! "$GROUP" ]
+then
+	export GROUP=public
+	echo "NOTE - Setting group to 'public'"
+fi
+ 
+#------------------------------------------------------------------------------
+# Format sql to add user
+# NOTE: set replication off, so user add will not replicate.
+#	This is easier then trying to figure out where to add the user.
+#------------------------------------------------------------------------------
+> $SQLFILE
+
+echo "use $DBNAME" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "set replication off" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+echo "if not exists (select name from $DBNAME..sysusers where name = \"$LOGIN\")" >> $SQLFILE
+echo "begin" >> $SQLFILE
+echo "print \"Adding USER ($LOGIN) to %1!:$DBNAME (group=$GROUP)...\",@@servername" >> $SQLFILE
+echo "execute sp_adduser $LOGIN,$LOGIN,\"$GROUP\"" >> $SQLFILE
+echo "end" >> $SQLFILE
+echo "else" >> $SQLFILE
+echo "print \"USER ($LOGIN) already exists in %1!:$DBNAME\",@@servername" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# run the sql to add the user
+#------------------------------------------------------------------------------
+echo ""
+for DBSERVER in `echo $DBSERVERLIST`
+do
+	echo "$DBSERVER: Adding USER ($LOGIN) to $DBNAME (group=$GROUP)" >> $LOGFILE
+	getPass $DBSERVER $EXEUSER | $ISQLEXE -U$EXEUSER -S$DBSERVER -w200 -i $SQLFILE >> $LOGFILE
+done
+
+#------------------------------------------------------------------------------
+# check output
+# Report on logins that already exist
+# Check for errors
+# Exit
+#------------------------------------------------------------------------------
+egrep '(^USER |^Adding USER )' $LOGFILE
+echo ""
+
+checkSqlErr $LOGFILE
+if [ $? -ne 0 ]
+then
+        echo "ERROR - adding user"
+        echo "Review $LOGFILE"
+        echo "\nREMINDER:  THIS SCRIPT MUST BE EXECUTED AGAINST BOTH ASES IN A REPLICATED ENVIRONMENT.\n"
+        exit 1
+else
+        echo "\nREMINDER:  THIS SCRIPT MUST BE EXECUTED AGAINST BOTH ASES IN A REPLICATED ENVIRONMENT.\n"
+        exit 0
+fi

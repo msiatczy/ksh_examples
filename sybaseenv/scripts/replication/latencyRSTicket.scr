@@ -1,0 +1,226 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: latencyRSTicket.scr -S <source DBSERVER> -T <target DBSERVER> -RS <REPSERVER> -ERSSD <RSSD> {-p <pagedest>}
+#
+#  Description: Using rs_ticket measure latency between primary and secondary
+#
+#     Location:	/sccm/dba/sybase/scripts/latencyRSTicket.scr 
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<source dbserver> - Source dbserver
+#              	<target dbserver> - Target dbserver
+#              	<repserver> - Repserver
+#              	<ERSSD> - Name of ERSSD database
+#
+#  Modification History:
+#	12/16/10 K. Sawant Rewrite script, based on earlier repLatency.scr
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+USAGE="ERROR - Usage: $0 -S <SOURCE DBSERVER> -T <TARGET DBSERVER> -RS <REPSERVER> -ERSSD <ERSSD> {-p <pagedest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export SRC_DBSERVER=$2;shift 2;;
+	                -T)	export TGT_DBSERVER=$2;shift 2;;
+	                -RS)	export REPSERVER=$2;shift 2;;
+	                -ERSSD)	export ERSSD=$2;shift 2;;
+	                -m)	export MAILDEST=$2;shift 2;;
+	                -p)	export PAGEDEST=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+
+# All three servers and ERSSD must be passed
+if [ ! "$SRC_DBSERVER" -o ! "$TGT_DBSERVER" -o ! "$REPSERVER" -o ! "$ERSSD" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+integer MINLATE
+test ! -d $RPTDIR/replication/repLatency/$REPSERVER && mkdir $RPTDIR/replication/repLatency/$REPSERVER
+export RPTFILE=$RPTDIR/replication/repLatency/$REPSERVER/$REPSERVER.${SRC_DBSERVER}_to_${TGT_DBSERVER}.using_rs_ticket.repLatency.$MMYYYY
+export DBLIST=/tmp/dblist.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export MAILFILE=/tmp/mailfile.$$
+export SQLOUT=/tmp/sqlout.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DBLIST && \rm -f $DBLIST
+	test $PAGEMSG && \rm -f $PAGEMSG
+	test $MAILFILE && \rm -f $MAILFILE
+	test $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Get list of all replicated databases where BOTH active and standby connections
+#  exist for the source and target dbservers
+#  Check for sql errors against ERSSD
+#--------------------------------------------------------------------------
+$OCSBIN/isql -U$ADMINLOGIN -S$ERSSD -b <<-! | egrep -v '(Password|rows affected|row affected|^$)' > $DBLIST
+	`getPass $ERSSD $ADMINLOGIN`
+	set nocount on
+	go
+	use $ERSSD
+	go
+	select a.dbname from rs_databases a where a.dsname = "$SRC_DBSERVER" and a.ptype = "A"
+	and a.dbname in (select b.dbname from rs_databases b where b.dsname = "$TGT_DBSERVER" and b.ptype = "S")
+	order by a.dbname
+	go
+	!
+
+checkSqlErr $DBLIST
+if [ $? -eq 1 ]
+then
+	echo "ERROR - SQL error(s) getting list of replicated databases from $ERSSD"
+	cat $DBLIST
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  If there are no databases to process, exit the script
+#--------------------------------------------------------------------------
+test ! -s $DBLIST && exit 0
+
+#--------------------------------------------------------------------------
+#  If database is not read only (status=1024):
+#	Execute rs_ticket stored proc which sends heartbeat timestamp to target ASE
+#  Check for SQL errors following each isql call
+#--------------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+	$ISQLEXE -U$ADMINLOGIN -S$SRC_DBSERVER <<-! | grep -v Password > $SQLOUT
+	`getPass $SRC_DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	if (select status&1024 from master..sysdatabases where name = "$DBNAME") <> 1024
+	begin
+		exec $DBNAME..rs_ticket
+	end
+	go
+	!
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+	echo "ERROR - SQL error(s) updating $SRC_DBSERVER:$DBNAME"
+		cat $SQLOUT
+	fi
+done
+
+#--------------------------------------------------------------------------
+# Wait 30 seconds and give the replication server time to push the data though
+#--------------------------------------------------------------------------
+sleep 30
+
+#--------------------------------------------------------------------------
+# Check rs_ticket_history on the target server to check the latency
+#--------------------------------------------------------------------------
+export MINLATE=0 
+> $MAILFILE
+cat $DBLIST |
+while read DBNAME
+do 
+#--------------------------------------------------------------------------
+# Check databases with offline status--accounts for databases in load (status2=16)
+#--------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$TGT_DBSERVER <<-! | grep -v Password > $SQLOUT
+	`getPass $TGT_DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	if (select status&1024 from master..sysdatabases where name = "$DBNAME") = 1024
+	and (select status2&16 from master..sysdatabases where name = "$DBNAME") = 16
+	begin
+		PRINT "DB under load"
+	end
+	go
+	!
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - SQL error(s) checking database suspect status"
+		cat $SQLOUT
+	fi
+
+#--------------------------------------------------------------------------
+# Calculate how many minutes the target server is behind the source server
+#--------------------------------------------------------------------------
+	export MINLATE="$(print "$($ISQLEXE -U$ADMINLOGIN -S$TGT_DBSERVER -b <<-! | tee $SQLOUT
+		`getPass $TGT_DBSERVER $ADMINLOGIN`
+		set nocount on
+		go
+		if (select status&1024 from master..sysdatabases where name = "$DBNAME") <> 1024
+			select ltrim(convert(char(11),(datediff(mi,pdb_t,getdate())))) 
+			from $DBNAME..rs_ticket_history 
+			where cnt=(select max(cnt) from $DBNAME..rs_ticket_history where rdb="${DBNAME}")
+		go
+		! )" | grep -v Password )"
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export COUNTRC=1
+		echo "ERROR - SQL error(s) calculating MINLATE for $DBNAME"
+		cat $SQLOUT
+	else
+		export COUNTRC=0
+	fi
+
+#--------------------------------------------------------------------------
+# If latency > 0 minutes write a log record.
+# If latency >= 60 minutes format a mail message.
+# If latency >= 120 minutes and a page destination is set, send a page.
+# (Send a separate page for each database -- easier to read on pager)
+#--------------------------------------------------------------------------
+	if [ $COUNTRC -eq 0 -a $MINLATE -gt 0 ]
+	then
+		echo "`date +'%D %T'` : $DBNAME : $TGT_DBSERVER is behind $SRC_DBSERVER by [minutes]: $MINLATE" >> $RPTFILE
+		if [ $MINLATE -ge 60 ]
+		then
+			echo "`date +'%D %T'` : $DBNAME : $TGT_DBSERVER is behind $SRC_DBSERVER by [minutes]: $MINLATE" >> $MAILFILE
+			if [ $MINLATE -ge 120 -a "$PAGEDEST" ]
+			then
+				echo "`date +'%D %T'` $DBNAME : $TGT_DBSERVER is behind $SRC_DBSERVER by [minutes]: $MINLATE" > $PAGEMSG
+		        	sendPage
+			fi
+		fi
+	fi
+done
+
+#--------------------------------------------------------------------------
+#  If MAILFILE exists and has size > 0 bytes, send mail 
+#--------------------------------------------------------------------------
+if [ -s $MAILFILE ]
+then
+	export MAILSUBJECT="$REPSERVER REPLICATION Latency Report"
+	sendMail
+fi
+
+#--------------------------------------------------------------------------
+#  Exit with 0  
+#--------------------------------------------------------------------------
+exit 0

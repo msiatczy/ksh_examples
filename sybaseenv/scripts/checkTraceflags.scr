@@ -1,0 +1,207 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkTraceflags.scr -S <DBSERVER> | -all {-m <maildest>}
+#
+#  Description: Validate active traceflags with RUN_server traceflags
+#		Run against one or all sybase servers.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	Autosys job:  DBM_dba_sybServerTraceFlagsALL
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	07/30/01 M. Siatczynski Original script
+#	03/01/02 M. Siatczynski Updates for OCS 12.5
+#	03/13/02 K. Hess	 Changed sybServerMachine.lst to sybDirectory.lst
+#	09/30/02 M. Siatczynski	Converted to standard
+#	10/16/02 M. Siatczynski	Changed sybDirectory.lst to aseDirectory.lst
+#	05/13/04 M. Siatczynski	Centralize script
+#	06/21/04 M. Siatczynski	Added grep to ignore header in ASEDIRLIST
+#	09/21/04 K. Hess	Updated rsh to ssh
+#	11/01/04 K. Hess	Rolling back update to ssh due to bad return
+#				status
+#	11/05/04 M. Murphy	Update script to only list trace flags not in
+#				the RUNSERVER file AND active on the server
+#	12/17/04 K. Hess	Updated rsh to ssh
+#	05/02/05 M. Siatczynski Added dbcc traceoff(3604) to end of sql code
+#	02/10/06 M. Siatczynski Implement ISQLEXE, getPass, ADMINLOGIN
+#	07/05/06 M. Siatczynski Ignore traceflag lines in RUNSERVER file that start with # (commented out)
+#	01/21/11 M. Siatczynski Direct ssh stderr to /dev/null to avoid capture of WARNING (/etc/banner) introduced with latest OS patch
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> | -all {-m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -all)   export ALL=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$ALL" && export ALL=0
+
+if [ ! "$ONEDBSERVER" -a $ALL -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ "$ONEDBSERVER" -a $ALL -eq 1 ]
+then
+        echo $USAGE
+        echo "ERROR - DBSERVER and -all are mutually exclusive"
+        exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserver.lst.$$
+export SQLOUT=/tmp/sqlout.$$
+export FLAGSON=/tmp/traceflags.$$
+export RUNSERVER=/tmp/runserver.$$
+export RUNSERVER2=/tmp/runserver2.$$
+export FLAGDIFF=/tmp/flagdiff.$$
+export NOTRUNSERVER=/tmp/not_run_server.$$
+export NOTSERVER=/tmp/not_server.$$
+export OUTFILE=$RPTDIR/central/checkTraceflags.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $FLAGSON && \rm -f $FLAGSON
+	test -f $RUNSERVER && \rm -f $RUNSERVER
+	test -f $RUNSERVER2 && \rm -f $RUNSERVER2
+	test -f $NOTRUNSERVER && \rm -f $NOTRUNSERVER
+	test -f $FLAGDIFF && \rm -f $FLAGDIFF
+	test -f $NOTSERVER && \rm -f $NOTSERVER
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dbserver list
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" ]
+then
+	grep "^$ONEDBSERVER " $ASEDIRLIST | cut -d" " -f1,2,4 > $DBSERVERLIST
+else
+	grep -v '^#' $ASEDIRLIST | cut -d" " -f1,2,4 > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+#  ssh to each database machine and get trace flags from runserver file
+#  isql into each database server and get active traceflags
+#  check for errors
+#  compare the traceflags in the RUN_server file with those active on the server
+#--------------------------------------------------------------------------
+
+> $OUTFILE
+date >> $OUTFILE
+echo "---------------------------------------------------------------------------------" >> $OUTFILE
+echo "Verify RUN_server traceflags are present in Active Traceflags list." >> $OUTFILE
+echo "---------------------------------------------------------------------------------" >> $OUTFILE
+
+cat $DBSERVERLIST |
+while read DBSERVER SN ASEDIR
+do
+	export DBSERVER SN ASEDIR
+	/usr/ucb/echo "Checking $DBSERVER . . . . ." >> $OUTFILE
+
+# send stderr to /dev/null to avoid capture of WARNING message
+	/usr/local/bin/ssh -n $SN "grep '\-T' $ASEDIR/install/RUN_${DBSERVER} 2>/dev/null | grep -v '^#'" > $RUNSERVER2
+
+#Pare down the RUNSERVER file to one traceflag per line ONLY
+
+	cat $RUNSERVER2 | sed -e 's/\-T//g' | tr '\\' ' '  | sed -e 's/ //g' | sort > $RUNSERVER
+	if [ $? -ne 0 ]
+	then
+		export HIGHRC=1
+		echo "ERROR - ssh'ing to $SN for $DBSERVER to get traceflags from RUNserver file" | tee -a $OUTFILE
+		echo "Skipping check for $DBSERVER" | tee -a $OUTFILE
+		continue
+	fi	
+
+	> $SQLOUT
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 <<-! | grep 'Active traceflags:' >> $SQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	dbcc traceon(3604)
+	go
+	dbcc traceflags
+	go
+	dbcc traceoff(3604)
+	go
+	!
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "ERROR - getting active traceflags for $DBSERVER" | tee -a $OUTFILE
+		echo "Skipping check of $DBSERVER" | tee -a $OUTFILE
+		continue
+	else
+
+#Pare down the active trace flags to one traceflag per line ONLY
+
+		cat $SQLOUT | sed -e 's/Active traceflags: //g' | tr ', ' '\012' | sed -e 's/ //g' | egrep -v '(3604|8399)' | sort > $FLAGSON
+	fi
+
+	diff $RUNSERVER $FLAGSON > $FLAGDIFF
+
+	if [ -s $FLAGDIFF ]
+	then
+		grep '>' $FLAGDIFF > $NOTRUNSERVER
+		grep '<' $FLAGDIFF > $NOTSERVER
+		if [ -s $NOTRUNSERVER ]
+		then
+			echo "  Active traceflags not in the RUNserver file" >> $OUTFILE
+			cat $NOTRUNSERVER >> $OUTFILE
+		fi
+		if [ -s $NOTSERVER ]
+		then
+			echo "  RUNserver flags not active on the server" >> $OUTFILE
+			cat $NOTSERVER >> $OUTFILE
+		fi
+		echo "" >> $OUTFILE
+	fi
+
+done
+
+echo "Checking is complete." >> $OUTFILE
+
+#------------------------------------------------------------------------------
+#  mail the report
+#------------------------------------------------------------------------------
+
+export MAILFILE=$OUTFILE
+export MAILSUBJECT="Sybase Trace Flags"
+sendMail
+
+#------------------------------------------------------------------------------
+# Exit
+#------------------------------------------------------------------------------
+exit $HIGHRC

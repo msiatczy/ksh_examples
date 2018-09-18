@@ -1,0 +1,253 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkWcmDefaultRoles.scr -S <DBSERVER> {-m <maildest>}
+#
+#  Description: Check all wc_ accounts for valid role membership:
+#		WC_ALL_DBREADONLY  - select on all user tables/views
+#		WC_ALL_DBFULL  - insert,update,delete,select on all user tables/views, execute on all procs
+#		WC_ALL_NOEXPIRE  - flag only - excludes account from 90-day non-use check -- dependency removed 9/21/10
+#		Rules:  NAMED wc_ accounts should always be granted WC_ALL_NOEXPIRE
+#			wc_ accounts MAY be granted ONE of the all-access roles (READONLY or FULL), but NOT BOTH
+#			alternately, a wc_ account MAY be granted another WC_ role instead of one of the WC_ALL roles
+#
+#		Exclusions:  Control list (WC_FACELESS_LIST) used to exclude faceless accounts (vary by ASE)
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	-S DBSERVER
+#              	-m maildest override
+#
+#  Modification History:
+#	05/14/10 M. Siatczynski	Initial Script
+#	08/02/10 M. Siatczynski	If not member of WC_ALL role, should be member of another WC_ role
+#	09/21/10 M. Siatczynski	Remove check to validate membership in WC_ALL_NOEXPIRE - not required for all wc accounts
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-m <maildest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVERSPEC=$2;shift 2;;
+	                -m)	export MAILDEST=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+#--------------------------------------------------------------------------
+#  Validate parms
+#--------------------------------------------------------------------------
+if [ ! "$DBSERVERSPEC" ]
+then
+	echo $USAGE
+	echo "DBSERVER must be passed"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Use this to describe major sections of code
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/serverlist.$$
+export SQL1=/tmp/perm.sql1.$$
+export SQLOUT=/tmp/sqlout.$$
+export MAILFILE=/tmp/mailfile.$$
+
+export HIGHRC=0
+> $MAILFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQL1 && \rm -f $SQL1
+	test $SQLOUT && \rm -f $SQLOUT
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Initialize list of dbservers
+# Using DBSERVERLIST leaves flexibility for running against multiple ASEs in the future
+#--------------------------------------------------------------------------
+echo "$DBSERVERSPEC" > $DBSERVERLIST
+
+#--------------------------------------------------------------------------
+# Process each DBSERVER separately
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+#--------------------------------------------------------------------------
+# Write headers
+#--------------------------------------------------------------------------
+	export WC_FACELESS_LIST=$CTLDIR/$DBSERVER/$DBSERVER.wc_faceless.lst
+	export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.checkWcmDefaultRoles.$DATETIME
+	> $LOGFILE
+
+#--------------------------------------------------------------------------
+# Format list of faceless accounts to exclude
+#--------------------------------------------------------------------------
+	if [ "$WC_FACELESS_LIST" -a -s "$WC_FACELESS_LIST" ]
+	then
+		export FIRSTLOGIN=1
+# init string with (
+		export EXCLUDE_INCLAUSE="("
+		cat $WC_FACELESS_LIST |
+		while read XLOGIN
+		do
+			test $FIRSTLOGIN -eq 1 && export EXCLUDE_INCLAUSE="${EXCLUDE_INCLAUSE}'$XLOGIN'" || export EXCLUDE_INCLAUSE="${EXCLUDE_INCLAUSE},'$XLOGIN'"
+			export FIRSTLOGIN=0
+		done
+# append closing )
+	        export EXCLUDE_INCLAUSE="${EXCLUDE_INCLAUSE})"
+	fi
+
+#--------------------------------------------------------------------------
+# Format the sql statements to check for missing role membership
+# WC_ALL_NOEXPIRE check commented out 9/21/10 - not all named accounts will have this role granted
+# (leave code for reference for now....remove by EOY 2010)
+#--------------------------------------------------------------------------
+	> $SQL1
+	echo "set nocount on" >> $SQL1
+	echo "go" >> $SQL1
+
+#	echo "select @@servername,name,'WC_ALL_NOEXPIRE role should be granted'" >> $SQL1
+#	echo "from master..syslogins" >> $SQL1
+#	echo "where name like 'wc[_]%'" >> $SQL1
+#	test "$EXCLUDE_INCLAUSE" && echo "and name not in $EXCLUDE_INCLAUSE" >> $SQL1
+#	echo "and suid not in (select distinct suid from sysloginroles where role_name(srid) = 'WC_ALL_NOEXPIRE')" >> $SQL1
+#	echo "go" >> $SQL1
+
+#--------------------------------------------------------------------------
+# Format the sql statements to check for login in BOTH roles
+#--------------------------------------------------------------------------
+	echo "select @@servername,suser_name(suid),'login not allowed in BOTH WC_ALL roles'" >> $SQL1
+	echo "from sysloginroles" >> $SQL1
+	echo "where role_name(srid) in ('WC_ALL_DBFULL','WC_ALL_DBREADONLY')" >> $SQL1
+	echo "group by suser_name(suid)" >> $SQL1
+	echo "having count(suser_name(suid)) > 1" >> $SQL1
+	echo "go" >> $SQL1
+
+#--------------------------------------------------------------------------
+# Format the sql statements to check for login in NEITHER roles
+#--------------------------------------------------------------------------
+	echo "select @@servername,name,'NO WC_ role has been granted'" >> $SQL1
+	echo "from master..syslogins" >> $SQL1
+	echo "where name like 'wc[_]%'" >> $SQL1
+	test "$EXCLUDE_INCLAUSE" && echo "and name not in $EXCLUDE_INCLAUSE" >> $SQL1
+	echo "and suid not in (select distinct suid from sysloginroles where role_name(srid) like 'WC[_]%')" >> $SQL1
+#	echo "and suid not in (select distinct suid from sysloginroles where role_name(srid) in ('WC_ALL_DBFULL','WC_ALL_DBREADONLY'))" >> $SQL1
+	echo "go" >> $SQL1
+
+#--------------------------------------------------------------------------
+# Pipe in the sql to check the roles
+#--------------------------------------------------------------------------
+	echo "`date` $DBSERVER - Checking roles..." >> $LOGFILE
+	> $SQLOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQL1 | grep -v Password >> $SQLOUT
+
+	cat $SQLOUT >> $LOGFILE
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "ERROR - Checking default roles on $DBSERVER" >> $LOGFILE
+		cat $LOGFILE >> $MAILFILE
+		continue
+	else
+		test -s $SQLOUT && export HIGHRC=1
+		test -s $SQLOUT && cat $LOGFILE >> $MAILFILE
+	fi
+
+#--------------------------------------------------------------------------
+# Format the sql statements to check for password expiration <> 60
+#--------------------------------------------------------------------------
+	> $SQL1
+	echo "set nocount on" >> $SQL1
+	echo "go" >> $SQL1
+	echo "create table #pwdexp (asename varchar(20) not null,wcname varchar(15) not null,pwdexp int null)" >> $SQL1
+	echo "insert #pwdexp (asename,wcname) select @@servername,name" >> $SQL1
+	echo "from master..syslogins" >> $SQL1
+	echo "where name like 'wc[_]%'" >> $SQL1
+	test "$EXCLUDE_INCLAUSE" && echo "and name not in $EXCLUDE_INCLAUSE" >> $SQL1
+	echo "go" >> $SQL1
+
+	echo "declare @passwdexp int,@passeclass int" >> $SQL1
+
+	echo "select @passeclass = class from master.dbo.sysattributes where object_type = \"PS\"" >> $SQL1
+
+	echo "update #pwdexp set pwdexp = int_value from master.dbo.sysattributes, #pwdexp" >> $SQL1
+	echo "where class = @passeclass AND attribute = 0 AND object = suser_id(wcname)" >> $SQL1
+	echo "AND object_cinfo = \"login\"" >> $SQL1
+	echo "and pwdexp is null" >> $SQL1
+
+	echo "update #pwdexp set pwdexp = int_value from master.dbo.sysattributes" >> $SQL1
+	echo "where class = 27 AND attribute = 7" >> $SQL1
+	echo "and pwdexp is null" >> $SQL1
+
+	echo "update #pwdexp set pwdexp = value" >> $SQL1
+	echo "from master.dbo.sysconfigures" >> $SQL1
+	echo "where name = \"systemwide password expiration\"" >> $SQL1
+	echo "and pwdexp is null" >> $SQL1
+	echo "go" >> $SQL1
+
+	echo "select asename,wcname,\"PASSWD EXPR=\",pwdexp from #pwdexp" >> $SQL1
+	echo "where pwdexp <> 60" >> $SQL1
+	echo "go" >> $SQL1
+	echo "drop table #pwdexp" >> $SQL1
+	echo "go" >> $SQL1
+
+#--------------------------------------------------------------------------
+# Pipe in the sql to check passwd expiration
+#--------------------------------------------------------------------------
+	echo "`date` $DBSERVER - Checking password expiration for values not equal 60..." >> $LOGFILE
+	> $SQLOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQL1 | grep -v Password >> $SQLOUT
+
+	cat $SQLOUT >> $LOGFILE
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "ERROR - Checking password expiration on $DBSERVER" >> $LOGFILE
+		cat $LOGFILE >> $MAILFILE
+		continue
+	else
+		test -s $SQLOUT && export HIGHRC=1
+		test -s $SQLOUT && cat $LOGFILE >> $MAILFILE
+	fi
+done
+
+#--------------------------------------------------------------------------
+# Write trailer
+# send email
+# Exit
+#--------------------------------------------------------------------------
+echo "`date` Script complete" >> $LOGFILE
+
+if [ $HIGHRC -eq 1 ]
+then
+	export MAILSUBJECT="ERROR checking default WC roles"
+	sendMail
+fi
+
+exit $HIGHRC

@@ -1,0 +1,159 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: verifyDatabaseOwner.scr -S <DBSERVER>|all -D <dbname|all> -dbowner <login> {-m <maildest>}
+#
+#  Description: Verify all databases are owned by the designated dbowner.
+#
+#     Location:	/sccm/dba/sybase/scripts/verifyDatabaseOwner.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - ASE
+#		<dbname> - database name
+#		<dbowner> - designated dbowner
+#		<maildest> - override default maildest of dba
+#
+#  Modification History:
+#       03/22/05 M. Siatczynski Initial script
+#       09/28/09 M. Siatczynski Allow multiple values for dbowner
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER>|all -D <database|all -dbowner <login> {-m <maildest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export ONEDBSERVER=$2;shift 2;;
+			-D)		export ONEDBNAME=$2;shift 2;;
+			-dbowner)	export DBOWNERSPEC=$2;shift 2;;
+			-m)		export MAILDEST=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$ONEDBSERVER" -o ! "$ONEDBNAME" -o ! "$DBOWNERSPEC" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export SEDFILE=/tmp/sedfile.$$
+export SQLFILE=/tmp/usersql.$$
+export SQLOUT=/tmp/sqlout.$$
+export MAILFILE=/tmp/mailfile.$$
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export LOGFILE=$LOGDIR/useradmin/central/verifyDatabaseOwner.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SEDFILE && \rm -f $SEDFILE
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create working list of ASEs
+# Format DBOWNERLIST (using a sedfile is easiest because of the single quite substitions)
+#------------------------------------------------------------------------------
+test "$ONEDBSERVER" = "all" && getAseList > $DBSERVERLIST || echo $ONEDBSERVER > $DBSERVERLIST
+
+> $SEDFILE
+echo "s/^/('/g" >> $SEDFILE
+echo "s/,/','/g" >> $SEDFILE
+echo "s/$/')/g" >> $SEDFILE
+
+#export DBOWNERLIST=`echo $DBOWNERSPEC | sed -e 's/^/("/g' -e 's/,/","/g' -e 's/$/")/g'`
+export DBOWNERLIST=`echo $DBOWNERSPEC | sed -f $SEDFILE`
+
+#------------------------------------------------------------------------------
+# Do the following for each ASE in DBSERVERLIST...
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Verify the following database owners" >> $LOGFILE
+echo $DBOWNERLIST >> $LOGFILE
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+
+#------------------------------------------------------------------------------
+# Format the SQL
+#------------------------------------------------------------------------------
+	> $SQLFILE
+	echo "set nocount on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	if [ "$ONEDBNAME" = "all" ]
+	then
+#		echo "select convert(char(15),@@servername),name,suser_name(suid) from master..sysdatabases where suser_name(suid) <> \"$DBOWNER\"" >> $SQLFILE
+		echo "select convert(char(15),@@servername),name,suser_name(suid) from master..sysdatabases where suser_name(suid) not in $DBOWNERLIST" >> $SQLFILE
+	else
+#		echo "select convert(char(15),@@servername),name,suser_name(suid) from master..sysdatabases where name = \"$ONEDBNAME\" and suser_name(suid) <> \"$DBOWNER\"" >> $SQLFILE
+		echo "select convert(char(15),@@servername),name,suser_name(suid) from master..sysdatabases where name = \"$ONEDBNAME\" and suser_name(suid) not in $DBOWNERLIST" >> $SQLFILE
+	fi
+	echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# Append the output to the logfile
+#------------------------------------------------------------------------------
+	echo "\n`date` $DBSERVER: Verifying database owners" >> $LOGFILE
+
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 -i$SQLFILE | grep -v Password> $SQLOUT
+
+	cat $SQLOUT >> $LOGFILE
+#------------------------------------------------------------------------------
+# Check for errors
+#------------------------------------------------------------------------------
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "`date` $DBSERVER: SQL FAILED" >> $LOGFILE
+	else
+		if [ -s $SQLOUT ]
+		then
+			echo "`date` $DBSERVER: Database owners NOT properly configured" >> $LOGFILE
+			> $MAILFILE
+			echo "The database owner is NOT VALID for the following database(s)." >> $MAILFILE
+			echo "The database owner should be in $DBOWNERLIST." >> $MAILFILE
+			echo "Use $SCRDIR/updDatabaseOwner.scr to correct the database owners." >> $MAILFILE
+			echo "See $LOGFILE for details of all ASEs.\n" >> $MAILFILE
+			cat $SQLOUT >> $MAILFILE
+			export MAILSUBJECT="$DBSERVER: Database Owner Verification FAILED"
+			sendMail
+		else
+			echo "`date` $DBSERVER: Database owners properly configured" >> $LOGFILE
+		fi
+	fi
+done
+
+echo "\n`date` END Verify database owners" >> $LOGFILE
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+test $HIGHRC -eq 1 && exit 1 || exit 0

@@ -1,0 +1,227 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: commitSummary.scr -R <REPOSITORY> {-S <DBSERVER> -F <from yyyy/mm/dd> -T <to yyyy/mm/dd -m <maildest> -rpt <all|fail|none>}
+#
+#  Description: Check sybase baseline compliance summary using COMMIT software
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<REPOSITORY> - compliance repository ASE
+#   		<DBSERVER> - ASE
+#   		<FROMDATE> - from date format yyyy/mm/dd
+#   		<TODATE> - to date format yyyy/mm/dd
+#   		<rpt> - report detail level (default=none)
+#
+#  Modification History:
+#	06/03/10 M. Siatczynski	Original script
+#	08/18/10 M. Siatczynski	Add parm to display module detail level - all (PASS/FAIL), FAIL only, or none
+#				Exit 2 failure, 1 warning, 0 success
+#	08/27/10 M. Siatczynski	Update select clause to pull most recent run per ASE for a given date range
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -R <REPOSITORY> {-S <DBSERVER> -F <from yyyy/mm/dd> -T <to yyyy/mm/dd -m <maildest> -rpt <all|fail|none>}"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 2
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -R)		export REPOSITORY=$2;shift 2;;
+                        -S)		export DBSERVER=$2;shift 2;;
+                        -F)		export FROMDATE=$2;shift 2;;
+                        -T)		export TODATE=$2;shift 2;;
+                        -m)		export MAILSPEC=$2;shift 2;;
+                        -rpt)		export RPTDETAIL=$2;shift 2;;
+                        -*)		echo $USAGE;exit 2;;
+                        *)		echo $USAGE;exit 2;;
+                esac
+        done
+fi
+
+if [ ! "$REPOSITORY" ]
+then
+        echo $USAGE
+        exit 2
+fi
+
+test "$DBSERVER" && export DBSERVERSPEC="-S $DBSERVER" || export DBSERVERSPEC=""
+test ! "$RPTDETAIL" && export RPTDETAIL=none
+
+export LOGFILE=$LOGDIR/audit/$REPOSITORY/$REPOSITORY.commitSummary.$DATETIME
+export CTOUT=/tmp/ctout.$$
+export MAILFILE=/tmp/mailfile.$$
+export MAILFILE=/tmp/mailfile.$$
+export CMPIDLIST=/tmp/cmpidlist.$$
+export CURRDATE=`date +"%Y/%m/%d"`
+test ! "$FROMDATE" && export FROMDATE=$CURRDATE
+test ! "$TODATE" && export TODATE=$CURRDATE
+export HIGHRC=0
+
+#------------------------------------------------------------------------------
+# format optional SQL clause
+#------------------------------------------------------------------------------
+export OPTSQL=""
+# if DBSERVER is passed, add that to where clause
+test "$DBSERVER" && export OPTSQL="$OPTSQL and svr_nm=\"$DBSERVER\""
+
+#------------------------------------------------------------------------------
+# If MAILSPEC is passed, validate and format list of email addrs
+# If not set here, MAILDEST defaults
+#------------------------------------------------------------------------------
+if [ "$MAILSPEC" ]
+then
+# make sure control file exists and has entries
+        if [ -f $MAILSPEC ]
+        then
+                if [ -s $MAILSPEC ]
+                then
+                        export MAILDEST=`cat $MAILSPEC`
+                else
+                        eval echo "WARNING - $MAILSPEC is 0 bytes" $OUTDEST
+                fi
+        else
+# make sure the mailspec doesn't contain slashes--otherwise it may be an invalid file reference
+                echo $MAILSPEC | grep '/' > /dev/null
+                if [ $? -eq 0 ]
+                then
+                        echo "ERROR - $MAILSPEC is not valid--possible invalid filename?"
+                        exit 2
+                else
+                        export MAILDEST=$MAILSPEC
+                fi
+        fi
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $CTOUT && \rm -f $CTOUT
+	test $MAILFILE && \rm -f $MAILFILE
+	test -f $CMPIDLIST && \rm -f $CMPIDLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $MAILFILE
+> $LOGFILE
+echo "`date` START - Sybase COMMIT summary against repository $REPOSITORY $FROMDATE to $TODATE" >> $LOGFILE
+echo "Report detail level = $RPTDETAIL" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# run summary report
+#------------------------------------------------------------------------------
+echo "\n`date` Executing ct_summary.pl against $REPOSITORY" >> $LOGFILE
+
+> $CTOUT
+$COMMITDIR/sybadmin/tools/ct_summary.pl -R $REPOSITORY -F $FROMDATE -T $TODATE $DBSERVERSPEC >> $CTOUT
+export CTRUNRC=$?
+test $CTRUNRC -ne 0 && export HIGHRC=2
+cat $CTOUT >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Detail report section
+# Get list of compliance run IDs based on detail level
+# Run appropriate ct_report script for each compliance run ID
+#------------------------------------------------------------------------------
+if [ "$RPTDETAIL" != "none" ]
+then
+#------------------------------------------------------------------------------
+# get list of compliance run IDS
+#------------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$REPOSITORY -w200 -b <<-! | grep -v Password > $CMPIDLIST
+	`getPass $REPOSITORY $ADMINLOGIN`
+	set nocount on
+	go
+	select cmpl_run_id 
+	from compliance_rep..compliance_run 
+	where
+	convert(date,strt_tm) >= "$FROMDATE" 
+	and convert(date,strt_tm) <= "$TODATE" 
+	$OPTSQL
+	group by svr_nm
+	having strt_tm = max(strt_tm)
+	order by cmpl_run_id
+	go
+	!
+
+	checkSqlErr $CMPIDLIST
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting list of compliance run IDs from $REPOSITORY" >> $LOGFILE
+		cat $CMPIDLIST >> $LOGFILE
+		export HIGHRC=2
+	fi
+
+	if [ ! -s $CMPIDLIST ]
+	then
+		echo "ERROR - No compliance run IDs in date range provided" >> $LOGFILE
+		export HIGHRC=2
+		continue
+	fi
+
+#------------------------------------------------------------------------------
+# Run ct_report of ct_report_fail for each compliance run ID
+#------------------------------------------------------------------------------
+
+	if [ "$RPTDETAIL" = "all" ]
+	then
+		echo "\n`date` Executing ct_report.pl against $REPOSITORY for each compliance run ID\n" >> $LOGFILE
+		cat $CMPIDLIST |
+		while read CMPID
+		do
+			export CMPID
+			> $CTOUT
+			echo "*******************************************************************\n" >> $CTOUT
+			$COMMITDIR/sybadmin/tools/ct_report.pl -C $CMPID -R $REPOSITORY >> $CTOUT
+			export CTRUNRC=$?
+			test $CTRUNRC -ne 0 && export HIGHRC=2
+			cat $CTOUT >> $LOGFILE
+		done
+	elif [ "$RPTDETAIL" = "fail" ]
+	then
+		echo "\n`date` Executing ct_report_fail.pl against $REPOSITORY for each compliance run ID\n" >> $LOGFILE
+		cat $CMPIDLIST |
+		while read CMPID
+		do
+			export CMPID
+			> $CTOUT
+			echo "*******************************************************************" >> $CTOUT
+			$COMMITDIR/sybadmin/tools/ct_report_fail.pl -C $CMPID -R $REPOSITORY >> $CTOUT
+			export CTRUNRC=$?
+			test $CTRUNRC -ne 0 && export HIGHRC=2
+			cat $CTOUT >> $LOGFILE
+		done
+	else
+		echo "\nWARNING - Invalid detail level ($RPTDETAIL) passed to script" >> $LOGFILE
+		export HIGHRC=1
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# Write trailers
+#------------------------------------------------------------------------------
+echo "\n`date` END - Sybase COMMIT summary against repository $REPOSITORY" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# send email, exit with final status
+#------------------------------------------------------------------------------
+cat $LOGFILE >> $MAILFILE
+export MAILSUBJECT="Sybase COMMIT summary $FROMDATE to $TODATE"
+sendMail
+
+exit $HIGHRC

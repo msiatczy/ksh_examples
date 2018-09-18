@@ -1,0 +1,147 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getFormulaDataserverDbschema.scr -S <DBSERVER> | -all
+#
+#  Description: Gather Sybase dataserver/dbschema for integration into Formula
+#
+#     Location:	/sccm/dba/sybase/scripts/getFormulaDataserverDbschema.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  NOTE:  This scirpt uses the exclude list that is used by transparency reporting.
+#
+#  Modification History:
+#	02/12/04 M. Siatczynski	Initial Script
+#	02/16/04 M. Siatczynski	Updated to reference PRD Autosys_Import subdir rather than DVL
+#	06/03/04 M. Siatczynski	Add logic to account for empty exclude list
+#	12/17/04 K. Hess	Updated rsh to ssh
+#	12/31/04 K. Hess	Hard-coded path to ssh
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#       03/15/07 M. Siatczynski Change grep of SN to correctly identify SN as the only thing on the line
+#       01/19/10 M. Siatczynski /sccm/cfig/sysinfo/service-names not maintained, need to ssh to SN to get actual hostname
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> | -all"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -all)   export ALL=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$ALL" && export ALL=0
+
+if [ "$ONEDBSERVER" -a $ALL -eq 1 ]
+then
+        echo $USAGE
+        echo "ERROR - DBSERVER and -all are mutually exclusive"
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/list.$$
+export SQLOUT=/tmp/sqlout.$$
+export EXCLUDE_LIST=$CTLDIR/transparencyExclude.lst
+export DATAFILE=/sccm/AutoSys_Import/PRD/formula/it_transparency/syb_db_info.txt
+
+> $DATAFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Generate list of servers to process
+#--------------------------------------------------------------------------
+
+if [ "$ONEDBSERVER" ]
+then
+	grep "^${ONEDBSERVER} " $ASEDIRLIST | cut -d" " -f1-2 > $DBSERVERLIST
+else
+	test -s $EXCLUDE_LIST && grep -v '^#' $ASEDIRLIST | cut -d" " -f1-2 | egrep -vf $EXCLUDE_LIST > $DBSERVERLIST || grep -v '^#' $ASEDIRLIST | cut -d" " -f1-2 > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+#  Process each server in the list
+#  MUST ssh to service name to get hostname
+#  method previously pulled from /sccm/cfig/sysinfo/service-names, but this file is no longer maintained by OSE process
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER SN
+do
+	export DBSERVER SN
+	unset HN
+
+# ssh to service name to get the hostname, send stderr (WARNING message) to /dev/null
+	export HN=`/usr/local/bin/ssh -n $SN 'hostname' 2>/dev/null`
+
+# if HN not set, default to service name and print error message
+	if [ ! "$HN" ]
+	then
+		echo "ERROR - unable to obtain hostname for service name $SN - defaulting to service name"
+		export HN=$SN
+	fi
+
+# Query the dataserver to get list of dbschemas
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password | sed -e 's/ //g' > $SQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select @@servername+","+name+",$HN,$SN,sybase"
+	from master..sysdatabases
+	where name not in ('master','model','sybsystemprocs','sybsystemdb','dba')
+	and name not like 'dbcc%'
+	and name not like 'sybsecurity%'
+	and name not like 'tempdb%'
+	order by name
+	go
+	!
+
+# Check for sql errors
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - Unable to obtain dbschema names from $DBSERVER"
+		echo "Skipping data collection for $DBSERVER"
+		continue
+	else
+		cat $SQLOUT >> $DATAFILE
+	fi
+
+done
+
+# chmod the file so it can be opened on the NT side
+chmod 777 $DATAFILE
+
+#--------------------------------------------------------------------------
+# Exit the script
+#--------------------------------------------------------------------------
+exit 0

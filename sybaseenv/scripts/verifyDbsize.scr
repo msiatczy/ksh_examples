@@ -1,0 +1,167 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: verifyDbsize.scr -S1 <DBSERVER1> -S2 <DBSERVER2>
+#
+#  Description: Verify dbsizes between two DB servers
+#  NOTE:	Does not verify segmenet allocation order at this time.
+#
+#     Location:	/sccm/dba/sybase/scripts/verifyDbsize.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	09/23/02 M. Siatczynski	Initial Script (rewrite FOZZIE refresh script)
+#	04/21/03 M. Siatczynski	Updated code to account for EGREPOUT names occurring in user database names
+#	01/23/04 M. Siatczynski	Centralized script
+#	08/23/04 M. Siatczynski	Move OUTFILE from reports to logs directory
+#	09/21/05 M. Siatczynski	Added additional code to make compare work properly
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S1 <DBSERVER1> -S2 <DBSERVER2>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S1)    export DBSERVER1=$2;shift 2;;
+                        -S2)    export DBSERVER2=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER1" -o ! "$DBSERVER2" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+export SPACE1=/tmp/$DBSERVER1.dbsize.$$
+export SPACE2=/tmp/$DBSERVER2.dbsize.$$
+export SPACE1X=/tmp/$DBSERVER1.dbsizex.$$
+export SPACE2X=/tmp/$DBSERVER2.dbsizex.$$
+export SPACE1DB=/tmp/$DBSERVER1.dbsizedb.$$
+export SPACE2DB=/tmp/$DBSERVER2.dbsizedbx.$$
+export CHECKLIST=/tmp/checklist.$$
+export EGREPOUT=/tmp/egreplist.$$
+
+> $EGREPOUT
+echo "^dba " >> $EGREPOUT
+echo "^dbccalt " >> $EGREPOUT
+echo "^dbccdb " >> $EGREPOUT
+echo "^master " >> $EGREPOUT
+echo "^model " >> $EGREPOUT
+echo "^sybsecurity " >> $EGREPOUT
+echo "^sybsecurity_archive " >> $EGREPOUT
+echo "^sybsystemdb " >> $EGREPOUT
+echo "^sybsystemprocs " >> $EGREPOUT
+echo "^tempdb " >> $EGREPOUT
+
+export OUTFILE=$LOGDIR/misc/${DBSERVER1}vs${DBSERVER2}.verifyDbsize.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SPACE1 && \rm -f $SPACE1
+	test -f $SPACE2 && \rm -f $SPACE2
+	test -f $SPACE1X && \rm -f $SPACE1X
+	test -f $SPACE2X && \rm -f $SPACE2X
+	test -f $SPACE1DB && \rm -f $SPACE1DB
+	test -f $SPACE2DB && \rm -f $SPACE2DB
+	test -f $CHECKLIST && \rm -f $CHECKLIST
+	test -f $EGREPOUT && \rm -f $EGREPOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Get dbspace for first server
+#------------------------------------------------------------------------------
+
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER1 -w200 -b <<-! | grep -v Password | sed -e 's/^ //g' | sort > $SPACE1
+`getPass $DBSERVER1 $ADMINLOGIN`
+set nocount on
+go
+select db_name(dbid),sum(size/512) from sysusages group by dbid order by db_name(dbid)
+go
+!
+
+checkSqlErr $SPACE1
+if [ $? -ne 0 ]
+then
+	echo "ERROR - Unable to obtain space info for $DBSERVER1"
+	exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Get dbspace for second server
+#------------------------------------------------------------------------------
+
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER2 -w200 -b <<-! | grep -v Password | sed -e 's/^ //g' | sort > $SPACE2
+`getPass $DBSERVER2 $ADMINLOGIN`
+set nocount on
+go
+select db_name(dbid),sum(size/512) from sysusages group by dbid order by db_name(dbid)
+go
+!
+
+checkSqlErr $SPACE2
+if [ $? -ne 0 ]
+then
+	echo "ERROR - Unable to obtain space info for $DBSERVER2"
+	exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Compare space utilization
+#  1.  Get databases which exist on both servers but have different usages
+#	- combine all usage lines and sort so matching database names are adjacent
+#	- filter out duplicate lines (usage the same between the 2 servers)
+#	- from the remaining list, get database names which are common to both servers
+#  2.  Pull the usage information for this list of databases
+#  3.  Print a usage comparison
+#------------------------------------------------------------------------------
+cut -d" " -f1 $SPACE1 | sed -e 's/$/ /g' > $SPACE1DB
+cut -d" " -f1 $SPACE2 | sed -e 's/$/ /g'> $SPACE2DB
+comm -12 $SPACE1DB $SPACE2DB > $CHECKLIST
+
+if [ -s $CHECKLIST ]
+then
+	egrep -f $CHECKLIST $SPACE1 | egrep -vf $EGREPOUT > $SPACE1X
+	egrep -f $CHECKLIST $SPACE2 | egrep -vf $EGREPOUT > $SPACE2X
+# write outfile headers
+	> $OUTFILE
+	date >> $OUTFILE
+	echo "-----------------------------------------------------------------------------------------------------------------------" >> $OUTFILE
+	echo "" >> $OUTFILE
+	echo "$DBSERVER1 database/size                                               $DBSERVER2 database/size" >> $OUTFILE
+	echo "-----------------------------------------------------------------------------------------------------------------------" >> $OUTFILE
+	sdiff -s $SPACE1X $SPACE2X | egrep -vf $EGREPOUT | grep '^[^0-9]' >> $OUTFILE
+	cat $OUTFILE
+	echo "\nReport saved under $OUTFILE\n"
+else
+	echo "\nNo space differences between $DBSERVER1 and $DBSERVER2\n"
+fi
+
+#------------------------------------------------------------------------------
+# Exit with 0
+#------------------------------------------------------------------------------
+exit 0

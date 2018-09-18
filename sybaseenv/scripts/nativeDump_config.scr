@@ -1,0 +1,277 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: nativeDump_config.scr -S <DBSERVER> 
+#
+#  Description: This script will prompt for backup pool information and add it to the dl_dump_pools table in the sybdb database.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Manual only.
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#
+#  Modification History:
+#	01/28/10 J. Aspenleiter	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SQLOUT=/tmp/sqlout.$$
+export LOGFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.nativeDump_config.$DATETIME
+export SQLFILE=/tmp/sqlfile.$$
+export DIALOGFILE=/tmp/dialogfile.$$
+
+> $LOGFILE
+date >> $LOGFILE
+echo "Adding new backup pool destinations to $DBSERVER %" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $DIALOGFILE && \rm -f $DIALOGFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+function getBackupPools {
+	#--------------------------------------------------------------------------
+	#CHECK TO SEE IF A NEW BACKUP DESTINATION NEEDS TO BE ADDED TO dl_dump_pools
+	#--------------------------------------------------------------------------
+	echo "set nocount on" > $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "use" >> $SQLFILE
+	echo "sybdb" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "select cast(dump_pool_id as varchar(5)) + \" \" + rtrim(full_dump_path) + \" \" + rtrim(tran_dump_path) from dl_dump_pools" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	
+	BCKUPPOOLEXIST=0
+	
+	> $DIALOGFILE
+	> $SQLOUT
+	
+	echo "-----------------------------" >> $DIALOGFILE
+	echo "BACKUP POOL(S)" >> $DIALOGFILE
+	echo "-----------------------------" >> $DIALOGFILE
+	
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 -i$SQLFILE | grep -v Password > $SQLOUT
+	
+	cat $SQLOUT |
+	while read BCKUP_POOL
+	do
+		set -A ARRAY_POOL $BCKUP_POOL
+	
+		echo "POOL_ID = ${ARRAY_POOL[0]}" >> $DIALOGFILE
+		echo "		FULL_DEST = ${ARRAY_POOL[1]}" >> $DIALOGFILE
+		echo "		TRAN_DEST = ${ARRAY_POOL[2]}" >> $DIALOGFILE
+		echo " " >> $DIALOGFILE
+	
+		BCKUPPOOLEXIST=1
+	done
+	
+}
+
+
+#--------------------------------------------------------------------------
+# Let's check to see if a Backup Pool arleady exists - if so, list it as an FYI...
+#--------------------------------------------------------------------------
+#execute the getBackupPools local function....
+getBackupPools
+
+if [[ $BCKUPPOOLEXIST == 1 ]]
+then
+
+	echo "Backup Pool(s) exists..." | tee -a $LOGFILE
+	cat $DIALOGFILE | tee -a $LOGFILE
+
+	#SINCE BACKUP POOLS EXIST - CHECK TO SEE IF THEY WANT TO ADD A NEW ONE...
+	echo "Do you still want to enter a new backup pool destination?"	
+	read NEWDEST?"y/n:"	
+
+	#make sure it's lowercase
+	typeset -l NEWDEST
+else
+
+	NEWDEST="y"
+
+fi
+
+if [[ $NEWDEST = "y" ]]
+then
+
+	#--------------------------------------------------------------------------
+	# Prompt for Full Backup Destination, and then Tran Log Backukp Destination
+	#--------------------------------------------------------------------------
+	echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+	echo "You are about to enter the full backup path destination for $DBSERVER" | tee -a $LOGFILE
+	echo "EXAMPLE FULL DEST PATH PROD: /sccm/syb_bkup_full/$DBSERVER" | tee -a $LOGFILE
+	echo "EXAMPLE FULL DEST PATH NON-PROD: /sccm/syb_30day/full/$DBSERVER" | tee -a $LOGFILE
+	echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+	echo ""
+	TRYS=4
+	
+	while [[ $TRYS != 0 ]]
+	do
+		read FULLDEST?"Enter Full Destination Here:"
+	
+		if [[ $TRYS == 1 ]]
+		then
+			echo "$FULLDEST  NOT FOUND!!!!" | tee -a $LOGFILE	
+			echo "The directory STILL cannot be found.  SCRIPT ENDING IN ERROR." | tee -a $LOGFILE
+			exit 1
+		fi
+	
+	
+		if [[ ! -d $FULLDEST ]] 
+		then
+			let "TRYS=$TRYS - 1"
+			echo "$FULLDEST  NOT FOUND!!!!" | tee -a $LOGFILE	
+			echo "TRY AGAIN."
+			echo ""
+		else  
+			TRYS=0
+		fi
+	done
+	
+	#We now have the full backup destination path set correctly $FULLDEST.
+	#Let's get the tran log destination path....
+	
+	echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+	echo "You are about to enter the transaction log backup path destination for $DBSERVER" | tee -a $LOGFILE
+	echo "EXAMPLE TRAN DEST PATH PROD: /sccm/syb_bkup_log/$DBSERVER" | tee -a $LOGFILE
+	echo "EXAMPLE TRAN DEST PATH NON-PROD: /sccm/syb_30day/tranlogs/$DBSERVER" | tee -a $LOGFILE
+	echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+	echo ""
+	TRYS=4
+	while [[ $TRYS != 0 ]]
+	do
+		read TRANDEST?"Enter Tran Log Destination Here:"
+	
+		if [[ $TRYS == 1 ]]
+		then
+			echo "$TRANDEST  NOT FOUND!!!!" | tee -a $LOGFILE	
+			echo "The directory STILL cannot be found.  SCRIPT ENDING IN ERROR." | tee -a $LOGFILE
+			exit 1
+		fi
+	
+	
+		if [[ ! -d $TRANDEST ]] 
+		then
+			let "TRYS=$TRYS - 1"
+			echo "$TRANDEST  NOT FOUND!!!!" | tee -a $LOGFILE	
+			echo "TRY AGAIN."
+			echo ""
+		else  
+			TRYS=0
+		fi
+	done
+
+	#--------------------------------------------------------------------------------------
+	# insert the backup dest info. 
+	#---------------------------------------------------------------------------------------
+	> $SQLOUT
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password | sed -e 's/  *//g' >> $SQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	use sybdb
+	go
+	exec sp_insert_dl_dump_pool "$FULLDEST", "$TRANDEST"
+	go
+	!
+	
+	checkSqlErr $SQLOUT
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - stored proc sp_insert_dl_dump_pool produces errors - view log file for details." | tee -a $LOGFILE
+		cat $SQLOUT >> $LOGFILE
+		echo "LOG FILE = $LOGFILE"
+		exit 1
+	else
+		echo "BACKUP POOL AS BEEN SUCCESSFULLY ADDED TO THE sybdb DATABASE ON $DBSERVER" | tee -a $LOGFILE
+	fi
+else
+		
+	echo "No new backup destination will be added." | tee -a $LOGFILE
+
+fi
+	
+	
+
+#--------------------------------------------------------------------------------------
+# POPULATE THE dl_dump_opt TABLE.
+# Add all databases to the dump_opt table.
+#---------------------------------------------------------------------------------------
+echo " "
+echo "ENTER DEFAULT # OF DAYS TO RETAIN BACKUP FILES" | tee -a $LOGFILE
+read BCK_RETAIN?"Default retention days:"
+echo " "
+echo "Executing the sp_dl_dump_opt_insert proc to add all database names into the dl_dump_opt table - not already configured" | tee -a $LOGFILE
+> $SQLOUT
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password | sed -e 's/  *//g' >> $SQLOUT
+`getPass $DBSERVER $ADMINLOGIN`
+set nocount on
+go
+use sybdb
+go
+exec sp_dl_dump_opt_insert @dbname = 'all', @retention_days = $BCK_RETAIN
+go
+select 'DBNAME = ' + dbname + char(012) +
+'---dump_pool_id = ' + cast(dump_pool_id as varchar(3)) + char(012) +
+'---full_inactive = ' + cast(full_inactive as varchar(3)) + char(012) +
+'---tran_inactive = ' + cast(tran_inactive as varchar(3)) + char(012) +
+'---retention_days = ' + cast(retention_days as varchar(3)) + char(012) +
+'---compression_level = ' + cast(compression_level as varchar(3)) + char(012) +
+'---stripe_num = ' + cast(stripe_num as varchar(3))
+from sybdb.dbo.dl_dump_opt
+go
+!
+
+checkSqlErr $SQLOUT
+if [ $? -ne 0 ]
+then
+	echo "ERROR - stored proc sp_dl_dump_opt_insert produces errors - view log file for details." | tee -a $LOGFILE
+	cat $SQLOUT >> $LOGFILE
+	echo "LOG FILE = $LOGFILE"
+	exit 1
+else
+	echo "Databases have been configured to use backup pool 1 by default.  View log file to see database backup config." | tee -a $LOGFILE
+	cat $SQLOUT >> $LOGFILE
+	echo "LOG FILE = $LOGFILE"
+	exit 0
+fi
+

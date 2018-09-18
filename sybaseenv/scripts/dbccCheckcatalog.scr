@@ -1,0 +1,182 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dbccCheckcatalog.scr -S <DBSERVER> {-D <dbname>|-L <dblist> -m <maildest> -p <pagedest>}
+#
+#  Description: Run dbcc checkcatalog for one or more databases on a DBSERVER
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	10/31/03 M. Siatczynski	Rewrite/centralize script
+#	11/06/03 M. Siatczynski	Included XLIST processing
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	03/03/06 M. Siatczynski	Ignore read only (status 1024) databases when processing all DBs on an ASE
+#	05/09/07 M. Siatczynski	Ignore offline databases (status2=16)
+#	05/29/00 M. Siatczynski	Updated to use getDbList function
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>|-L <dblist> -m <maildest> -p <pagedest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -L)     export DBLIST=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -p)     export PAGEDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+if [ "$DBNAME" -a "$DBLIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - DBNAME and DBLIST are mutually exclusive"
+        exit 1
+fi
+
+if [ "$DBLIST" -a ! -s "$DBLIST" ]
+then
+        echo "$USAGE"
+        echo "ERROR - DBLIST does not exist or is 0 bytes"
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export ERRORFLAG=0
+export XLIST=$CTLDIR/$DBSERVER/$DBSERVER.dbccExclude.lst
+export DBCCSQL=/tmp/dbccsql.$$
+export SORTDBLIST=/tmp/sortdblist.$$
+export TMPDBLIST=/tmp/dblist.$$
+export TMPXLIST=/tmp/xlist.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+if [ "$DBNAME" ]
+then
+	export LOGFILE=$LOGDIR/dbcc/$DBSERVER/$DBSERVER.$DBNAME.dbccCheckcatalog.$DATETIME
+else
+	export LOGFILE=$LOGDIR/dbcc/$DBSERVER/$DBSERVER.dbccCheckcatalog.$DATETIME
+fi
+
+> $LOGFILE
+> $MAILFILE
+
+echo "SCRIPT START: `date`" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBCCSQL && \rm -f $DBCCSQL
+	test -f $SORTDBLIST && \rm -f $SORTDBLIST
+	test -f $TMPDBLIST && \rm -f $TMPDBLIST
+	test -f $TMPXLIST && \rm -f $TMPXLIST
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Determine what databases to run dbcc checkcatalog on:
+#	- single database (-D option)
+#	- list of databases (-L option)
+#	- all databases (no option) 
+#		Exclude list is only used when running against all databases.
+#  NOTE:  sed removes the spaces from the isql output, otherwise the files can't 
+#  be accurately compared to the exclusion list
+#--------------------------------------------------------------------------
+> $SORTDBLIST
+if [ "$DBNAME" ]
+then
+	echo $DBNAME > $TMPDBLIST
+elif [ "$DBLIST" ]
+then
+	sort $DBLIST > $TMPDBLIST
+else
+	getDbList -S $DBSERVER -user -system -xreadonly | sort > $SORTDBLIST
+
+#--------------------------------------------------------------------------
+#  Exclude database in the exclusion list
+#--------------------------------------------------------------------------
+        if [ -s $XLIST ]
+        then
+                sort $XLIST > $TMPXLIST
+                comm -23 $SORTDBLIST $TMPXLIST > $TMPDBLIST
+
+                echo "The following databases are excluded from checkstorage:\n" >> $LOGFILE
+                cat $TMPXLIST >> $LOGFILE
+                echo "" >> $LOGFILE
+        else
+                cat $SORTDBLIST > $TMPDBLIST
+        fi
+fi
+
+#--------------------------------------------------------------------------
+#  Execute checkcatalog for each database
+#--------------------------------------------------------------------------
+for DBNAME in `cat $TMPDBLIST`
+do
+	> $DBCCSQL
+	echo "dbcc checkcatalog ($DBNAME)" >> $DBCCSQL
+	echo "go" >> $DBCCSQL
+
+	$SCRDIR/sqlTimer.scr -S $DBSERVER -i $DBCCSQL -o $LOGFILE -m $MAILFILE
+	if [ $? -ne 0 ]
+	then
+		export ERRORFLAG=1
+	fi
+done
+
+echo "SCRIPT END: `date`" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# If there were any failures, send email
+# If a page destination is set, then send a page
+#--------------------------------------------------------------------------
+if [ $ERRORFLAG -eq 1 ]
+then
+	echo "\nNOTE: Check $LOGFILE for further details.\n" >> $MAILFILE
+	export MAILSUBJECT="$DBSERVER DBCC CHECKCATALOG FAILED"
+	sendMail
+	if [ "$PAGEDEST" ]
+	then
+		echo "$DBSERVER DBCC CHECKCATALOG FAILED" > $PAGEMSG
+		sendPage
+	fi
+	exit 1
+else
+	exit 0
+fi

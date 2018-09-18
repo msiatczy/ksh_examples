@@ -1,0 +1,140 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: addSqlbtAuditLinks.scr -S <DBSERVER> {-D <DBNAME> -relink}
+#
+#  Description: Create links under $DTBASE/audit for backups of sybsecurity and sybsecurity_archive
+#
+#     Location:	/sccm/dba/sybase/scripts/addSqlbtAuditLinks.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#         NOTE: DBSERVER must be an actual server AND corresond to 
+#		a physical control directory of the same name
+#
+#  Modification History:
+#	01/17/06 M. Siatczynski Original script
+#	03/14/06 M. Siatczynski Rename files under sbackups.physical to .skip and link audit ctldir to .skip files
+#				Add parm -relink to perform unlink and relink
+#	03/15/06 M. Siatczynski Updated hardcoded sbackups.physical to use $DT_PHYSICAL (std env variable)
+#				Updated to use DT_AUDIT rather than hardcoded audit
+#	04/26/06 M. Siatczynski Add additional code for RELINK=1 to remove regular files in addition to symbolic links
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Initialize variables
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <DBNAME> -relink}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -D)	export ONEDBNAME=$2;shift 2;;
+	                -relink)	export RELINK=1;shift 1;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        echo "ERROR - DBSERVER must be passed"
+        exit 1
+fi
+
+test ! "$RELINK" && export RELINK=0
+
+# NOTE:  SETDBSERVER must be set AFTER case statement and profile must be sourced AFTER SETDBSERVER
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+export TMPDBLIST=/tmp/dblist.$$
+export AUDITBASE=$DT_AUDIT/$DBSERVER
+export PHYSBASE=$DT_PHYSICAL/$DBSERVER
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $TMPDBLIST && \rm -f $TMPDBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  If no specific DB passed, create link for both sybsecurity and sybsecurity_archive
+#  Otherwise, process specific database
+#--------------------------------------------------------------------------
+if [ "$ONEDBNAME" ]
+then
+	echo $ONEDBNAME > $TMPDBLIST
+else
+	> $TMPDBLIST
+	echo "sybsecurity" >> $TMPDBLIST
+	echo "sybsecurity_archive" >> $TMPDBLIST
+fi
+
+#--------------------------------------------------------------------------
+#  Make the control directories if they don't exist
+#--------------------------------------------------------------------------
+test ! -d $DT_AUDIT && mkdir $DT_AUDIT
+test ! -d $AUDITBASE && mkdir $AUDITBASE
+
+#--------------------------------------------------------------------------
+#  Create link to .dtoptions file from the physical control directory
+#    (If RELINK=1, remove the link or file before creating new link)
+#  Copy the empty .dtoptions file under $DT_AUDIT/DBSERVER control directory
+#--------------------------------------------------------------------------
+if [ $RELINK -eq 1 ]
+then
+	test -L $DT_AUDIT/.dtoptions -o -f $DT_AUDIT/.dtoptions && \rm $DT_AUDIT/.dtoptions
+fi
+
+test ! -L $DT_AUDIT/.dtoptions && ln -s $DT_PHYSICAL/.dtoptions $DT_AUDIT/.dtoptions
+test ! -f $AUDITBASE/.dtoptions && cp -p $PHYSBASE/.dtoptions $AUDITBASE/.dtoptions
+
+#--------------------------------------------------------------------------
+#  Make sure PHYSFILE is named .skip
+#  If a link or files already exists and -relink passed, remove the link or file
+#  Make the link if it doesn't exist
+#--------------------------------------------------------------------------
+cat $TMPDBLIST |
+while read DBNAME
+do
+	export $DBNAME
+	export AUDITFILE=$AUDITBASE/$DBNAME
+	export PHYSFILE=$PHYSBASE/$DBNAME
+
+	test -f $PHYSFILE && mv $PHYSFILE $PHYSFILE.skip
+	if [ $RELINK -eq 1 ]
+	then
+		test -L $AUDITFILE -o -f $AUDITFILE && \rm $AUDITFILE
+	fi
+
+	if [ ! -L $AUDITFILE ]
+	then
+		echo "Creating link:  $AUDITFILE -> $PHYSFILE.skip"
+		ln -s $PHYSFILE.skip $AUDITFILE
+	else
+		echo "LINK EXISTS:  $AUDITFILE -> $PHYSFILE.skip"
+	fi
+done
+
+echo "\nReview the following links under $AUDITBASE\n"
+ls -l $AUDITBASE
+
+#--------------------------------------------------------------------------
+#  exit
+#--------------------------------------------------------------------------
+exit 0

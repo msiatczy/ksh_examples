@@ -1,0 +1,128 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkDbs.scr -S <DBSERVER> {-D <DBNAME>}
+#
+#  Description: Check one or all databases on a server
+#
+#     Location:	/sccm/dba/sybase/adhoc/checkDbs.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	-S Database Server
+#              	-D Database
+#
+#
+#  Modification History:
+#	04/15/03 M. Siatczynski	Initial Script
+#	06/28/04 M. Siatczynski	Centralized script
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -D)	export DBNAME=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+export DBLIST=/tmp/dbnamelist.$$
+export SQL1=/tmp/tempsql.$$
+export OUTFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.checkDbs.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQL1 && \rm -f $SQL1
+	test $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# If a single dbname is passed, put it in the list, otherwise
+# generate a list of all DBs on the server (excluding system dbs)
+# Also set OUTFILE, depending on DBNAME
+#--------------------------------------------------------------------------
+> $DBLIST
+if [ "$DBNAME" ]
+then
+	echo $DBNAME >> $DBLIST
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password >> $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+--	select name from sysdatabases order by name
+--	select name from sysdatabases where name not like 'tempdb%' and status&1024 <> 1024
+	select name from sysdatabases where name not in ('master','model','dba','lookjack')
+	and name not like 'tempdb%'
+	and name not like 'sybsystem%'
+	and name not like 'sybsecurity%'
+	and name not like 'dbcc%'
+	go
+	!
+fi
+
+#--------------------------------------------------------------------------
+# Format the sql to be run against each database
+#--------------------------------------------------------------------------
+> $SQL1
+echo "set nocount on" >> $SQL1
+echo "go" >> $SQL1
+
+for DBNAME in `cat $DBLIST`
+do
+	export DBNAME
+#	echo "print '$DBNAME'" >> $SQL1
+	echo "use $DBNAME" >> $SQL1
+	echo "go" >> $SQL1
+
+#	echo "select convert(char(35),db_name()),convert(char(35),object_name(c.id)),convert(char(35),c.name) from syscolumns c, systypes t" >> $SQL1
+#	echo "where c.id > 99 and t.name = 'text' and t.usertype = c.usertype" >> $SQL1
+#	echo "order by object_name(c.id),c.name" >> $SQL1
+
+	echo "select convert(char(20),db_name()),convert(char(40),object_name(id)),row_count(db_id(),id),convert(numeric(11,0),2*(data_pages(db_id(), id, 0))) from $DBNAME..syscolumns where name = 'ta_region' order by object_name(id)" >> $SQL1
+#	echo "sp_setrepproc" >> $SQL1
+	echo "go" >> $SQL1
+
+done
+
+#--------------------------------------------------------------------------
+# Pipe in the sql
+#--------------------------------------------------------------------------
+> $OUTFILE
+
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -i$SQL1 -b | grep -v Password: >> $OUTFILE
+
+#--------------------------------------------------------------------------
+# Check for errors
+#--------------------------------------------------------------------------
+checkSqlErr $OUTFILE
+if [ $? -eq 1 ]
+then
+        echo "$0 FAILED"
+	echo "Results in $OUTFILE"
+        exit 1
+else
+        echo "$0 SUCCESSFUL"
+	echo "Results in $OUTFILE"
+        exit 0
+fi

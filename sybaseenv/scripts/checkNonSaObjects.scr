@@ -1,0 +1,335 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkNonSaObjects.scr (-S <DBSERVER> | -all) {-exclude -m <maildest>}
+#
+#  Description: Check all servers/databases for objects created by user other than sa.
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	11/21/02 M. Siatczynski	Initial Script
+#	02/17/03 M. Siatczynski	Added exclusion logic for entire servers or
+#				server/database combos
+#	03/03/03 M. Siatczynski	Added parm for MAILDEST and showall option
+#	04/28/03 M. Siatczynski	Added ELMO and POPLAR databases to exclusion list
+#	05/27/03 M. Siatczynski	Added BERT to dbserver exclusion list
+#	06/04/03 M. Siatczynski	Added BOBCAT/cifhist to exclusion list
+#	07/25/03 M. Siatczynski	Addes support*exchange to ignore list
+#	08/18/03 M. Murphy	Added crm_conv and track99 to ignore list
+#	09/11/03 M. Siatczynski	Added mdm_extract*mdmextract user to ignore list
+#	02/20/04 M. Siatczynski	Added support*mdmextract user to ignore list
+#	03/23/04 M. Siatczynski	Added IDTOLD to exclusion list
+#	05/12/04 M. Siatczynski	Centralized script & added error checking, changed showall to exclude
+#	06/15/04 M. Siatczynski	Added mdm_extract*bv_user user to ignore list
+#	03/30/05 M. Siatczynski	Added dstme to exclusion list
+#	08/03/05 M. Siatczynski	Updated select to ignore objects ownered by loginame with sa_role (srid=0)
+#				Changed OUTFILE location to LOGDIR rather than RPTDIR
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	05/03/06 M. Siatczynski	Do not check offline databases (status2=16)
+#	06/08/06 M. Siatczynski	Add SPRUCE to list of excluded servers, remove IDTOLD
+#	01/09/07 M. Siatczynski	Add TEMPE_DHICKORY,DHICKORY, TEMPE_SHICKORY, and SHICKORY to list of excluded servers
+#	01/22/07 M. Siatczynski	Remove BERT, SPRUCE, TEMPE_DHICKORY and TEMPE_SHICKORY from list of excluded servers
+#	01/23/07 M. Siatczynski	Readd BERT and SPRUCE until permanently shutdown
+#	03/22/07 M. Siatczynski	Remove BERT,SPRUCE, and HOLLY und add DWILLOW 
+#	05/07/07 M. Siatczynski	Add BHICKORY
+#	05/14/07 M. Siatczynski	Add PHICKORY2, add UHICKORY2, remove IDTDEV
+#	05/05/08 M. Siatczynski	Remove ELMO and POPLAR, add DALMOND and DCOCONUT (testing)
+#	12/09/08 M. Siatczynski	Change BIGBIRD to PHICKORY, remove crm_conv from ignore list, add DALMOND, DCOCONUT, DORANGE to exclude servers list
+#	05/29/09 M. Siatczynski	Updated to call getDbList function
+#	02/16/10 M. Siatczynski	Add Evergreen ASEs to list of excluded servers
+#	06/25/10 M. Siatczynski	Add sfaber to UHICKORY exclude list
+#	06/29/10 M. Siatczynski	Add sfaber to remaining *HICKORY exclude lists
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 (-S <DBSERVER> | -all) {-exclude -m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)		export ONEDBSERVER=$2;shift 2;;
+                        -all)		export ALL=1;shift 1;;
+                        -m)		export MAILDEST=$2;shift 2;;
+                        -exclude)	export EXCLUDE=1;shift 1;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$EXCLUDE" && export EXCLUDE=0
+test ! "$ALL" && export ALL=0
+
+if [ "$ONEDBSERVER" -a $ALL -eq 1 ]
+then
+	echo $USAGE
+	echo "ERROR - <DBSERVER> and -all are mutually exclusive"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export OUTFILE=$LOGDIR/useradmin/central/checkNonSaObjects.$DATETIME
+export SQLFILE=/tmp/sqlfile.$$
+export EXCLUDE_DBSERVERS=/tmp/exclude.servers.$$
+export EXCLUDE_DBS=/tmp/exclude.dbs.$$
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export DBLIST=/tmp/dblist.$$
+export SQLOUT=/tmp/sqlout.$$
+
+export HIGHRC=0
+
+> $OUTFILE
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $EXCLUDE_DBSERVERS && \rm -f $EXCLUDE_DBSERVERS
+	test -f $EXCLUDE_DBS && \rm -f $EXCLUDE_DBS
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# DBSERVER EXCLUSIONS
+# Format exclude server list
+# Should be DEV servers only
+# ALL Evergreen Odyssey ASEs are excluded (2/16/10)
+#--------------------------------------------------------------------------
+> $EXCLUDE_DBSERVERS
+echo "DWILLOW" >> $EXCLUDE_DBSERVERS
+echo "DHICKORY" >> $EXCLUDE_DBSERVERS
+echo "DALMOND" >> $EXCLUDE_DBSERVERS
+echo "DCOCONUT" >> $EXCLUDE_DBSERVERS
+echo "DORANGE" >> $EXCLUDE_DBSERVERS
+echo "SHICKORY" >> $EXCLUDE_DBSERVERS
+echo "srodydb01d" >> $EXCLUDE_DBSERVERS
+echo "srodydb01u" >> $EXCLUDE_DBSERVERS
+echo "odydb01p" >> $EXCLUDE_DBSERVERS
+
+#--------------------------------------------------------------------------
+# DBSERVER/DATABASE/LOGIN EXCLUSIONS
+# Format exclude server/database combo list
+# NOTE:  Entries in this files must be formatted as follows:
+# DBSERVER, two spaces, asterisk (*), DBNAME, two spaces, period(.), asterisk(*),
+#   two spaces, asterisk(*),period(.), asterisk(*),two spaces, asterisk(*), login
+# Example:
+# <DBSERVER>  *<DBNAME>  .*  *.*  *<login>
+#--------------------------------------------------------------------------
+> $EXCLUDE_DBS
+echo "PHICKORY  *mdm_extract  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "PHICKORY  *mdm_extract  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "PHICKORY  *mdm_extract  .*  *.*  *bv_user" >> $EXCLUDE_DBS
+echo "PHICKORY  *support  .*  *.*  *sturicek" >> $EXCLUDE_DBS
+echo "PHICKORY  *support  .*  *.*  *bnair" >> $EXCLUDE_DBS
+echo "PHICKORY  *support  .*  *.*  *fjarosin" >> $EXCLUDE_DBS
+echo "PHICKORY  *support  .*  *.*  *sfaber" >> $EXCLUDE_DBS
+echo "PHICKORY  *support  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "PHICKORY  *support  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "PHICKORY  *cifhist  .*  *.*  *CFmebal" >> $EXCLUDE_DBS
+echo "PHICKORY  *dstme  .*  *.*  *dsthistme" >> $EXCLUDE_DBS
+echo "PHICKORY2  *mdm_extract  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "PHICKORY2  *mdm_extract  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "PHICKORY2  *mdm_extract  .*  *.*  *bv_user" >> $EXCLUDE_DBS
+echo "PHICKORY2  *support  .*  *.*  *sturicek" >> $EXCLUDE_DBS
+echo "PHICKORY2  *support  .*  *.*  *bnair" >> $EXCLUDE_DBS
+echo "PHICKORY2  *support  .*  *.*  *fjarosin" >> $EXCLUDE_DBS
+echo "PHICKORY2  *support  .*  *.*  *sfaber" >> $EXCLUDE_DBS
+echo "PHICKORY2  *support  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "PHICKORY2  *support  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "PHICKORY2  *cifhist  .*  *.*  *CFmebal" >> $EXCLUDE_DBS
+echo "PHICKORY2  *dstme  .*  *.*  *dsthistme" >> $EXCLUDE_DBS
+echo "BHICKORY  *mdm_extract  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "BHICKORY  *mdm_extract  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "BHICKORY  *mdm_extract  .*  *.*  *bv_user" >> $EXCLUDE_DBS
+echo "BHICKORY  *support  .*  *.*  *sturicek" >> $EXCLUDE_DBS
+echo "BHICKORY  *support  .*  *.*  *bnair" >> $EXCLUDE_DBS
+echo "BHICKORY  *support  .*  *.*  *fjarosin" >> $EXCLUDE_DBS
+echo "BHICKORY  *support  .*  *.*  *sfaber" >> $EXCLUDE_DBS
+echo "BHICKORY  *support  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "BHICKORY  *support  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "BHICKORY  *cifhist  .*  *.*  *CFmebal" >> $EXCLUDE_DBS
+echo "BHICKORY  *dstme  .*  *.*  *dsthistme" >> $EXCLUDE_DBS
+echo "UHICKORY  *mdm_extract  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "UHICKORY  *mdm_extract  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "UHICKORY  *mdm_extract  .*  *.*  *bv_user" >> $EXCLUDE_DBS
+echo "UHICKORY  *support  .*  *.*  *sturicek" >> $EXCLUDE_DBS
+echo "UHICKORY  *support  .*  *.*  *bnair" >> $EXCLUDE_DBS
+echo "UHICKORY  *support  .*  *.*  *fjarosin" >> $EXCLUDE_DBS
+echo "UHICKORY  *support  .*  *.*  *sfaber" >> $EXCLUDE_DBS
+echo "UHICKORY  *support  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "UHICKORY  *support  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "UHICKORY  *cifhist  .*  *.*  *CFmebal" >> $EXCLUDE_DBS
+echo "UHICKORY  *dstme  .*  *.*  *dsthistme" >> $EXCLUDE_DBS
+echo "UHICKORY2  *mdm_extract  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "UHICKORY2  *mdm_extract  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "UHICKORY2  *mdm_extract  .*  *.*  *bv_user" >> $EXCLUDE_DBS
+echo "UHICKORY2  *support  .*  *.*  *sturicek" >> $EXCLUDE_DBS
+echo "UHICKORY2  *support  .*  *.*  *bnair" >> $EXCLUDE_DBS
+echo "UHICKORY2  *support  .*  *.*  *fjarosin" >> $EXCLUDE_DBS
+echo "UHICKORY2  *support  .*  *.*  *sfaber" >> $EXCLUDE_DBS
+echo "UHICKORY2  *support  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "UHICKORY2  *support  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "UHICKORY2  *cifhist  .*  *.*  *CFmebal" >> $EXCLUDE_DBS
+echo "UHICKORY2  *dstme  .*  *.*  *dsthistme" >> $EXCLUDE_DBS
+echo "UHICKORYB  *mdm_extract  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "UHICKORYB  *mdm_extract  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "UHICKORYB  *mdm_extract  .*  *.*  *bv_user" >> $EXCLUDE_DBS
+echo "UHICKORYB  *support  .*  *.*  *sturicek" >> $EXCLUDE_DBS
+echo "UHICKORYB  *support  .*  *.*  *bnair" >> $EXCLUDE_DBS
+echo "UHICKORYB  *support  .*  *.*  *fjarosin" >> $EXCLUDE_DBS
+echo "UHICKORYB  *support  .*  *.*  *sfaber" >> $EXCLUDE_DBS
+echo "UHICKORYB  *support  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "UHICKORYB  *support  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "UHICKORYB  *cifhist  .*  *.*  *CFmebal" >> $EXCLUDE_DBS
+echo "UHICKORYB  *dstme  .*  *.*  *dsthistme" >> $EXCLUDE_DBS
+
+echo "DALMOND  *mdm_extract  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "DALMOND  *mdm_extract  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "DALMOND  *mdm_extract  .*  *.*  *bv_user" >> $EXCLUDE_DBS
+echo "DALMOND  *support  .*  *.*  *sturicek" >> $EXCLUDE_DBS
+echo "DALMOND  *support  .*  *.*  *bnair" >> $EXCLUDE_DBS
+echo "DALMOND  *support  .*  *.*  *fjarosin" >> $EXCLUDE_DBS
+echo "DALMOND  *support  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "DALMOND  *support  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "DALMOND  *cifhist  .*  *.*  *CFmebal" >> $EXCLUDE_DBS
+echo "DALMOND  *dstme  .*  *.*  *dsthistme" >> $EXCLUDE_DBS
+
+echo "DCOCONUT  *mdm_extract  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "DCOCONUT  *mdm_extract  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "DCOCONUT  *mdm_extract  .*  *.*  *bv_user" >> $EXCLUDE_DBS
+echo "DCOCONUT  *support  .*  *.*  *sturicek" >> $EXCLUDE_DBS
+echo "DCOCONUT  *support  .*  *.*  *bnair" >> $EXCLUDE_DBS
+echo "DCOCONUT  *support  .*  *.*  *fjarosin" >> $EXCLUDE_DBS
+echo "DCOCONUT  *support  .*  *.*  *exchange" >> $EXCLUDE_DBS
+echo "DCOCONUT  *support  .*  *.*  *mdmextract" >> $EXCLUDE_DBS
+echo "DCOCONUT  *cifhist  .*  *.*  *CFmebal" >> $EXCLUDE_DBS
+echo "DCOCONUT  *dstme  .*  *.*  *dsthistme" >> $EXCLUDE_DBS
+
+#--------------------------------------------------------------------------
+# Create a dbserver list 
+# If exclude flag is passed, exclude dbservers
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" ]
+then
+	if [ $EXCLUDE -eq 1 ]
+	then
+		echo $ONEDBSERVER | egrep -vf $EXCLUDE_DBSERVERS > $DBSERVERLIST
+	else
+		echo $ONEDBSERVER > $DBSERVERLIST
+	fi
+else
+	if [ $EXCLUDE -eq 1 ]
+	then
+		getAseList | egrep -vf $EXCLUDE_DBSERVERS > $DBSERVERLIST
+	else
+		getAseList > $DBSERVERLIST
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# Query all servers for objects owned by non-sa login
+# For each dbserver, get a list of databases (excluded tempdbs and offline databases)
+# Then get list of objects (exclude system objects and those starting with SQR_%
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+        export DBSERVER
+	> $SQLFILE
+
+	getDbList -S $DBSERVER -user -system > $DBLIST
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "ERROR - getting list of databases for $DBSERVER"
+		echo "Skipping check of $DBSERVER"
+		cat $DBLIST
+		continue
+	fi
+
+	cat $DBLIST |
+	while read DBNAME
+	do
+		export DBNAME
+		echo "set nocount on" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "use $DBNAME" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "select convert(char(12),@@servername),convert(char(20),db_name()),convert(char(30),name),type,convert(char(20),loginame),crdate from sysobjects" >> $SQLFILE
+		echo "where loginame <> NULL and type <> 'S' and name not like 'SQR_%' and suser_id(loginame) not in (select suid from master..sysloginroles where srid = 0) order by crdate" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+
+#--------------------------------------------------------------------------
+# If exclude flag is passed, exclude specific dbs
+#--------------------------------------------------------------------------
+	> $SQLOUT
+	if [ $EXCLUDE -eq 1 ]
+	then
+		getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password | egrep -vf $EXCLUDE_DBS >> $SQLOUT
+		checkSqlErr $SQLOUT
+		if [ $? -eq 1 ]
+		then
+			export HIGHRC=1
+			echo "ERROR - checking objects on $DBSERVER"
+			echo "Skipping check of $DBSERVER"
+			cat $SQLOUT
+			continue
+		else
+			cat $SQLOUT >> $OUTFILE
+		fi
+	else
+		getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password >> $SQLOUT
+		checkSqlErr $SQLOUT
+		if [ $? -eq 1 ]
+		then
+			export HIGHRC=1
+			echo "ERROR - checking objects on $DBSERVER"
+			echo "Skipping check of $DBSERVER"
+			cat $SQLOUT
+			continue
+		else
+			cat $SQLOUT >> $OUTFILE
+		fi
+	fi
+done
+
+#--------------------------------------------------------------------------
+# mail the report to dba
+#--------------------------------------------------------------------------
+if [ -s $OUTFILE ]
+then
+	echo "\nReport date:  `date`" >> $OUTFILE
+	export MAILSUBJECT="Non-sa owner report"
+	export MAILFILE=$OUTFILE
+	sendMail
+fi
+
+#--------------------------------------------------------------------------
+# Exit based on the highest return code
+#--------------------------------------------------------------------------
+exit $HIGHRC

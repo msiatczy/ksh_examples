@@ -1,0 +1,205 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: nativeRmDmpFiles.scr -S <DBSERVER> {-m <maildest>}
+#
+#  Description: This script will quiry the sybdb.dbo.dl_dumpfile & dl_hist tables to determine which
+#		dump files can be purged from the backup destination.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Manually or by Autosys. 
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#
+#  Modification History:
+#	02/04/10 J. Aspenleiter	Initial Script
+#	08/13/10 M. Siatczynski	Change LOGFILE location to $LOGDIR/backup instead of $LOGDIR/misc, change LOGFILE filename
+#				Write filename being deleted to LOGFILE
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SQLOUT=/tmp/sqlout.$$
+export LOGFILE=$LOGDIR/backup/$DBSERVER/$DBSERVER.nativeRmDmpFiles.$DATETIME
+export SQLFILE=/tmp/sqlfile.$$
+export MAILFILE=/tmp/mailfile.$$
+
+EMAIL_DBA=0
+
+> $LOGFILE
+echo "`date` BEGIN dump file purge for $DBSERVER" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#Get all expired non deleted dump files.  Can be found in the sybdb database.
+#
+# {ARRAY_DUMPS[0]} = dl_id
+# {ARRAY_DUMPS[1]} = stripe_num
+# {ARRAY_DUMPS[2]} = dumpfile
+#
+#--------------------------------------------------------------------------
+echo "set nocount on" > $SQLFILE
+echo "go" >> $SQLFILE
+echo "use" >> $SQLFILE
+echo "sybdb" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "SELECT isnull(h.dl_id,0), isnull(stripe_num,0), isnull(dumpfile,'NODUMPFILE')" >> $SQLFILE
+echo "FROM dl_hist h" >> $SQLFILE
+echo "JOIN dl_dumpfile d" >> $SQLFILE
+echo "ON h.dl_id = d.dl_id" >> $SQLFILE
+echo "WHERE dumpfile_deleted IS NULL" >> $SQLFILE
+echo "AND" >> $SQLFILE
+echo "expiration_date < getdate()" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+> $SQLOUT
+
+#  the -w needs to stay wide because the path to these backup files can be quite long.  If you go too narrow, the array won't work.
+
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w2048 -i$SQLFILE | grep -v Password > $SQLOUT
+
+checkSqlErr $SQLOUT
+if [ $? -ne 0 ]
+then
+	echo "ERROR occurred while getting exired dump file data." >> $LOGFILE
+	cat $SQLOUT >> $LOGFILE
+	exit 1
+fi
+
+
+#clear out the $SQLFILE - need to reuse it for the updates....
+> $SQLFILE
+echo "use sybdb" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $SQLOUT |
+while read EXPIRED_DUMPS
+do
+	set -A ARRAY_DUMPS $EXPIRED_DUMPS
+
+# Leaving this in place...  If there is ever problems with the script - it would be a good thing to verify the
+# array is working the way it should, and this tells you again which array element is what....
+#	echo "dl_id = ${ARRAY_DUMPS[0]}"
+#	echo "stripe_num = ${ARRAY_DUMPS[1]}"
+#	echo "dumpfile = ${ARRAY_DUMPS[2]}"
+	
+	FILEFOUND=0
+
+	if [[ -f ${ARRAY_DUMPS[2]} ]]
+	then
+		FILEFOUND=1
+		\rm -f ${ARRAY_DUMPS[2]}
+	fi
+
+	if [[ ! -f ${ARRAY_DUMPS[2]} && $FILEFOUND = 1 ]]
+	then
+		echo "REMOVED DUMP FILE: ${ARRAY_DUMPS[2]}"  >> $LOGFILE
+
+		echo "update dl_dumpfile" >> $SQLFILE
+		echo "set dumpfile_deleted = getdate()" >> $SQLFILE
+		echo "where dl_id = ${ARRAY_DUMPS[0]}" >> $SQLFILE
+		echo "and stripe_num = ${ARRAY_DUMPS[1]}" >> $SQLFILE
+		echo "go" >> $SQLFILE 	
+
+	elif [[ ! -f ${ARRAY_DUMPS[2]} && $FILEFOUND = 0 ]]
+	then
+		echo "update dl_dumpfile" >> $SQLFILE
+                echo "set dumpfile_deleted = 'JAN 1, 1900 12:00 AM'" >> $SQLFILE
+                echo "where dl_id = ${ARRAY_DUMPS[0]}" >> $SQLFILE
+                echo "and stripe_num = ${ARRAY_DUMPS[1]}" >> $SQLFILE
+                echo "go" >> $SQLFILE
+		
+		echo "WARNING - DUMP FILE NOT FOUND:  ${ARRAY_DUMPS[2]}"  >> $LOGFILE
+		EMAIL_DBA=1
+
+	elif [[ -f ${ARRAY_DUMPS[2]} && $FILEFOUND = 1 ]]
+	then
+                echo "WARNING - COULD NOT REMOVE DUMP FILE:  ${ARRAY_DUMPS[2]}"  >> $LOGFILE
+                EMAIL_DBA=1
+	fi
+	
+done
+
+
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w2048 -i$SQLFILE | grep -v Password > $SQLOUT
+
+checkSqlErr $SQLOUT
+if [ $? -ne 0 ]
+then
+	echo "ERROR occurred while updating dl_dumpfile table in the sybdb database." >> $LOGFILE
+	cat $SQLOUT >> $LOGFILE
+
+        echo "`date` END Script completed with ERRORS" >> $LOGFILE
+        > $MAILFILE
+        echo "`date` Script completed with ERROR MESSAGES." >> $MAILFILE
+        echo "Log file can be found: $LOGFILE" >> $MAILFILE
+        echo " " >> $MAILFILE
+        echo "------- LOGFILE CONTENTS ------- " >> $MAILFILE
+        cat $LOGFILE >> $MAILFILE
+        export MAILSUBJECT="Backup File Removal ERRORS - $DBSERVER"
+        sendMail
+
+	exit 1
+else
+
+	if [[ $EMAIL_DBA = 1 ]]
+	then
+
+		echo "`date` END Script completed with WARNINGS" >> $LOGFILE
+                > $MAILFILE
+                echo "`date` Script completed with WARNING MESSAGES." >> $MAILFILE
+		echo "Log file can be found: $LOGFILE" >> $MAILFILE
+		echo " " >> $MAILFILE
+		echo "------- LOGFILE CONTENTS ------- " >> $MAILFILE
+                cat $LOGFILE >> $MAILFILE
+                export MAILSUBJECT="Backup File Removal WARNING - $DBSERVER"
+                sendMail 
+
+	else
+		echo "`date` END Script completed SUCCESSFULLY." >> $LOGFILE
+
+	fi
+	exit 0
+fi

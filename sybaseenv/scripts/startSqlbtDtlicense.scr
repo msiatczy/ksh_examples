@@ -1,0 +1,72 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: startSqlbtDtlicense.scr -S <DBSERVER>
+#
+#  Description: Start Sqlbt dtlicense for particular ASE
+#		If a dtlicence process is running for any ASE, that is good enough
+#
+#  NOTE:  this script is quick and dirty at this point---needs error checking
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - ASE
+#
+#  Modification History:
+#	04/10/06 M. Siatczynski New script (copied from startSybSqlbt.scr)
+#--------------------------------------------------------------------------
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+# NOTE:  SETDBSERVER must be set AFTER case statement and profile must be sourced AFTER case statement
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+export RPTFILE=$RPTDIR/backup/$DBSERVER/$DBSERVER.startSqlbtDtlicense.$MMYYYY
+
+#--------------------------------------------------------------------------
+#  Start the SQLBT license manager
+#  If there is already a dtlicense process running, we don't need to start another one
+#--------------------------------------------------------------------------
+export DTRUNNING=`$SCRDIR/kickstart -CHECK dtlicense`
+if [ "$DTRUNNING" = "dtlicense is NOT RUNNING" ]
+then
+	echo "`date` $DBSERVER: Starting Datatools License Manager (dtlicense) on $HOST..." >> $RPTFILE
+	$DTBASE/dtlicense/dtlicense -port 4444 >> $RPTFILE 2>&1
+else
+	echo "`date` $DBSERVER: Datatools License Manager already running on $HOST" >> $RPTFILE
+fi
+
+#------------------------------------------------------------------------------
+# exit
+# always exit with 0 at this point
+#------------------------------------------------------------------------------
+exit 0

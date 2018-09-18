@@ -1,0 +1,108 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: manageAutosysLogs.scr -E <autosys env>
+#
+#  Description: Check autosys job and error logs
+#		Move any non-zero byte logs to sentlogs and send email
+#		Remove zero byte logs older than 1 day
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	03/10/04 M. Siatczynski	Initial Script
+#	03/22/04 M. Siatczynski	Changed text of mail subject
+#	03/25/04 M. Siatczynski	Updated contents of mail so the datetime stamp on file is visible
+#	04/07/04 M. Siatczynski	Add chmod 600 for sentlog files to ensure only sybase can see files
+#				(may contain sa password if run with -x debug mode)
+#	12/07/06 M. Siatczynski	Autosys logs have been moved under $LOGDIR
+#				Only remove zero byte logs older than 1 day
+#				All log files older than 45 days are removed as part of central log cleanup
+#				chmod no longer necessary--files are chmod'd when they are touched under .autosysSybProfile
+#	05/02/11 M. Siatczynski	Update autosys env names in USAGE
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -E <DAZ|SAZ|UAZ|PRD|BAZ>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -E)     export AUTOENV=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$AUTOENV" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export MAILFILE=/tmp/mailfile.$$
+export FILELIST=/tmp/filelist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $FILELIST && \rm -f $FILELIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Remove any zero bytes .joblog and .errlog files that are older than 1 day
+#--------------------------------------------------------------------------
+export AUTOLOGDIR=$LOGDIR/autosys/$AUTOENV
+> $MAILFILE
+
+find $AUTOLOGDIR -mtime +1 -size 0 -type f -exec \rm {} \;
+
+#--------------------------------------------------------------------------
+#  Of the remaining files, move any non-zero byte files to the sentlogs directory
+#  prune is needed to avoid searching in sentlogs directory
+#  The ls command, sed, and cut strips off the datetime stamp and filename
+#--------------------------------------------------------------------------
+cd $AUTOLOGDIR
+find . -name sentlogs -prune -o \( ! -size 0 -type f -print \) | sed -e 's/^\.\///g' > $FILELIST
+if [ -s $FILELIST ]
+then
+	cat $FILELIST |
+	while read FILENAME
+	do
+		export FILENAME
+		ls -go $FILENAME | sed 's/  */ /g' | cut -d" " -f4-7 >> $MAILFILE
+		cat $AUTOLOGDIR/$FILENAME >> $MAILFILE
+		echo "END OF LOG FILE\n" >> $MAILFILE
+		mv $AUTOLOGDIR/$FILENAME $AUTOLOGDIR/sentlogs/$FILENAME
+	done
+	export MAILSUBJECT="AutoSys Logs for DBM jobs in $AUTOENV environment"
+	sendMail
+fi
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+exit 0

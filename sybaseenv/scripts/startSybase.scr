@@ -1,0 +1,201 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: startSybase.scr {-ASE <DBSERVER> -RS <REPSERVER>}
+#
+#  Description: Start sybase products on a machine boot
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	07/31/02 M. Siatczynski	Rewrite original script
+#	08/29/02 M. Siatczynski	Added ulimit setting
+#	04/29/05 M. Siatczynski Centralized script, moved sqlbt components to separate script
+#	05/05/05 M. Siatczynski Updated command to start repserver
+#	03/01/06 K. Hess	Removing RSM server from startup script.  RSM Server is no 
+#				longer needed in new versions of Sybase Central.
+#	02/12/07 M. Siatczynski Append hostname to list of service names to start components that run on host and not servicename
+#	07/30/07 M. Siatczynski Add -ase and -rs parm so single ASE or RS can be started
+#				Format servicenames to exact matches are found
+#				Comment out SYSAM start - not needed for ASE 12.5 and handled separately for ASE 15
+#	07/31/07 M. Siatczynski Add start of SYSAM 2.0 prior to ASE/RS starts (must be started prior to ASE15/RS15 starts)
+#	01/11/11 M. Siatczynski Call new script to get service names on host
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+while [ $# -gt 0 ]
+do
+	case $1 in
+		-ASE)	export ONEDBSERVER=$2;shift 2;;
+		-RS)	export ONEREPSERVER=$2;shift 2;;
+		-*)     echo "USAGE ERROR";exit 1;;
+		*)      echo "USAGE ERROR";exit 1;;
+	esac
+done
+
+#--------------------------------------------------------------------------
+#  Set ulimit
+#--------------------------------------------------------------------------
+ulimit -n 1024
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SERVICENAMES=/tmp/servicenames.$$
+export ASELIST=/tmp/aselist.$$
+export RSLIST=/tmp/rslist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SERVICENAMES && \rm -f $SERVICENAMES
+	test -f $ASELIST && \rm -f $ASELIST
+	test -f $RSLIST && \rm -f $RSLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#  If single ASE or RS passed, put this name in list, otherwise do all on host
+#  add hostname to list of servicenames (for ASEs/RSs that don't run on servicename)
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" -o "$ONEREPSERVER" ]
+then
+	test "$ONEDBSERVER" && echo $ONEDBSERVER > $ASELIST
+	test "$ONEREPSERVER" && echo $ONEREPSERVER > $RSLIST
+else
+# get list of service names available on this host
+# reformat the list of servicenames so exact matches are found (put a space before and after)
+        > $SERVICENAMES
+#        /sccm/software/bin/get_service_name |
+        /apps/OSscripts/srvnamesLOC |
+        while read SN
+        do
+                echo " $SN " >> $SERVICENAMES
+        done
+        echo " $HOST " >> $SERVICENAMES
+
+# from the service name list, get list of Sybase ASEs and Repservers
+	if [ -s $SERVICENAMES ]
+	then
+		egrep -f $SERVICENAMES $ASEDIRLIST | cut -d" " -f1 > $ASELIST
+		egrep -f $SERVICENAMES $REPDIRLIST | cut -d" " -f1 > $RSLIST
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# Start the SYSAM license manager
+# LM_LICENSE_FILE is set in SYBASE.ksh
+# If LM_LICENSE_FILE exists, it indicates that SYSAM 2.0 is used in this NFS environment
+# First check to see if the license server is running.  If it's not, start it.
+#--------------------------------------------------------------------------
+export SYSAMBIN=$SYSAMDIR/$SYBASE_SYSAM2/bin
+
+if [ -f $LM_LICENSE_FILE ]
+then
+	echo "Checking SYSAM license server"
+	export SYSAMRUNNING=0
+	$SYSAMBIN/sysam status | grep 'Cannot connect to license server' > /dev/null
+	export SYSAMRUNNING=$?
+	if [ $SYSAMRUNNING -eq 0 ]
+	then
+		echo "Starting SYSAM license server"
+		$SYSAMBIN/sysam start &
+		sleep 5
+	else
+		echo "SYSAM license server is already running"
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  Start the ASE components
+#--------------------------------------------------------------------------
+if [ -s $ASELIST ]
+then
+	cat $ASELIST |
+	while read DBSERVER
+	do
+		export SETDBSERVER=$DBSERVER
+# re-source profile to set environment for ASE
+		. /sccm/dba/sybase/.dbaSybProfile
+
+		export ASEINSTALL=$SYBASE/$SYBASE_ASE/install
+		export SQLBTOSINSTALL=$DTBASE/openserver/install
+
+#--------------------------------------------------------------------------
+# Start ASE
+#--------------------------------------------------------------------------
+
+		if [ -f $ASEINSTALL/RUN_${DBSERVER} ]
+		then
+			echo "Starting dataserver $DBSERVER"
+			$ASEINSTALL/startserver -f $ASEINSTALL/RUN_${DBSERVER} &
+			sleep 60
+		fi
+
+#--------------------------------------------------------------------------
+# Start backupserver
+#--------------------------------------------------------------------------
+		export BACKUPSERVER=${DBSERVER}_BACKUP
+		if [ -f $ASEINSTALL/RUN_${BACKUPSERVER} ]
+		then
+			echo "Starting backup server $BACKUPSERVER"
+			$ASEINSTALL/startserver -f $ASEINSTALL/RUN_${BACKUPSERVER} &
+			sleep 5
+		fi
+
+	done
+else
+	echo "INFO:  There are no ASEs to be started on `hostname`"
+fi
+
+#--------------------------------------------------------------------------
+# Start repserver (if applicable)
+#--------------------------------------------------------------------------
+if [ -s $RSLIST ]
+then
+	cat $RSLIST |
+	while read REPSERVER
+	do
+		export SETREPSERVER=$REPSERVER
+# re-source profile to set environment for RS
+		. /sccm/dba/sybase/.dbaSybProfile
+
+		export REPINSTALL=$SYBASE/$SYBASE_REP/install
+
+		if [ -f $REPINSTALL/RUN_${REPSERVER} ]
+		then
+			echo "Starting repserver $REPSERVER"
+			$REPINSTALL/RUN_${REPSERVER} &
+			sleep 30
+		fi
+
+	done
+else
+	echo "INFO:  There are no REPSERVERs to be started on `hostname`"
+fi
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+exit 0
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,3 @@
+# FILE FORMAT:
+# (1)VIPSERVER (2)pageRangeStart (3)pageRangeEnd (4)status(prod/nonprod) (5)LOB
+SAMDB1-VS 0000 2359 prod FMG

@@ -1,0 +1,273 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: auditRptFailedLogins.scr -S <DBSERVER|all> {-from '<from mm/dd/yyyy>' -to '<to mm/dd/yyyy>' -L <login> -detail -m 'maildest maildest etc'}
+#
+#  Description: Report on failed sybase login attempts for one or more ASEs 
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  NOTE:  If -from and -to are not specified, the report currently defaults to the previous calendar day.
+# 	  The script can not report on data more current than the previous calendar day.
+#
+#  NOTE2:  This script needs better date validation (e.g. 'to date' not less than 'from date', etc.)
+#
+#  NOTE3:  Detail report can only be generated for a single login.
+#
+#  Modification History:
+#	07/19/06 M. Siatczynski	Initial Script
+#	08/02/06 M. Siatczynski	Add -from and -to parms
+#	10/06/06 M. Siatczynski	If errors, append sql output mailfile so we get at least some of the report in the mail file
+#				Change AUDITDBSERVER from POPLAR to REDWOODP
+#	12/18/06 M. Siatczynski	Change AUDITDBSERVER from REDWOODP to PREDWOOD
+#	12/26/06 M. Siatczynski	Add parm to get detail for a single login
+#	04/24/07 M. Siatczynski	Change sybsecurity_archive_<DBSERVER> to sybsec_arch_<DBSERVER>
+#	02/22/10 M. Siatczynski	Convert code to dynamic SQL so we can skip repository databases that don't exist - but print warning
+#				Change exit status (0=success, 1=warning, 2=failure)
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER|all> {-from '<from mm/dd/yyyy>' -to '<to mm/dd/yyyy>' -L <login> -detail -m '<maildest> <maildest> ...'}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -from)  export FROMDATE=$2;shift 2;;
+                        -to)	export TODATE=$2;shift 2;;
+                        -L)     export ONELOGIN=$2;shift 2;;
+                        -detail)	export DETAIL=1;shift 1;;
+                        -m)     export MAILTO=$2;shift 2;;
+                        -flag)  export FLAG=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$DETAIL" && export DETAIL=0
+
+if [ ! "$ONEDBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ "$TODATE" -a ! "$FROMDATE" ]
+then
+        echo $USAGE
+	echo "ERROR - If 'to date' is specified, you MUST specify 'from date'"
+	exit 1
+fi
+
+if [ ! "$ONELOGIN" -a $DETAIL -eq 1 ]
+then
+        echo $USAGE
+	echo "ERROR - Detail can only be generated for a single login"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export AUDITDBSERVER=PREDWOOD
+export DBSERVERLIST=/tmp/dbserver.list.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export MAILFILE=/tmp/mailfile.$$
+
+HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Parse the list of of mail destinitions
+#--------------------------------------------------------------------------
+test -n "$MAILTO" && export MAILDEST="$MAILTO"
+
+#--------------------------------------------------------------------------
+# Create a working dbserverlist
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList > $DBSERVERLIST
+	export RPTFILE=$RPTDIR/audit/central/auditRptFailedLogins.summary.$DATETIME
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+	export RPTFILE=$RPTDIR/audit/central/$ONEDBSERVER.auditRptFailedLogins.summary.$DATETIME
+fi
+
+#--------------------------------------------------------------------------
+# write headers
+#--------------------------------------------------------------------------
+> $RPTFILE
+> $MAILFILE
+echo "`date` Failed Logins Summary Report:\n" >> $RPTFILE
+echo "`date` Failed Logins Summary Report:\n" >> $MAILFILE
+
+#--------------------------------------------------------------------------
+#  Format and sql for each DBSERVER in DBSERVERLIST
+#  event=45 = login attempt
+#  eventmod=2 = failure
+#  Need to allow nulls for login_name column -- login is occasionally null
+#--------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+if [ $DETAIL -eq 1 ]
+then
+	echo "create table #failed_logins (dbserver varchar(15) not null, login_name varchar(30) null, eventdate datetime not null, failed_count int not null)" >> $SQLFILE
+else
+	echo "create table #failed_logins (dbserver varchar(15) not null, login_name varchar(30) null, eventdate date not null, failed_count int not null)" >> $SQLFILE
+fi
+echo "go" >> $SQLFILE
+echo "declare @reposdb varchar(50), @fromdate date, @todate date" >> $SQLFILE
+
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	echo "if exists (select name from master..sysdatabases where name = \"sybsec_arch_${DBSERVER}\")" >> $SQLFILE
+	echo "begin" >> $SQLFILE
+	echo "select @reposdb = \"sybsec_arch_${DBSERVER}\"" >> $SQLFILE
+	
+	if [ "$FROMDATE" ]
+	then
+		echo "select @fromdate = \"$FROMDATE\"" >> $SQLFILE
+	else
+		echo "select @fromdate = convert(date,(dateadd(dd,-1,getdate())))" >> $SQLFILE
+	fi
+
+	if [ "$TODATE" ]
+	then
+		echo "select @todate = \"$TODATE\"" >> $SQLFILE
+	else
+		echo "select @todate = convert(date,(dateadd(dd,-1,getdate())))" >> $SQLFILE
+	fi
+
+	if [ $DETAIL -eq 1 ]
+	then
+#detail query 
+#format dynamic SQL
+		echo "execute (\"insert #failed_logins" >> $SQLFILE
+		echo "select dbserver='$DBSERVER',loginname,eventtime,1" >> $SQLFILE
+		echo "from \" + @reposdb + \"..sysaudits" >> $SQLFILE
+		echo "where event = 45 and eventmod = 2" >> $SQLFILE
+		echo "and convert(date,eventtime) between @fromdate and @todate\")" >> $SQLFILE
+	else
+#summary query
+#format dynamic SQL
+		echo "execute (\"insert #failed_logins" >> $SQLFILE
+		echo "select dbserver='$DBSERVER',loginname,eventdate=convert(date,eventtime),numfailed=count(*)" >> $SQLFILE
+		echo "from \" + @reposdb + \"..sysaudits" >> $SQLFILE
+		echo "where event = 45 and eventmod = 2" >> $SQLFILE
+		echo "and convert(date,eventtime) between @fromdate and @todate" >> $SQLFILE
+		echo "group by loginname,convert(date,eventtime)\")" >> $SQLFILE
+	fi
+	echo "end" >> $SQLFILE
+	echo "else" >> $SQLFILE
+	echo "begin" >> $SQLFILE
+	echo "print \"WARNING - sybsec_arch_${DBSERVER} database DOES NOT EXIST on $AUDITDBSERVER\"" >> $SQLFILE
+	echo "end" >> $SQLFILE
+done
+
+echo "print \"\"" >> $SQLFILE
+echo "print \"Reporting on failures between %1! and %2!\",@fromdate,@todate" >> $SQLFILE
+echo "print \"\"" >> $SQLFILE
+if [ $DETAIL -eq 1 ]
+then
+# change display name of datetime column, so order by will properly sort by datetime rather than char
+	echo "select dbserver,login_name,eventtime=convert(char,eventdate,9)" >> $SQLFILE
+else
+	echo "select dbserver,login_name,eventdate,failed_count" >> $SQLFILE
+fi
+echo "from #failed_logins" >> $SQLFILE
+test "$ONELOGIN" && echo "where login_name = \"$ONELOGIN\"" >> $SQLFILE
+echo "order by dbserver, login_name, eventdate" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "drop table #failed_logins" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#--------------------------------------------------------------------------
+#  Execute the sql against AUDITDBSERVER
+#--------------------------------------------------------------------------
+getPass $AUDITDBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$AUDITDBSERVER -w200 -i$SQLFILE  | grep -v Password > $SQLOUT
+
+#------------------------------------------------------------------------------
+# check for errors
+#------------------------------------------------------------------------------
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	export HIGHRC=2
+	echo "Report FAILED" >> $MAILFILE
+	cat $SQLOUT >> $MAILFILE
+	echo "\nSee $RPTFILE for details" >> $MAILFILE
+else
+	grep 'WARNING' $SQLOUT > /dev/null
+	if [ $? -eq 0 ]
+	then
+# report has WARNINGS
+		export HIGHRC=1
+		echo "Report completed with WARNINGS" >> $MAILFILE
+		cat $SQLOUT >> $MAILFILE
+		echo "\nSee $RPTFILE for details" >> $MAILFILE
+	else
+# report SUCCESSFUL
+		cat $SQLOUT >> $MAILFILE
+		echo "\nSee $RPTFILE for details" >> $MAILFILE
+	fi
+fi
+
+cat $SQLOUT >> $RPTFILE
+
+#------------------------------------------------------------------------------
+# write trailers
+#------------------------------------------------------------------------------
+echo "\n`date` End of Report" >> $RPTFILE
+echo "\n`date` End of Report" >> $MAILFILE
+
+#------------------------------------------------------------------------------
+# Send summary report
+# exit
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 2 ]
+then
+	export MAILSUBJECT="Sybase Failed Login Summary (FAILURE)"
+	sendMail
+	exit 2
+elif [ $HIGHRC -eq 1 ]
+then
+	export MAILSUBJECT="Sybase Failed Login Summary (WARNING)"
+	sendMail
+	exit 1
+else
+	export MAILSUBJECT="Sybase Failed Login Summary (SUCCESSFUL)"
+	sendMail
+	exit 0
+fi

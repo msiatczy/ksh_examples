@@ -1,0 +1,103 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: startRS.scr -S <REPSERVER> {-m <maildest> -p <pagedest>}
+#
+#  Description: Start a repserver.
+#		Always send mail with restart message.
+#		Send page if pagedest is passed.
+#
+#     Location: /sccm/dba/sybase/scripts
+#
+#    Called by:	scanRSLog.scr
+#
+#        Calls:	none
+#   
+#   Parameters:	none
+#
+#  Modification History:
+#       07/09/03 M. Siatczynski Original script
+#       08/03/04 M. Siatczynski Centralized script
+#       08/02/05 M. Siatczynski Redirect output to log subdirectory rather than reports
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <REPSERVER> {-m <maildest> -p <pagedest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export REPSERVER=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -p)     export PAGETO=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$REPSERVER" ]
+then
+        echo "$USAGE"
+        exit 1
+fi
+
+# SETREPSERVER must be set before profile is sourced
+export SETREPSERVER=$REPSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize variables
+#  Override PAGEDEST if -p is specified
+#--------------------------------------------------------------------------
+test "$PAGETO" && export PAGEDEST=$PAGETO || unset PAGEDEST
+export REPINSTALL=$SYBASE/$SYBASE_REP/install
+export STARTLOG=$LOGDIR/replication/startRS/$REPSERVER/$REPSERVER.startRS.$MMYYYY
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $MAILFILE && \rm -f $MAILFILE
+        test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------------------
+# "ping" the RS
+# If not running, attempt to start it
+#------------------------------------------------------------------------------------------
+$SCRDIR/sybPing.scr -S $REPSERVER
+export RC=$?
+
+if [ $RC -eq 1 ]
+then
+        > $MAILFILE
+        echo "`date` $REPSERVER not running on $HOST.  Starting via $REPINSTALL/RUN_${REPSERVER}" >> $MAILFILE
+	cat $MAILFILE >> $STARTLOG
+	export MAILSUBJECT="$REPSERVER: Starting on $HOST"
+	sendMail
+
+	$REPINSTALL/startserver -f $REPINSTALL/RUN_${REPSERVER}
+
+	if [ "$PAGEDEST" ]
+	then
+		> $PAGEMSG
+		echo "Starting $REPSERVER on $HOST (`date +'%D %T'`)" >> $PAGEMSG
+		sendPage
+	fi
+else
+	echo "`date` $REPSERVER already running on $HOST." >> $STARTLOG
+fi	
+#------------------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------------------
+exit 0

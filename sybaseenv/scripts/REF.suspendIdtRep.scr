@@ -1,0 +1,259 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: suspendIdtRep.scr -S <SOURCE DBSERVER> -T <TARGET DBSERVER> -RS <REP SERVER> -RSASE <RS ASE> -RSSD <RSSD>
+#
+#  Description: Short description for the use of this script. 
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	10/14/03 M. Siatczynski	Initial Script
+#	11/10/03 M. Siatczynski	Added code to resume replication following completion of reports
+#				Do not suspend replication for prs
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <SOURCE DBSERVER> -T <TARGET DBSERVER> -RS <REP SERVER> -RSASE <RS ASE> -RSSD <RSSD>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export SOURCE_DBSERVER=$2;shift 2;;
+                        -T)     export TARGET_DBSERVER=$2;shift 2;;
+                        -RS)    export REPSERVER=$2;shift 2;;
+                        -RSASE) export RSASE=$2;shift 2;;
+                        -RSSD)  export RSSD=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$SOURCE_DBSERVER" -o ! "$TARGET_DBSERVER" -o ! "$REPSERVER" -o ! "$RSASE" -o ! "$RSSD" ]
+then
+        echo $USAGE
+        exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export RPTFILE=$RPTDIR/misc/$REPSERVER.suspendIdtRep.$DATETIME
+export IRLOG=$LOGDIR/misc/checkIRCycle.$$.$DATETIME
+export SOURCE_REPTIME=/tmp/source_reptime.$$
+export TARGET_REPTIME=/tmp/target_reptime.$$
+export DIFF=/tmp/diff.$$
+export GENCTL=idtrep.$$.lst
+export CTLFILE=/sccm/home/dba/sybase/ctl/$GENCTL
+export TEMPCTL=tempctl.$$
+export TEMPCTLFILE=/sccm/home/dba/sybase/ctl/$TEMPCTL
+export REPSCRIPTS=/sccm/home/dba/sybase/scripts/repSetup
+export MAILFILE=/tmp/mailfile.$$
+export FISQL=/tmp/fisql.$$
+
+#--------------------------------------------------------------------------
+# Format SQL to check for completion of Fixed Income reports on IDTPROD2
+#--------------------------------------------------------------------------
+> $FISQL
+echo "set nocount on" >> $FISQL
+echo "go" >> $FISQL
+echo "use prs" >> $FISQL
+echo "go" >> $FISQL
+echo "declare @ficomp tinyint" >> $FISQL
+echo "select @ficomp=0" >> $FISQL
+echo "-- check completion of Fixed Income on IDTPROD2" >> $FISQL
+echo "select @ficomp=1 where " >> $FISQL
+echo "(select count(*) from pr_autogen where instance_id = 800 and status_code = 'c' " >> $FISQL
+echo "and convert(char(10), last_run_datetime, 101) = convert(char(10), getdate(), 101) " >> $FISQL
+echo "and frequency_code = 'd' and calendar_code = 'b') = " >> $FISQL
+echo "(select count(*) from pr_autogen where instance_id = 800 and frequency_code = 'd' and calendar_code = 'b')" >> $FISQL
+echo "print \"%1!\",@ficomp" >> $FISQL
+echo "go" >> $FISQL
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SOURCE_REPTIME && \rm -f $SOURCE_REPTIME
+	test -f $TARGET_REPTIME && \rm -f $TARGET_REPTIME
+	test -f $DIFF && \rm -f $DIFF
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $TEMPCTLFILE && \rm -f $TEMPCTLFILE
+# move the control file to the /tmp directory, so they don't build up in the
+# central control directory, but we can reference under /tmp, if necessary
+# comment out until the getRepDbs.scr script is updated to handle an absolute ctlfile path/name
+#	test -f $CTLFILE && mv $CTLFILE /tmp/$GENCTL
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Check to see if the IR Cycle is done
+#  If not complete, check every 5 minutes until complete
+#  Should we stop after n iterations???
+#--------------------------------------------------------------------------
+echo "`date`:  Checking if IR Cycle is done..." >> $RPTFILE
+
+> $IRLOG
+/sccm/software/bin/pr_rtdep server=IDTPROD1 >> $IRLOG
+IRDONE=$?
+
+if [ ! $IRDONE ]
+then
+        echo "$0 : Unable to verify completion of IR Cycle.  Exiting."
+        exit 1
+else
+	while [ $IRDONE -eq 1 ]
+	do
+		echo "`date`:  IR Cycle not done yet..." >> $RPTFILE
+		sleep 300
+		/sccm/software/bin/pr_rtdep server=IDTPROD1 >> $IRLOG
+		IRDONE=$?
+	done
+fi
+
+echo "`date`:  IR Cycle is done" >> $RPTFILE
+
+#--------------------------------------------------------------------------
+# Send final transaction across for investments
+#--------------------------------------------------------------------------
+echo "`date`:  Sending final transaction for investments..." >> $RPTFILE
+> $SOURCE_REPTIME
+$ISQLEXE -U$ADMINLOGIN -S$SOURCE_DBSERVER -w200 -b <<-! | grep -v Password >> $SOURCE_REPTIME
+`getPass $SOURCE_DBSERVER $ADMINLOGIN`
+set nocount on
+go
+update investments..repmon set reptime = getdate()
+go
+select reptime from investments..repmon
+go
+!
+
+echo "`date`:  Source reptime ($SOURCE_DBSERVER) = `cat $SOURCE_REPTIME`" >> $RPTFILE
+
+#--------------------------------------------------------------------------
+# Wait for the update to replicate to the target dbserver
+#--------------------------------------------------------------------------
+echo "`date`:  Checking replicate for final transaction..." >> $RPTFILE
+> $TARGET_REPTIME
+$ISQLEXE -U$ADMINLOGIN -S$TARGET_DBSERVER -w200 -b <<-! | grep -v Password >> $TARGET_REPTIME
+`getPass $TARGET_DBSERVER $ADMINLOGIN`
+set nocount on
+go
+select reptime from investments..repmon
+go
+!
+
+echo "`date`:  Target reptime ($TARGET_DBSERVER) = `cat $TARGET_REPTIME`" >> $RPTFILE
+diff -w $SOURCE_REPTIME $TARGET_REPTIME > $DIFF
+
+while [ -s $DIFF ]
+do
+	echo "`date`:  Waiting for final transaction..." >> $RPTFILE
+	sleep 300
+	> $TARGET_REPTIME
+	$ISQLEXE -U$ADMINLOGIN -S$TARGET_DBSERVER -w200 -b <<-! | grep -v Password >> $TARGET_REPTIME
+	`getPass $TARGET_DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select reptime from investments..repmon
+	go
+	!
+
+	echo "`date`:  Target reptime ($TARGET_DBSERVER) = `cat $TARGET_REPTIME`" >> $RPTFILE
+	diff -w $SOURCE_REPTIME $TARGET_REPTIME > $DIFF
+done
+echo "`date`:  Final transaction received on replicate." >> $RPTFILE
+
+#--------------------------------------------------------------------------
+# Get list of replicated databases
+# Remove prs from list of databases
+#--------------------------------------------------------------------------
+echo "`date`:  Getting list of replicated databases..." >> $RPTFILE
+/sccm/home/dba/sybase/scripts/getRepDbs.scr -RSASE $RSASE -RSSD $RSSD -genctl $TEMPCTL > /dev/null
+export RC=$?
+if [ "$RC" -ne 0 ]
+then
+	echo "ERROR - Not able to generate list of replicated databases" >> $RPTFILE
+	exit 1
+fi
+
+grep -v ' prs ' $TEMPCTLFILE > $CTLFILE
+
+echo "`date`:  Replicated list generated (prs excluded):  $GENCTL" >> $RPTFILE
+
+#--------------------------------------------------------------------------
+# Suspend DSI connections based on list of replicated databases
+#--------------------------------------------------------------------------
+echo "`date`:  Suspending DSI to $TARGET_DBSERVER..." >> $RPTFILE
+$REPSCRIPTS/suspendDsi.scr -L $GENCTL -RS $REPSERVER -S $TARGET_DBSERVER -fmt -run -noprompt >> $RPTFILE
+export RC=$?
+if [ "$RC" -ne 0 ]
+then
+	echo "Exiting" >> $RPTFILE
+	exit 1
+else
+	echo "`date`:  DSI suspended to $TARGET_DBSERVER." >> $RPTFILE
+fi
+
+#--------------------------------------------------------------------------
+# Loop, checking for completion of fixed income reports on IDTPROD2 (instance_id=800)
+# Status is checked on SOURCE DBSERVER because prs database is only updated at source.
+# Remove all spaces from the output, leaving only a 1 or 0
+#--------------------------------------------------------------------------
+echo "`date`:  Checking completion of Fixed Income reports on $TARGET_DBSERVER..." >> $RPTFILE
+
+export RPTDONE=0
+
+export RPTDONE=`getPass $SOURCE_DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$SOURCE_DBSERVER -w200 -b -i$FISQL | grep -v Password`
+
+while [ $RPTDONE -eq 0 ]
+do
+	echo "`date`:  Fixed Income reports not yet complete on $TARGET_DBSERVER" >> $RPTFILE
+	sleep 300
+	export RPTDONE=`getPass $SOURCE_DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$SOURCE_DBSERVER -w200 -b -i$FISQL | grep -v Password`
+done
+
+echo "`date`:  Fixed Income reports complete on $TARGET_DBSERVER." >> $RPTFILE
+
+#--------------------------------------------------------------------------
+# Resume DSI connections based on list of replicated databases
+# Commented out until we know how to check completion of reports
+#--------------------------------------------------------------------------
+echo "`date`:  Resuming DSI to $TARGET_DBSERVER..." >> $RPTFILE
+$REPSCRIPTS/resumeDsi.scr -L $GENCTL -RS $REPSERVER -S $TARGET_DBSERVER -fmt -run -noprompt >> $RPTFILE
+export RC=$?
+if [ "$RC" -ne 0 ]
+then
+	echo "Exiting" >> $RPTFILE
+	exit 1
+else
+	echo "`date`:  DSI resumed to $TARGET_DBSERVER." >> $RPTFILE
+fi
+
+#--------------------------------------------------------------------------
+# Send email
+# Move to end when last two steps are implemented
+#--------------------------------------------------------------------------
+cat $RPTFILE > $MAILFILE
+export MAILDEST="$MAILDEST msiatczy khess"
+export MAILSUBJECT="IDT Suspend Replication Status"
+sendMail
+
+exit 0

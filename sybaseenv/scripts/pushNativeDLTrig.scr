@@ -1,0 +1,124 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: pushNativeDLTrig.scr -T <trigger>|all -S <DBSERVER>|all
+#
+#  Description: Push one trigger or all triggers used for native backup/recover to one/all ASEs
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	08/27/10 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -T <trigger>|all -S <DBSERVER>|all"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -T)	export ONETRIGGER=$2;shift 2;;
+	                -S)	export ONEDBSERVER=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$ONETRIGGER" -o ! "$ONEDBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# initialize variables
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/central/pushNativeDLTrig.$DATETIME
+export DBSERVERLIST=/tmp/dbserver.lst.$$
+export TRIGLIST=/tmp/trig.lst.$$
+
+#--------------------------------------------------------------------------
+# format DBSERVER list
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAse15List | grep -v 'odydb01' > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# generate trigger list
+# defaults to all files ending with .trg under $DISTDIR/sybdb/triggers
+#--------------------------------------------------------------------------
+if [ "$ONETRIGGER" = "all" ]
+then
+	cd $DISTDIR/sybdb/triggers
+	ls *.trg > $TRIGLIST
+else
+	echo $ONETRIGGER > $TRIGLIST
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $TRIGLIST && \rm -f $TRIGLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Add the new trigger(s) to dbserver(s)
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Pushing triggers" >> $LOGFILE
+
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	echo "\nCreating trigger(s) on $DBSERVER..." | tee -a $LOGFILE
+	for TRIGGER in `cat $TRIGLIST`
+	do
+		echo "$TRIGGER" | tee -a $LOGFILE
+		export TRIGFILE=$DISTDIR/sybdb/triggers/$TRIGGER
+		if [ ! -s $TRIGFILE ]
+		then
+			echo "ERROR - $TRIGFILE does not exist or is 0 bytes" | tee -a $LOGFILE
+			exit 1
+		fi
+		getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -i$TRIGFILE -w200 | grep -v Password >> $LOGFILE
+	done
+done
+
+#--------------------------------------------------------------------------
+#  check SQL errors
+#  exit
+#--------------------------------------------------------------------------
+checkSqlErr $LOGFILE
+if [ $? -ne 0 ]
+then
+        echo "ERROR - creating triggers(s)" | tee -a $LOGFILE
+        echo "Review $LOGFILE"
+        exit 1
+else
+        echo "Trigger(s) SUCCESSFULLY created" | tee -a $LOGFILE
+	exit 0
+fi

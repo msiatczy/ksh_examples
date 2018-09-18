@@ -1,0 +1,251 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: verifyBackups.scr -S <DBSERVER> -all | {-xdbserver -xdb -m <maildest>}
+#
+#  Description: Verify backups are being run via SQLBT for one or more dbservers.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	01/02/02	K. Hess	Initial Script
+#	03/13/02	K. Hess	Updated variables
+#	05/13/02	K. Hess	Updated variables
+#	07/25/02	M. Murphy	Added DATATOOLS_DIR setting
+#	09/24/02	M. Siatczynski	Changed test to test -f on cleanup
+#	10/21/02	M. Siatczynski	Changed report formatting and mail routine, added trap
+#	02/25/03	M. Siatczynski	Exclude control files that end with .skip
+#	07/11/03	M. Siatczynski	Update code to exclude all tempdbs
+#	05/13/04	M. Siatczynski	Centralize script, implement dbserver and db exclusion lists
+#	06/03/04	M. Siatczynski	Add logic to account for empty exclude list
+#	12/17/04	K. Hess		Updated rsh to ssh
+#	02/16/05	M. Siatczynski	Add note to email on how to permamently exclude databases from report
+#	02/17/06	M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN, changed CTLDIR to SQLBTCTLDIR
+#	03/15/06	M. Siatczynski	Replace sbackups.physical with $DT_PHYSICAL
+#	03/16/06	M. Siatczynski	Add STDCTLDIRLIST to check for control files in all standard full backup directories
+#	11/14/06	M. Siatczynski	Allow for comment in SQLBTDIRLIST
+#	12/21/06	M. Siatczynski	Change DBSERVEREXCLUDE to RPTASEEXCLUDELIST and DBEXCLUDE to RPTDBEXCLUDELIST
+#	12/22/06	M. Siatczynski	Change LOGNAME to USER
+#	06/01/09	M. Siatczynski	Ignore archive databases
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> | -all {-xdbserver -xdb -m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -xdbserver)   export XDBSERVER=1;shift 1;;
+                        -xdb)   export XDB=1;shift 1;;
+                        -all)   export ALL=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$XDBSERVER" && export XDBSERVER=0
+test ! "$XDB" && export XDB=0
+test ! "$ALL" && export ALL=0
+
+if [ ! "$ONEDBSERVER" -a $ALL -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ "$ONEDBSERVER" -a $ALL -eq 1 ]
+then
+        echo $USAGE
+        echo "ERROR - DBSERVER and -all are mutually exclusive"
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export TMPDBLIST=/tmp/tmpdblist.$$
+export DBLIST=/tmp/dblist.$$
+export CTLFILE=/tmp/ctlfiles.$$
+export TMPCTLFILE=/tmp/tmpctlfiles.$$
+export DIFFILE=/tmp/diff.$$
+export DBDIFF=/tmp/dbdiff.$$
+export CTLDIFF=/tmp/ctldiff.$$
+export SQLBTLIST=/tmp/sqlbt.list.$$
+export DBREPORT=/tmp/dbrpt.$$
+export CTLREPORT=/tmp/ctlrpt.$$
+export XDBSERVERLIST=/tmp/exclude.dbserver.lst.$$
+export XDBLIST=/tmp/exclude.db.lst.$$
+export STDCTLDIRLIST=$CTLDIR/sqlbtStdCtlDir.lst
+export REPORT=$RPTDIR/backup/central/verifyBackups.$DATETIME
+
+> $DBREPORT
+> $CTLREPORT
+
+#--------------------------------------------------------------------------
+#  Define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $TMPDBLIST && \rm -f $TMPDBLIST
+        test -f $DBLIST && \rm -f $DBLIST
+        test -f $CTLFILE && \rm -f $CTLFILE
+        test -f $TMPCTLFILE && \rm -f $TMPCTLFILE
+        test -f $DIFFILE && \rm -f $DIFFILE
+        test -f $DBDIFF && \rm -f $DBDIFF
+        test -f $CTLDIFF && \rm -f $CTLDIFF
+        test -f $SQLBTLIST && \rm -f $SQLBTLIST
+        test -f $DBREPORT && \rm -f $DBREPORT
+        test -f $CTLREPORT && \rm -f $CTLREPORT
+        test -f $XDBSERVERLIST && \rm -f $XDBSERVERLIST
+        test -f $XDBLIST && \rm -f $XDBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working sqlbt list
+# If one dbserver is passed, do not process the DBSERVER exclusion list
+# Reformat the exclude list so it will pick up exact servername matches
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" ]
+then
+	grep "^$ONEDBSERVER " $SQLBTDIRLIST | cut -d" " -f1-3 > $SQLBTLIST
+else
+	if [ $XDBSERVER -eq 1 ]
+	then
+		sed -e 's/^/\^/g' -e 's/$/ /g' $RPTASEEXCLUDELIST > $XDBSERVERLIST
+		test -s $XDBSERVERLIST && grep -v '^#' $SQLBTDIRLIST | cut -d" " -f1-3 | egrep -vf $XDBSERVERLIST > $SQLBTLIST || grep -v '^#' $SQLBTDIRLIST | cut -d" " -f1-3 > $SQLBTLIST
+	else
+		grep -v '^#' $SQLBTDIRLIST | cut -d" " -f1-3 > $SQLBTLIST
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  Create lists of SQL BT control files and databases by database server
+#  and find differences
+#--------------------------------------------------------------------------
+
+cat $SQLBTLIST |
+while read DBSERVER SN DTBASE
+do
+	export DBSERVER SN DTBASE
+
+#--------------------------------------------------------------------------
+#  Create list of control files from all sqlbt control directores in standard list
+#  Sort the list and eliminate duplicates
+#--------------------------------------------------------------------------
+	> $TMPCTLFILE
+
+	for SUBDIR in `grep -v '^#' $STDCTLDIRLIST`
+	do
+		export SQLBTCTLDIR=$DTBASE/$SUBDIR/$DBSERVER
+		/usr/local/bin/ssh -n $SN "test -f $SQLBTCTLDIR/* && ls $SQLBTCTLDIR | grep -v '\.skip$' | sort" >> $TMPCTLFILE
+	done
+
+	sort $TMPCTLFILE | uniq  > $CTLFILE
+
+#--------------------------------------------------------------------------
+#  Create list of databases defined on the server
+#  Ignore tempdbs and archive databases (status3=4194304)
+#  Check for errors
+#  Process database exclusions (if processing all database servers and -xdb flag was passed)
+#--------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password | sed -e 's/ //g' | sort > $TMPDBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases where name not like 'tempdb%' and status3 & 4194304 <> 4194304
+	go
+	!
+
+	checkSqlErr $TMPDBLIST
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting list of databases for $DBSERVER"
+		cat $TMPDBLIST
+		continue
+	else
+		if [ "$ONEDBSERVER" ]
+		then
+			cat $TMPDBLIST > $DBLIST
+		else
+			if [ $XDB -eq 1 ]
+			then
+				grep "^$DBSERVER " $RPTDBEXCLUDELIST | cut -d" " -f2 | sort | sed -e 's/^/\^/g' -e 's/$/\$/g' > $XDBLIST
+				test -s $XDBLIST && egrep -vf $XDBLIST $TMPDBLIST > $DBLIST || cat $TMPDBLIST > $DBLIST
+			else
+				cat $TMPDBLIST > $DBLIST
+			fi
+		fi
+	fi
+
+#--------------------------------------------------------------------------
+#  Find differences  
+#--------------------------------------------------------------------------
+	> $DIFFILE
+	diff $DBLIST $CTLFILE > $DIFFILE
+
+	> $DBDIFF
+	grep \> $DIFFILE > $DBDIFF
+
+	> $CTLDIFF
+	grep \< $DIFFILE > $CTLDIFF
+
+#--------------------------------------------------------------------------
+#  Create report for missing backups  
+#--------------------------------------------------------------------------
+	if [ -s "$CTLDIFF" ]
+	then
+		test ! -s $DBREPORT && echo "THE FOLLOWING DATABASES ARE NOT BEING BACKED UP:\n" >> $DBREPORT
+		echo "------------$DBSERVER-----------" >> $DBREPORT
+		cat $CTLDIFF >> $DBREPORT
+		echo "" >> $DBREPORT
+	fi
+
+	if [ -s $DBDIFF ]
+	then
+		test ! -s $CTLREPORT && echo "THE FOLLOWING CONTROL FILES DO NOT HAVE A CORRESPONDING DATABASE ON THE SERVER:\n" >> $CTLREPORT
+		echo "------------$DBSERVER-----------" >> $CTLREPORT
+		cat $DBDIFF >> $CTLREPORT
+		echo "" >> $CTLREPORT
+	fi
+done
+
+#--------------------------------------------------------------------------
+#  Mail report
+#--------------------------------------------------------------------------
+if [ -s "$DBREPORT" -o -s "$CTLREPORT" ]
+then
+        > $REPORT
+        echo `date` >> $REPORT
+        echo "\n$0 executed by user $USER on `hostname`" >> $REPORT
+        echo "\nTo permanently exclude databases from report, enter DBSERVER DBNAME in $RPTDBEXCLUDELIST\n" >> $REPORT
+	test -s $DBREPORT && cat $DBREPORT >> $REPORT
+	test -s $CTLREPORT && cat $CTLREPORT >> $REPORT
+
+	export MAILFILE=$REPORT
+	export MAILSUBJECT="REPORT: Sybase Backups"
+	sendMail
+fi
+
+#------------------------------------------------------------------------------
+# Exit
+#------------------------------------------------------------------------------
+exit 0

@@ -1,0 +1,80 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: rollSqlbtOpenserverLogs.scr -S <DBSERVER> {-OS <OPENSERVER> -G <generations>}
+#
+#  Description: Rotate the errorlogs for SQLBT Openserver.
+#		keeping n generations (default 8 generations).
+#
+#     Location:	/sccm/dba/sybase/scripts/rollSqlbtOpenserverLogs.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	-S <DBSERVER> - database server
+#		-G <generations> - number of generations to keep
+#
+#  Modification History:
+#	06/10/04 M. Siatczynski	Initial Script
+#	04/04/07 M. Siatczynski	Add -OS parm to account for new OS naming standard, defaults to old naming standard
+#--------------------------------------------------------------------------
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> {-OS <OPENSERVER> -G <generations>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -OS)	export BTOPENSERVER=$2;shift 2;;
+	                -G)	export GENERATIONS=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# if openserver name is not passed, default to old naming standard
+test ! "$BTOPENSERVER" && export BTOPENSERVER=${DBSERVER}_BT_OPENSRV
+
+# NOTE:  SETDBSERVER must be set AFTER case statement and .dbaSybProfile must be sourced AFTER case statement
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.miscfunctions
+
+test ! "$GENERATIONS" && export GENERATIONS=8
+
+export OSLOG=$DT_OPENSERVER_HOME/install/errorlog_${BTOPENSERVER}
+
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# If there is not a current log file, then the environment is probably not set correctly.
+# Roll the SQLBT errorlogs and clear the current one.
+# If any generation cannot be copied of moved, exit the script with non-0 RC.
+#--------------------------------------------------------------------------
+if [ -f $OSLOG ]
+then
+	rollGenerations $OSLOG $GENERATIONS
+else
+	echo "$OSLOG does not exist"	
+	export HIGHRC=1
+fi
+
+#--------------------------------------------------------------------------
+# Exit with 0 if all above commands were successful
+#--------------------------------------------------------------------------
+exit $HIGHRC

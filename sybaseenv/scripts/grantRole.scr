@@ -1,0 +1,178 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: grantRole.scr -U <user> -login <login>|-L <login list> -S <DBSERVER> -role <role> {-adduser}
+#
+#  Description: Grant a role to a login on a specific DBSERVER.  Optinally add user to all DBs where role has been granted perms
+#
+#     Location:	/sccm/dba/sybase/scripts/grantRole.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<user> - login of the user running the add
+#		<login> - login
+#		<role> - role
+#
+#
+#  Modification History:
+#	02/09/06 M. Siatczynski	Initial Script
+#	06/06/06 M. Siatczynski	Add SPRUCE to ASE list
+#	07/31/06 M. Siatczynski	Add DBSERVER parm,remove hardcoded SAM server list
+#	08/15/06 M. Siatczynski	grantRole.scr replaces grantSamRole.scr and grantIdtRole.scr
+#	08/16/06 M. Siatczynski	add -L parm to allow for grant to list of logins
+#	05/17/10 M. Siatczynski	add -adduser parm to allow call to addUserForRole.scr
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -U <user> -login <login>|-L <login list> -S <DBSERVER> -role <role> {-adduser}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-U)		export EXEUSER=$2;shift 2;;
+			-login)		export ONELOGIN=$2;shift 2;;
+			-L)		export INPUTLIST=$2;shift 2;;
+			-S)		export DBSERVER=$2;shift 2;;
+			-role)		export ROLE=$2;shift 2;;
+			-adduser)	export ADDUSER=1;shift 1;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# user and login must be passed
+if [ ! "$EXEUSER" -o ! "$ROLE" -o ! "$DBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# either login name or list must be passed
+if [ ! "$ONELOGIN" -a ! "$INPUTLIST" ]
+then
+        echo $USAGE
+        echo "ERROR - login name or list of logins MUST be passed"
+        exit 1
+fi
+
+# default ADDUSER flag to 0 if not passed
+test ! "$ADDUSER" && export ADDUSER=0
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.grantRole.$DATETIME
+export SQLFILE=/tmp/loginsql.$$
+export SQLOUT=/tmp/sqlout.$$
+export LOGINLIST=/tmp/loginlist.$$
+export HIGHRC=0
+
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $LOGINLIST && \rm -f $LOGINLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create a working login list
+#------------------------------------------------------------------------------
+if [ "$INPUTLIST" ]
+then
+        if [ ! -s $INPUTLIST ]
+        then
+                echo "ERROR - $INPUTLIST does not exist or is 0 bytes"
+                exit 1
+        else
+                cat $INPUTLIST > $LOGINLIST
+        fi
+else
+        echo $ONELOGIN > $LOGINLIST
+fi
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Role grant" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Format sql for each login in the list
+#------------------------------------------------------------------------------
+> $SQLFILE
+
+echo "use master" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $LOGINLIST |
+while read LOGIN
+do
+	export LOGIN
+	echo "print \"Granting $ROLE to $LOGIN on %1!...\",@@servername" >> $SQLFILE
+	echo "execute sp_role \"grant\",$ROLE,$LOGIN" >> $SQLFILE
+	echo "print \"Enabling role $ROLE at logon for $LOGIN on %1!...\",@@servername" >> $SQLFILE
+	echo "execute sp_modifylogin $LOGIN,\"add default role\",$ROLE" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#------------------------------------------------------------------------------
+# run the sql
+#------------------------------------------------------------------------------
+echo "`date` Granting role $ROLE on $DBSERVER for the following logins:" >> $LOGFILE
+cat $LOGINLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+getPass $DBSERVER $EXEUSER | $ISQLEXE -U$EXEUSER -S$DBSERVER -w200 -i $SQLFILE > $SQLOUT
+
+cat $SQLOUT >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Check for errors
+#------------------------------------------------------------------------------
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	export HIGHRC=1
+	echo "`date` Role grant FAILED for $DBSERVER" >> $LOGFILE
+else
+	echo "`date` Role grant SUCCESSFUL for $DBSERVER" >> $LOGFILE
+fi
+
+echo "`date` END Role grant" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# If no errors and ADDUSER flag passed, call script to add user to databases
+# exit with final return status
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+        echo "\nRole grant FAILED - output in $LOGFILE"
+	echo "\nREMINDER:  THIS SCRIPT MUST BE EXECUTED AGAINST BOTH ASES IN A REPLICATED ENVIRONMENT.\n"
+        exit 1
+else
+	echo "\nRole grant SUCCESSFUL"
+	echo "\nREMINDER:  THIS SCRIPT MUST BE EXECUTED AGAINST BOTH ASES IN A REPLICATED ENVIRONMENT.\n"
+	if [ $ADDUSER -eq 1 ]
+	then
+	        echo "\nCalling script to ADD USER to databases.  See addUserForRole log for details." | tee -a $LOGFILE
+		$SCRDIR/addUserForRole.scr -U $ADMINLOGIN -L $LOGINLIST -role $ROLE -S $DBSERVER
+		test $? -ne 0 && export HIGHRC=1
+	fi
+# exit with final return status
+        test $HIGHRC -eq 1 && exit 1 || exit 0
+fi

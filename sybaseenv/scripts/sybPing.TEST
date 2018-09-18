@@ -1,0 +1,276 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sybPing.scr -all | -S <SERVER (DB or REP)> {-p <pagedest> -m <maildest> -nopage -nomail -pagerange}
+#
+#  Description: "Ping" ASEs, backupservers, VIPs and repservers.
+#
+#     Location: /sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	none
+#   
+#   Parameters:	none
+#
+#  NOTE:  3 separate ping lists are used in this script.  This is necessary in order to accommodate the 
+#		backupserver ping.  An equal amount of code would be necessary to perform the logic if
+#		3 lists were not used.
+#
+#  NOTE:  If using -pagerange, pass the server name to sendPage so the page range is validated for the specific server.
+#
+#  Modification History:
+#       01/21/02 M. Siatczynski Original script (rewrite of Wepco script)
+#       02/18/02 M. Siatczynski Added except list info to email message
+#       09/25/02 M. Siatczynski Converted to standard, add sort of dbserver list
+#       02/20/03 M. Siatczynski Changed filenames of ping and page audit trails
+#				added month and year to log names
+#       04/16/03 M. Siatczynski Updated loop to send email before page to try and detect missing pages
+#       06/17/03 M. Siatczynski Reverted code to send page then email
+#       06/18/03 M. Siatczynski Added HOST and changed format of page/mail message
+#       09/30/03 M. Siatczynski Incorporate VIP and rep pings into this script so we can eliminate vipPing.scr
+#				Switch to use aseDirectory.lst instead of sybServer.lst
+#				Removed HOST (part of profile)
+#				Add datetime to page/mail message
+#       10/13/03 M. Siatczynski Add parms (none previously)
+#       11/24/03 M. Siatczynski Final centralization changes
+#       12/31/03 M. Siatczynski Changed MAIL to MAILFLAG -- MAIL is s system variable
+#       06/21/04 M. Siatczynski Use VIPSERVERLIST rather than VIPLIST
+#       06/22/04 M. Siatczynski Remove PAGELOG -- all pages are not logged to a central file
+#				Add -pagerange parm
+#       01/07/05 M. Siatczynski Use getVipList function rather than grep/cut
+#				Remove SORT variables used for compare - no longer needed
+#       10/07/05 M. Siatczynski Remove pingServer function - moved to .dbaSybProfile
+#				Update pingServer call to include username parm
+#				Include SQL output in email
+#       10/11/05 M. Siatczynski Add return status to checkPingResult so we can avoid pinging backupserver if ping of ASE failed
+#       12/01/05 M. Siatczynski Perform ping using ADMINLOGIN (central variable)--no login needed for backupserver
+#       02/13/06 M. Siatczynski Implement ISQLEXE
+#       02/16/10 M. Siatczynski Add logic to accommodate backupserver names for Evergreen ASEs
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile.NEW
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -all | -S <SERVER (DB or REP)> {-p <pagedest> -m <maildest> -nopage -nomail -pagerange}"
+export CALLED="$0 $*"
+
+export ALL=0
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -all)		export ALL=1;shift 1;;
+                        -S)		export PINGSERVER=$2;shift 2;;
+                        -p)		export PAGEDEST=$2;shift 2;;
+                        -m)		export MAILDEST=$2;shift 2;;
+                        -nopage)	export PAGEFLAG=0;shift 1;;
+                        -nomail)	export MAILFLAG=0;shift 1;;
+                        -pagerange)	export PAGERANGE=1;shift 1;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ $ALL -eq 0 -a ! "$PINGSERVER" ]
+then
+	echo $USAGE
+	echo "ERROR - Either SERVER or -all MUST be passed."
+	exit 1
+fi
+
+if [ $ALL -eq 1 -a "$PINGSERVER" ]
+then
+	echo $USAGE
+	echo "ERROR - SERVER and -all are mutually exclusive."
+	exit 1
+fi
+
+# if -nopage not passed, then set page trigger true
+# if -nomail not passed, then set mail trigger true
+test ! "$PAGEFLAG" && export PAGEFLAG=1
+test ! "$MAILFLAG" && export MAILFLAG=1
+test ! "$PAGERANGE" && export PAGERANGE=0
+
+# input lists
+export EXCEPT_LIST=$CTLDIR/sybPingExcept.lst
+
+# sorted lists (for compare)
+export SORTEXCEPT=/tmp/sortexcept.$$
+
+# resulting ping lists
+export ASEPINGLIST=/tmp/asepinglist.$$
+export VIPPINGLIST=/tmp/vippinglist.$$
+export REPPINGLIST=/tmp/reppinglist.$$
+
+export PINGRESULT=/tmp/pingresult.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+
+# log files
+export PINGLOG=$RPTDIR/misc/sybPingLog.$MMYYYY
+
+# return code
+export HIGHRC=0
+
+#----------------------------------------------------------------------------------
+# FUNCTION DEFINITIONS
+#----------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------
+# Check the result of the "ping":
+#       If results file is greater than 0 bytes:
+#               - Set highest return code=1
+#               - Write audit record to ping log
+#               - If pageflag true, send page and write audit record to page log
+#               - If mailflag true, format and send mail
+#----------------------------------------------------------------------------------
+function checkPingResult {
+	export SERVER=$1
+	if [ -s "$PINGRESULT" ]
+	then
+		export HIGHRC=1
+		export PINGTIME=`date '+%D %T'`
+	        echo "$PINGTIME $SERVER" >> $PINGLOG
+	        cat $PINGRESULT >> $PINGLOG
+	
+		echo "$SERVER: Connection failure from $HOST $PINGTIME" > $PAGEMSG
+		if [ $PAGEFLAG -eq 1 ]
+		then
+			sendPage $SERVER
+		fi
+		if [ $MAILFLAG -eq 1 ]
+		then
+			> $MAILFILE
+			export MAILSUBJECT="`cat $PAGEMSG`"
+			cat $PAGEMSG >> $MAILFILE
+			echo "" >> $MAILFILE
+			cat $PINGRESULT >> $MAILFILE
+        		echo "\nTo avoid page, enter server name in $EXCEPT_LIST" >> $MAILFILE
+			sendMail
+		fi
+		return 1
+	else
+		return 0
+	fi	
+}
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SORTEXCEPT && \rm -f $SORTEXCEPT
+	test -f $ASEPINGLIST && \rm -f $ASEPINGLIST
+	test -f $VIPPINGLIST && \rm -f $VIPPINGLIST
+	test -f $REPPINGLIST && \rm -f $REPPINGLIST
+	test -f $PINGRESULT && \rm -f $PINGRESULT
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------------------
+# MAIN PROGRAM
+#------------------------------------------------------------------------------------------
+# If a single server is passed:
+# Validate that it exists in one of the control lists. If it does, then format all 3 ping lists.  
+# NOTE:  It is necessary to format 3 ping lists in order to use a single set of code.
+# Plus, if the server is an ASE, it will automatically ping the backupserver.
+# THE EXCLUDE LIST IS NOT USED IF A SINGLE SERVER IS PASSED.
+#
+# If processing all servers:
+# Sort the exceptions list.
+# Get the ase and rep lists, sort, and remove exceptions. (comm relies on sorted lists)
+#------------------------------------------------------------------------------------------
+
+if [ "$PINGSERVER" ]
+then
+	grep "^${PINGSERVER} " $ASEDIRLIST $REPDIRLIST $VIPSERVERLIST > /dev/null;export RC=$?
+	if [ $RC -ne 0 ]
+	then
+		echo $CALLED
+		echo "ERROR - $PINGSERVER MUST exist in one of the following lists in order to be pingable by this script:\n$ASEDIRLIST\n$REPDIRLIST\n$VIPSERVERLIST"
+		exit 1
+	fi
+	
+	getAseList | sort | grep "^${PINGSERVER}$" > $ASEPINGLIST
+	getRepList | sort | grep "^${PINGSERVER}$" > $REPPINGLIST
+	getVipList | sort | grep "^${PINGSERVER}$" > $VIPPINGLIST
+else
+	sort $EXCEPT_LIST > $SORTEXCEPT
+	getAseList | sort | comm -23 - $SORTEXCEPT > $ASEPINGLIST
+	getRepList | sort | comm -23 - $SORTEXCEPT > $REPPINGLIST
+	getVipList | sort | comm -23 - $SORTEXCEPT > $VIPPINGLIST
+fi
+
+
+#DEBUG
+echo "ASEPINGLIST:"
+cat $ASEPINGLIST
+
+#------------------------------------------------------------------------------------------
+# "Ping" each ASE and corresponding backupserver
+#------------------------------------------------------------------------------------------
+for DBSERVER in `cat $ASEPINGLIST`
+do
+#------------------------------------------------------------------------------------------
+# "ping" the ASE
+# If ping of ASE failed, continue with next ASE--don't attempt ping of backupserver
+#------------------------------------------------------------------------------------------
+	pingServer $DBSERVER $ADMINLOGIN > $PINGRESULT
+	checkPingResult $DBSERVER
+
+	test $? -ne 0 && continue
+
+#------------------------------------------------------------------------------------------
+# "ping" the backupserver
+# can not call pingServer function because backupserver password is NULL
+# login name is not needed for connection
+# if DBSERVER string contains odydb01, then this is an Evergreen ASE and backupserver name is different
+#------------------------------------------------------------------------------------------
+	echo $DBSERVER | grep 'odydb01' > /dev/null
+	test $? -eq 0 && export BACKSERVER=${DBSERVER}_back || export BACKSERVER=${DBSERVER}_BACKUP
+
+	> $PINGRESULT
+	$ISQLEXE -S$BACKSERVER -P <<-! >> $PINGRESULT
+	!
+
+	checkPingResult $BACKSERVER
+done
+
+#------------------------------------------------------------------------------------------
+# "Ping" each VIPSERVER in the ping list
+#------------------------------------------------------------------------------------------
+for VIPSERVER in `cat $VIPPINGLIST`
+do
+	pingServer $VIPSERVER $ADMINLOGIN > $PINGRESULT
+	checkPingResult $VIPSERVER
+done
+
+#------------------------------------------------------------------------------------------
+# "Ping" each REPSERVER in the ping list
+#------------------------------------------------------------------------------------------
+for REPSERVER in `cat $REPPINGLIST`
+do
+	pingServer $REPSERVER $ADMINLOGIN > $PINGRESULT
+	checkPingResult $REPSERVER
+done
+
+#------------------------------------------------------------------------------------------
+# exit with final return code
+#------------------------------------------------------------------------------------------
+if [ $HIGHRC -eq 0 ]
+then
+	exit 0
+elif [ $HIGHRC -eq 1 ]
+then
+	exit 1
+else
+	echo "HIGHRC unknown"
+fi

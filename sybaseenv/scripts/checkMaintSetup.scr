@@ -1,0 +1,86 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkMaintSetup.scr
+#
+#  Description: Check all servers/non-system databases for existance of main_grp/maint user
+#
+#     Location:	/sccm/dba/sybase/scripts/checkMaintSetup.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	11/21/02 M. Siatczynski	Initial Script
+#	04/20/04 M. Siatczynski	Centralized script
+#	08/23/04 M. Siatczynski	Moved from reports to logs directory
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+OUTFILE=$LOGDIR/useradmin/central/checkMaintSetup.$DATETIME
+> $OUTFILE
+
+SQLFILE=/tmp/sqlfile.$$
+DBSERVERLIST=/tmp/dbserver.lst.$$
+
+getAseList > $DBSERVERLIST
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  format and run query
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+        export DBSERVER
+	> $SQLFILE
+        $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password |
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from sysdatabases where name not in ('master','model','tempdb','sybsystemprocs','dbccdb','dbccalt','sybsecurity','sybsecurity_archive','sybsystemdb','dba')
+	go
+	!
+
+	while read DBNAME
+	do
+		export DBNAME
+		echo "set nocount on" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "use $DBNAME" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "select distinct convert(char(15),@@servername),\":\",convert(char(20),db_name())+\": GROUP  maint_grp does not exist\" from sysusers where 'maint_grp' not in (select user_name(gid) from sysusers)" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "if exists (select * from sysalternates where suid = suser_id(\"${DBNAME}_maint\"))" >> $SQLFILE
+		echo "select convert(char(15),@@servername),\":\",convert(char(20),db_name())+\": ALIAS  ${DBNAME}_maint ALIASED to dbo\" from sysalternates where suid=suser_id(\"${DBNAME}_maint\") and altsuid=1" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "select convert(char(15),@@servername),\":\",convert(char(20),db_name())+\": USER  ${DBNAME}_maint USER DOES NOT EXIST\" where not exists (select * from sysusers where user_name(uid) = \"${DBNAME}_maint\")" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "select convert(char(15),@@servername),\":\",convert(char(20),db_name())+\": GROUP  ${DBNAME}_maint USER NOT IN maint_grp GROUP\" from sysusers u, sysalternates a where user_name(u.uid) = \"${DBNAME}_maint\" and user_name(u.gid) <> 'maint_grp' and suser_id(\"${DBNAME}_maint\") <> a.suid" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+
+        getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password >> $OUTFILE
+done
+
+#--------------------------------------------------------------------------
+# exit with 0
+#--------------------------------------------------------------------------
+echo "Review report in $OUTFILE"
+exit 0

@@ -1,0 +1,9 @@
+encryptAdminPassphrase.scr -login backup
+encryptAdminPassphrase.scr -login batch_dba
+encryptAdminPassphrase.scr -login dba_maint
+encryptAdminPassphrase.scr -login dbas
+encryptAdminPassphrase.scr -login encryption_key
+encryptAdminPassphrase.scr -login foglight
+encryptAdminPassphrase.scr -login indirect_sa_role
+encryptAdminPassphrase.scr -login sybase
+encryptAdminPassphrase.scr -login XIPRTE

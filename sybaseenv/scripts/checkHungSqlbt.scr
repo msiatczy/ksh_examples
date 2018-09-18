@@ -1,0 +1,147 @@
+#!/bin/ksh 
+#--------------------------------------------------------------------------
+#  NOTE:  THIS SCRIPT IS NO LONGER CALLED BY ANY SCRIPTS. 12/26/2006 MJS
+#--------------------------------------------------------------------------
+#        Usage: checkHungSqlbt.scr -S <dbserver> -dumptype <full|tran> {-p <pagedest>}
+#
+#  Description: Check for hung sqlbt processes following completion of full or tran log backups
+#
+#     Location:	/sccm/dba/sybase/scripts/checkHungSqlbt.scr
+#
+#    Called by:	sqlbtBackup.scr
+#		sqlbtTranDump.scr
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<dbserver> - dbserver
+#              	<dumptype> - type of dump:  full or tran
+#              	<pagedest> - Pass this parm if you want to receive pages for hung processes
+#
+#  NOTE:  This script is only valid on ASE 12.5 and higher.
+#
+#  Modification History:
+#	11/06/02 M. Siatczynski Original script
+#	12/05/02 M. Siatczynski Added cmd=DUMP TRANSACTION and time => 30 minutes to criteria
+#	04/21/03 K. Hess	Updated report loop to exit with a 0 rather than a 1 so AutoSys
+#					would not get an error
+#	07/07/03 M. Siatczynski Added cmd=EXECUTE to criteria to detect hung full backups
+#	07/08/03 M. Siatczynski Added DBSERVER name to email subject
+#	10/03/03 M. Siatczynski Centralized script, added -dumptype and cmd=DUMP DATABASE
+#				Since process will now be called immediately following full or tran dumps, remove 30 minute latency check
+#	10/28/03 M. Siatczynski Centralized script to new central location
+#	11/10/03 M. Siatczynski Moved RPTFILE from misc subdir to backup subdir
+#				Only send process detail in email, not whole report file
+#	01/29/04 M. Siatczynski Wildcard command name to '%SQL-Back%' for sqlbt 4.6
+#	02/10/06 M. Siatczynski Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+USAGE="ERROR - Usage: $0 -S <DBSERVER> -dumptype <full|tran> {-p <pagedest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)		export DBSERVER=$2;shift 2;;
+	                -p)		export PAGEDEST=$2;shift 2;;
+	                -dumptype)	export DUMPTYPE=$2;shift 2;;
+	                -*)		echo $USAGE;exit 1;;
+	                *)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DUMPTYPE" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+if [ "$DUMPTYPE" != "full" -a "$DUMPTYPE" != "tran" ]
+then
+	echo $USAGE
+	echo "ERROR - dumptype must be full or tran"
+	exit 1
+fi
+
+if [ "$DUMPTYPE" = "full" ]
+then
+	export DUMPCMD="DUMP DATABASE"
+elif [ "$DUMPTYPE" = "tran" ]
+then
+	export DUMPCMD="DUMP TRANSACTION"
+fi
+
+export RPTFILE=$RPTDIR/backup/$DBSERVER/$DBSERVER.checkHungSqlbt.$DATETIME
+export TEMPFILE=/tmp/processes.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export MAILFILE=/tmp/mailfile.$$
+
+echo "`date +'%b %e %H:%M:%S'` $DBSERVER: SQLBT process hung" > $PAGEMSG
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $TEMPFILE && \rm -f $TEMPFILE
+	test $PAGEMSG && \rm -f $PAGEMSG
+	test $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# query sysprocesses for SQL-BackTrack connections 30 minutes old or older
+#--------------------------------------------------------------------------
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w150 <<-! | grep -v Password > $TEMPFILE
+`getPass $DBSERVER $ADMINLOGIN`
+if exists 
+(select * from sysprocesses where program_name like "%SQL-Back%" and (cmd = "$DUMPCMD" or cmd = "EXECUTE"))
+begin
+	print "COMPLETE PROCESS DETAIL:"
+	print ""
+	select * from sysprocesses
+	where program_name like "%SQL-Back%"
+	and (cmd = "$DUMPCMD" or cmd = "EXECUTE")
+	print ""
+	print "sp_uwho_time RESULTS:"
+	execute sp_uwho_time
+end
+go
+!
+
+#--------------------------------------------------------------------------
+#  If there are SQLBT processes 30 minutes old or older, create a report
+#  Otherwise, exit the script
+#  Always send mail
+#  Only page if PAGEDEST is set
+#--------------------------------------------------------------------------
+if [ -s $TEMPFILE ]
+then
+	> $RPTFILE
+	echo "Start of report: `date`\n" >> $RPTFILE
+        echo "$0 executed by user $LOGNAME on `hostname`\n" >> $RPTFILE
+	cat $TEMPFILE >> $RPTFILE
+	echo "\nEnd of report: `date`" >> $RPTFILE
+
+	export ENDROW=`grep -n 'sp_uwho_time RESULTS:' $RPTFILE | cut -d":" -f1`
+	let ENDROW=$ENDROW-1
+	head -$ENDROW $RPTFILE > $MAILFILE
+	echo "See $RPTFILE for complete details." >> $MAILFILE
+	export MAILSUBJECT="$DBSERVER: Hung SQLBT Process"
+	sendMail
+
+	test "$PAGEDEST" && sendPage
+	exit 1
+else
+	exit 0
+fi

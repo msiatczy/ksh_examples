@@ -1,0 +1,50 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: stopOnsiteOpnsrv.scr
+#
+#  Description: Stop the Onsite openserver on p-inv-onsite
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	06/13/05 M. Siatczynski New script
+#	02/13/06 M. Siatczynski Implement ISQLEXE
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export OPENSERVER=ONS_OPNSRV
+export OSPROCESS=ons_opnsrv
+export RUNNING=0
+
+#--------------------------------------------------------------------------
+#  Stop the onsite openserver
+#  First check to see if openserver is currently running
+#  username and password are not required for openserver
+#--------------------------------------------------------------------------
+ps -def | grep $OSPROCESS | grep -v grep > /dev/null
+export RUNNING=$?
+
+echo "RUNNING=$RUNNING"
+
+if [ $RUNNING -eq 0 ]
+then
+	$ISQLEXE -S $OPENSERVER -P <<-!
+	shutdown
+	go
+	!
+fi
+
+#--------------------------------------------------------------------------
+# exit
+#--------------------------------------------------------------------------
+exit 0

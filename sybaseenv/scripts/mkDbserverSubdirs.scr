@@ -1,0 +1,129 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: mkDbserverSubdirs.scr {-d <directory path>} | {-S <DBSERVER>}
+#
+#  Description: Make DBSERVER subdirectories under a designated directory IF directory path is passed
+#		OR Make DBSERVER subdirectory under each standard directory if a DBSERVER is passed
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	DIRPATH - full directory path under which to make the subdirectories
+#
+#  Modification History:
+#	02/05/04 M. Siatczynski	Initial Script
+#	05/02/06 M. Siatczynski	Add STDSUBDIRS and ability to create subdirs for new DBSERVER
+#	02/15/11 M. Siatczynski	Updates to accommodate AMG East, add chmod
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 {-d <directory path>} | {-S <DBSERVER>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -d)     export DIRPATH=$2;shift 2;;
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+#--------------------------------------------------------------------------
+# validate parms
+#--------------------------------------------------------------------------
+export STDSUBDIRS=$CTLDIR/stdDbserverSubdirs.lst
+
+if [ "$DIRPATH" -a "$ONEDBSERVER" ]
+then
+	echo "ERROR - DIRPATH and DBSERVER are mutually exclusive--can only pass one parm"
+	exit 1
+fi
+
+# if a directory path is passed, it MUST be in the standard list AND it MUST physically exist
+if [ "$DIRPATH" ]
+then
+	grep ^${DIRPATH}$ $STDSUBDIRS > /dev/null
+	export GREPRC=$?
+	if [ $GREPRC -eq 0 ]
+	then
+# exists in standard list--make sure it physically exists
+		if [ ! -d $DIRPATH ]
+		then
+			echo "ERROR - $DIRPATH does not exist"
+			exit 1
+		fi
+	else
+# doesn't exist in standard list
+		echo "ERROR - $DIRPATH does not exist in $STDSUBDIRS"
+		echo "Add the path to $STDSUBDIRS and rerun this script"
+		exit 1
+	fi
+fi
+
+export DBSERVERLIST=/tmp/dbserver.lst.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Format list of DBSERVERS
+#--------------------------------------------------------------------------
+test "$ONEDBSERVER" && echo $ONEDBSERVER > $DBSERVERLIST || getAseList > $DBSERVERLIST
+
+#--------------------------------------------------------------------------
+#  Make a DBSERVER subdirectory for each DBSERVER in $ASEDIRLIST
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	cat $STDSUBDIRS |
+	while read SUBDIR
+	do
+		if [ -d $SUBDIR ]
+		then
+			echo "$SUBDIR already exists"
+
+			if [ -d $SUBDIR/$DBSERVER ]
+			then
+				echo "$SUBDIR/$DBSERVER already exists"
+			else
+				echo "Making directory $SUBDIR/$DBSERVER..."
+				mkdir $SUBDIR/$DBSERVER
+				chmod 770 $SUBDIR/$DBSERVER
+			fi
+		else
+			echo "Making directory $SUBDIR..."
+			mkdir $SUBDIR
+			chmod 770 $SUBDIR
+			echo "Making directory $SUBDIR/$DBSERVER..."
+			mkdir $SUBDIR/$DBSERVER
+			chmod 770 $SUBDIR/$DBSERVER
+		fi
+	done
+done

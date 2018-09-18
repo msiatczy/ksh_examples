@@ -1,0 +1,168 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: purgeAuditData.scr -S <SOURCE_DBSERVER> -T <TARGET_DBSERVER> -days <days>
+#
+#  Description: Purge audit data older than n days from POPLAR.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	12/21/05 M. Siatczynski	Initial script
+#	01/03/06 M. Siatczynski	Add parm (-nobackup) to skip backup
+#	02/10/06 M. Siatczynski	Implement ISQLEXE
+#	10/06/06 M. Siatczynski	Change HOST_DBSERVER to TARGET_DBSERVER and make a parm rather than hardcoding as POPLAR
+#	12/12/06 M. Siatczynski	Always keep 180 days of login data (event=45), delete all other events according to -days parm
+#	12/18/06 M. Siatczynski	Force index I1 on delete
+#	12/29/06 M. Siatczynski	Remove backup of sybsecurity_archive_DBSERVER on TARGET_DBSERVER - moved to separate autosys job
+#	03/19/07 M. Siatczynski	Add getdate so we can see which purge is taking the longest
+#	04/24/07 M. Siatczynski	Change sybsecurity_archive_<DBSERVER> to sybsec_arch_<DBSERVER>
+#	10/10/07 M. Siatczynski	Add showplan for troubleshooting purposes
+#	01/13/09 J. Aspenleiter	Added delete to remove norad audit data older than 7 days.  Also increased row count for
+#				all delete statments from 10K to 100K.  Added a new variable to each delete - @datetime.
+#	09/17/09 M. Siatczynski	Modified some comments
+#	06/23/10 M. Siatczynski	Remove code to keep 180 days of login data, last login date is stored on syslogins record with ASE 15
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -T <TARGET_DBSERVER> -days <days>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -T)     export TARGET_DBSERVER=$2;shift 2;;
+                        -days)	export DAYS=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$TARGET_DBSERVER" -o ! "$DAYS" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$DOBACKUP" && export DOBACKUP=1
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SQLOUT=/tmp/sqlout.$$
+export RPTFILE=$RPTDIR/audit/$DBSERVER/$DBSERVER.purgeAuditData.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $RPTFILE
+echo "`date` START Purge process for $TARGET_DBSERVER.sybsec_arch_${DBSERVER}" >> $RPTFILE
+echo "\nData older then $DAYS days will be purged.\n" >> $RPTFILE
+
+#------------------------------------------------------------------------------
+# Purge data older than n days.
+# NOTE:  tablename MUST be specified twice in the delete statement when forcing the index
+#------------------------------------------------------------------------------
+echo "`date` Purging data...\n" >> $RPTFILE
+
+> $SQLOUT
+$ISQLEXE -U$ADMINLOGIN -S$TARGET_DBSERVER -w200 -e <<-! | grep -v Password >> $SQLOUT
+`getPass $TARGET_DBSERVER $ADMINLOGIN`
+set flushmessage on
+go
+use sybsec_arch_${DBSERVER}
+go
+select "TIMESTAMP:",getdate()
+go
+set showplan on
+go
+declare @totrows int
+declare @row_count int
+declare @datetime datetime
+select @datetime = dateadd(dd,-${DAYS},getdate())
+select @totrows=0
+select @row_count=1
+set rowcount 100000
+while @row_count > 0
+begin
+        begin tran
+        delete sybsec_arch_${DBSERVER}..sysaudits from sybsec_arch_${DBSERVER}..sysaudits (index I1)
+        where eventtime < @datetime
+        select @row_count = @@rowcount
+        select @totrows = @totrows + @row_count
+        commit tran
+end
+print "TOTAL ROWS PURGED (all events):  %1!",@totrows
+go
+select "TIMESTAMP:",getdate()
+go
+set rowcount 0
+go
+
+--NORAD - keep only 1 weeks worth of data
+declare @totrows int
+declare @row_count int
+declare @datetime datetime
+select @datetime = dateadd(dd,-7,getdate())
+select @totrows=0
+select @row_count=1
+set rowcount 100000
+while @row_count > 0
+begin
+        begin tran
+        delete sybsec_arch_${DBSERVER}..sysaudits from sybsec_arch_${DBSERVER}..sysaudits (index I1)
+        where eventtime < @datetime
+        and loginname = 'norad'
+        select @row_count = @@rowcount
+        select @totrows = @totrows + @row_count
+        commit tran
+end
+print "TOTAL ROWS PURGED (norad login):  %1!",@totrows
+go
+select "TIMESTAMP:",getdate()
+go
+set rowcount 0
+go
+set showplan off
+go
+!
+
+cat $SQLOUT >> $RPTFILE
+
+#------------------------------------------------------------------------------
+# check sql output and exit appropriately
+#------------------------------------------------------------------------------
+checkSqlErr $SQLOUT
+if [ $?	 -eq 1 ]
+then
+	echo "\n`date` Purge FAILED - SQL output above." >> $RPTFILE
+	exit 1
+else
+	echo "\n`date` Purge SUCCESSFUL - SQL output above." >> $RPTFILE
+	exit 0
+fi

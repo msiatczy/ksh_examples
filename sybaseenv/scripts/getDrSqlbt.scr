@@ -1,0 +1,153 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getDrSqlbt.scr
+#  Description: Make copies of SQL-BackTrack files necessary for disaster recovery
+#		.dtoptions, license, .dblicenseinfo.rdf, control files, and
+#		Openserver RUN* file
+#     Location: /sccm/dba/sybase/scripts
+#    Called by: AutoSys
+#   Parameters: DBSERVER
+#  Modification History:
+#       02/03/04 K. Hess        Initial script
+#       03/04/04 K. Hess        Updated report output
+#       06/01/04 K. Hess        Adding backup directory resolution info.  For
+#				example:  /sccm/900dba4 ~ /vol/db4/db4
+#       08/17/04 M. Siatczynski Remove copy of sqlbt control files - this is now done in sqlbtBackup.scr and sqlbtTranDump.scr
+#       02/17/05 K. Hess	Changed retention of control files from 7 days to 60 days
+#       04/12/05 M. Siatczynski	Compress sqlbt control files older than 7 days
+#				Added trap for temp file cleanup
+#       04/18/06 K. Hess	Updated the archive directory for .dtoptions and other files to
+#				go to the dated subdirectory so the files are not getting overwritten
+#       10/17/08 M. Siatczynski	Change RPTFILE to LOGFILE, change $RPTDIR to $LOGDIR
+#				Change LOGFILE filename to include script name and $DATETIME stamp
+#----------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Parameters:  Database server
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>"
+ 
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+ 
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export SETDBSERVER=$DBSERVER
+
+. /sccm/dba/sybase/.dbaSybProfile
+ 
+export LOGFILE=$LOGDIR/dr/$DBSERVER/$DBSERVER.getDrSqlbt.$DATETIME
+export TMPDIRLIST=/tmp/tmpdirlist.$$
+export BKUPLOC=$SQLBT_DRDIR/$DBSERVER.backup_directory_location.log
+export DRDIRLIST=/tmp/drdirlist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TMPDIRLIST && \rm -f $TMPDIRLIST
+	test -f $DRDIRLIST && \rm -f $DRDIRLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Verify directories exist; if not, create them
+#--------------------------------------------------------------------------
+test ! -d $DBSERVER_DRDIR && mkdir $DBSERVER_DRDIR 
+test ! -d $SQLBT_DRDIR && mkdir $SQLBT_DRDIR
+test ! -d $SQLBT_DRDIR/$DBSERVER$MMDDYYYY && mkdir $SQLBT_DRDIR/$DBSERVER$MMDDYYYY
+
+#--------------------------------------------------------------------------
+#  Init LOGFILE
+#  Header for DR Report
+#--------------------------------------------------------------------------
+echo "-- SQL-BackTrack DR REPORT for $DBSERVER on $DATETIME" > $LOGFILE
+
+#----------------------------------------------------------------------------
+# SQL-BackTrack
+# Save copy of .dtoptions, license, .dblicenseinfo.rdf, control files, and
+# Openserver RUN* file
+#----------------------------------------------------------------------------
+if [ -f $DT_PHYSICAL/.dtoptions ]
+	then
+	cp -p $DT_PHYSICAL/.dtoptions $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/.
+	else
+	echo "--SQL-BackTrack .dtoptions file not found for $DBSERVER" >> $LOGFILE
+fi
+
+if [ -f $DT_SBACKTRACK_HOME/ctl/license ]
+	then
+	cp -p $DT_SBACKTRACK_HOME/ctl/license $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/.
+	else
+	echo "--SQL-BackTrack license file not found for $DBSERVER" >> $LOGFILE
+fi
+
+if [ -f $DT_SBACKTRACK_HOME/ctl/.dblicenseinfo.rdf ]
+	then
+	cp -p $DT_SBACKTRACK_HOME/ctl/.dblicenseinfo.rdf $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/.
+	else
+	echo "--SQL-BackTrack .dblicenseinfo.rdf file not found for $DBSERVER" >> $LOGFILE
+fi
+
+if [ -f $DTBASE/openserver/install/RUN* ]
+	then
+	cp -p $DTBASE/openserver/install/RUN* $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/.
+	else
+	echo "--Openserver is not configured for $DBSERVER" >> $LOGFILE
+fi
+
+#--------------------------------------------------------------------------
+#  Grabs backup pool directory information from .dtoptions and then runs
+#  df on each directory to get the mount point output
+#--------------------------------------------------------------------------
+grep "directory=" $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/.dtoptions | cut -d= -f2 >> $TMPDIRLIST
+
+echo `date` >> $BKUPLOC
+
+for DIR in `cat $TMPDIRLIST`
+do
+	
+	test -d $DIR && df -k $DIR >> $BKUPLOC
+
+done
+
+#--------------------------------------------------------------------------
+#  Compress and cleanup old control directories
+#  Compression pct is written to stdout, so 2>&1 redirect is necessary to get output to LOGFILE
+#-------------------------------------------------------------------------- 
+cd $SQLBT_DRDIR
+find $SQLBT_DRDIR -type d -name $DBSERVER'????????' -mtime +7 -print > $DRDIRLIST
+if [ -s $DRDIRLIST ]
+then
+	cat $DRDIRLIST |
+	while read DIR
+	do
+		export DIR
+		echo "tar'ing and compressing $DIR" >> $LOGFILE
+		tar -cvf $DIR.tar $DIR >> $LOGFILE
+		compress -fv $DIR.tar >> $LOGFILE 2>&1
+		echo "removing $DIR" >> $LOGFILE
+		test -s $DIR.tar.Z && \rm -r $DIR
+	done
+fi
+
+find $SQLBT_DRDIR -type f -name $DBSERVER'????????.tar.Z' -mtime +60 -print -exec \rm -r {} \; >> $LOGFILE
+
+#--------------------------------------------------------------------------
+#  Exit with 0
+#--------------------------------------------------------------------------
+exit 0

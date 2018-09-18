@@ -1,0 +1,81 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sendTestPage.scr -p <pagedest> {-id <pagetag>}
+#
+#  Description: Quick way to send test page from any host, specifically used after changing oncall
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#   Parameters:	<PAGEDEST> 
+#		<PAGETAG> - single string to attach to page
+#
+#  NOTE:  logging not needed, as sendPage logs each page sent
+#
+#  Modification History:
+#	04/21/11 M. Siatczynski Initial script
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+## unset the centrally-set PAGEDEST variable - MUST be passed to script
+unset PAGEDEST
+
+#------------------------------------------------------------------------------
+# Initialize variables
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -p <pagedest> {-id <pagetag>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -p)	export PAGEDEST=$2;shift 2;;
+	                -id)	export PAGETAG=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$PAGEDEST" ]
+then
+        echo $USAGE
+        exit 1
+fi
+export PAGEMSG=/tmp/pagefile.$$
+
+test ! "$PAGETAG" && export PAGETAG=""
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# format the pagemsg
+# send test page 
+#------------------------------------------------------------------------------
+echo "`date` TEST PAGE $PAGETAG from $HOST" > $PAGEMSG
+
+sendPage
+
+echo "Test page sent to $PAGEDEST"
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+exit 0

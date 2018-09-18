@@ -1,0 +1,64 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getOCVersion.scr
+#  Description: Gets current Sybase Open Client version
+#     Location: /sccm/dba/sybase/scripts
+#    Called by: getDr.scr
+#   Parameters: DBSERVER
+#  Modification History:
+#       04/26/04 K. Hess        Initial script
+#       02/13/06 M. Siatczynski	Implement ISQLEXE
+#       22/27/06 M. Siatczynski	Call isql from /opt/sccm/sybase/OCS/bin rather than $HOME/$SYBASE_OCS/bin
+#				sybase has different home directory in Tempe and OCS is not under this home directory
+#----------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Parameters:  Database server
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>"
+ 
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+ 
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export SETDBSERVER=$DBSERVER
+
+. /sccm/dba/sybase/.dbaSybProfile
+ 
+export RPTFILE=$RPTDIR/dr/$DBSERVER/$DBSERVER.getDr.$MMDDYYYY
+export OCVERSIONLOG=$DBSERVER_DRDIR/$DBSERVER.ocversion.log
+
+#----------------------------------------------------------------------------
+#  Verify dr directory exists; if not, create the directory
+#----------------------------------------------------------------------------
+test ! -d $DBSERVER_DRDIR && mkdir $DBSERVER_DRDIR
+
+#--------------------------------------------------------------------------
+#  Header for DR Report
+#--------------------------------------------------------------------------
+echo "--OC VERSION REPORT for $DBSERVER on $DATETIME" >> $RPTFILE
+
+#----------------------------------------------------------------------------
+# Get version information
+#----------------------------------------------------------------------------
+#echo "`date +'%D %T'` CENTRAL	`$HOME/$SYBASE_OCS/bin/isql -v | grep Utility`" >> $OCVERSIONLOG
+echo "`date +'%D %T'` CENTRAL	`/opt/sccm/sybase/OCS/bin/isql -v | grep Utility`" >> $OCVERSIONLOG
+echo "`date +'%D %T'` $DBSERVER	`$ISQLEXE -v | grep Utility`" >> $OCVERSIONLOG
+#--------------------------------------------------------------------------
+#  Exit with 0
+#--------------------------------------------------------------------------
+exit 0

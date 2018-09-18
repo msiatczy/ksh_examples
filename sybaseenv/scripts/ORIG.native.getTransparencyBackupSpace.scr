@@ -1,0 +1,219 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getTransparencyBackupSpace.scr -S <DBSERVER> {-D <dbname>|all}
+#
+#  Description: Calculate disk backup space used by database(s) based on data in sybdb database
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  NOTE:  THIS SCRIPT MUST RUN ON THE HOST FROM WHICH THE BACKUPS RUN.
+#  IT GETS SPACE FOR NAS BACKUPS ONLY--IT DOES NOT GATHER INFORMATION FOR BACKUPS WRITTEN DIRECTLY TO TAPE.
+#
+#  Modification History:
+#	11/04/03 M. Siatczynski	Initial Script
+#	01/29/04 M. Siatczynski	change for sqlbt 4.6 -- dump file is single file now (replace <1> at end of filename with -0)
+#	05/06/04 M. Siatczynski	added call to sqlbtDtsreport.scr and code to more accurately generate tape info
+#	06/06/06 M. Siatczynski	change positional fields from dtsreport for new version of sqlbt 5.5
+#	05/03/10 M. Siatczynski	Modified script for sybase native backup solution
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.datefunctions
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>|all}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo "ERROR - DBSERVER MUST be passed"
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/db.lst.$$
+export TEMPFILE=/tmp/temp.$$
+export NASFILES=/tmp/nasfiles.$$
+export TODAY=`date +"%d-%b-%Y`
+export BACKUP_DATAFILE=$RPTDIR/backup/$DBSERVER/$DBSERVER.transparencyBackupSpace
+
+# current date variables - used to compare dates
+export CURRENTJJJ=`date +'%j' | sed -e 's/^0*//g'`
+export CURRENTYYYY=`date +'%Y'`
+export CURRENTDATE=`getMMDDYYYY $CURRENTJJJ $CURRENTYYYY`
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $TEMPFILE && \rm -f $TEMPFILE
+	test -f $NASFILES && \rm -f $NASFILES
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Process each dbserver and associated dbnames
+#--------------------------------------------------------------------------
+# initialize report file for dbserver
+> $BACKUP_DATAFILE
+
+	export GRANDMB=0
+
+# get list of db names for the ASE
+	if [ "$DBNAME" ]
+	then
+		echo $DBNAME > $DBLIST
+	else
+		getDbList -S $DBSERVER -user -system > $DBLIST
+	fi
+
+	cat $DBLIST |
+	while read DB
+	do
+		export FULLNASMB=0
+		export TRANNASMB=0
+		export TOTALNASMB=0
+# generate csv dtsreport file for DBSERVER DB
+		export DTSREPORT=`$SCRDIR/sqlbtDtsreport.scr -S $DBSERVER -D $DB -fmt csv`
+		if [ ! -f $DTSREPORT ]
+		then
+			echo "ERROR - Invalid dtsreport ($DTSREPORT) returned for $DBSERVER $DB"
+			echo "Skipping backup data collection for $DBSERVER $DB"
+			continue
+		fi
+
+# Get the number of generations maintained for the DB 
+# tail -1 uses the generations value from the most recent dump file (full or tran)
+                export GENERATIONS=`tail -1 $DTSREPORT | cut -d"," -f10`
+		test ! "$GENERATIONS" -o "$GENERATIONS" = "N/A" && export GENERATIONS=0
+#####
+# NEW query to get NUMBER of database backups (equiv to sqlbt generations)
+#####
+select h.dbname,copies=count(h.dl_id)
+from dl_dumpfile f, dl_hist h
+where f.dumpfile_deleted = NULL
+and h.dl_id = f.dl_id
+group by h.dbname,f.stripe_num
+
+# get the number of unique days of full NAS backups
+# Ideally, we should calculate the number of 24 hour periods, but unique dates are easiest to check at this point
+# (the awk at end removes the spaces in the number)
+		export NUMNASDAYS=`cut -d"," -f12,13,17 $DTSREPORT | grep '^Full' | grep 'disk:' | cut -d"," -f2 | uniq | wc -l | awk '{print $1}'`
+		test ! "$NUMNASDAYS" && export NUMNASDAYS=0
+#####
+# NEW query to get backup retention days
+#####
+select dbname,retention_days from dl_dump_opt
+
+# get the number of full NAS backups
+# (the awk at end removes the spaces in the number)
+		export NUMNASFULLS=`cut -d"," -f12,17 $DTSREPORT | grep '^Full' | grep 'disk:' | wc -l | awk '{print $1}'`
+		test ! "$NUMNASFULLS" && export NUMNASFULLS=0
+#####
+# NEW query to get num fulls - why do we need this and NUMBER of database backups - could just use num fulls?
+#####
+select h.dbname,numfulls=count(h.dl_id)
+from dl_dumpfile f, dl_hist h
+where f.dumpfile_deleted = NULL
+and h.dl_id = f.dl_id
+and h.dump_type = 'FULL'
+group by h.dbname,f.stripe_num
+
+#####
+# NEW query to mimic some columns from dtsreport
+#####
+select h.ase_name+","+h.dbname+","+h.dump_type+","+f.dumpfile
+from dl_hist h, dl_dumpfile f
+where h.dl_id = f.dl_id
+and f.dumpfile_deleted = NULL
+
+
+# parse out all filenames associated with full and tran log NAS backups
+# NEED TO APPEND -0 ONTO END OF FILE NAMES
+		cut -d"," -f12,17 $DTSREPORT | egrep '(^Full|^Log Only)' | grep 'disk:' | sed -e 's/disk:[0-9A-Za-z_]*\//\//g' -e 's/$/-0/g' > $NASFILES
+
+# sum disk usage for all Full NAS backups for the DB
+		export TOTALKB=0
+		grep '^Full' $NASFILES | cut -d"," -f2 |
+		while read DUMPFILE
+		do
+			export DUMPFILE
+			test -f $DUMPFILE && export SPACEKB=`du -ks $DUMPFILE | cut -f1` || export SPACEKB=0
+			let TOTALKB=$TOTALKB+$SPACEKB
+		done
+		export FULLNASMB=`echo $TOTALKB | awk '{print $1 * 1024 / 1048576}'`
+
+# sum disk usage for all Log NAS backups for the DB
+		export TOTALKB=0
+		grep '^Log Only' $NASFILES | cut -d"," -f2 |
+		while read DUMPFILE
+		do
+			export DUMPFILE
+			test -f $DUMPFILE && export SPACEKB=`du -ks $DUMPFILE | cut -f1` || export SPACEKB=0
+			let TOTALKB=$TOTALKB+$SPACEKB
+		done
+		export TRANNASMB=`echo $TOTALKB | awk '{print $1 * 1024 / 1048576}'`
+
+# add the Full and Log NAS together and add to grand total
+		export TOTALNASMB=`echo $FULLNASMB $TRANNASMB | awk '{print $1 + $2}'`
+		export GRANDMB=`echo $GRANDMB $TOTALNASMB | awk '{print $1 + $2}'`
+
+# calculate average size of full backup
+#		export AVGFULLNASMB=`echo $FULLNASMB $NUMNASFULLS | awk '{print $1 / $2}'`
+		export AVGFULLNASMB=`echo $FULLNASMB $NUMNASFULLS | awk '{if ( $2 > 0 ) {print $1 / $2} else {print 0}}'`
+
+# calculate average size of full and tran backups for one day
+#		export AVGDAILYNASMB=`echo $TOTALNASMB $NUMNASDAYS | awk '{print $1 / $2}'`
+		export AVGDAILYNASMB=`echo $TOTALNASMB $NUMNASDAYS | awk '{if ( $2 > 0 ) {print $1 / $2} else {print 0}}'`
+
+# get the number of full tape backups within the last week (7 days)
+		export NUMTAPEWIWEEK=0
+		cut -d"," -f12,13,17 $DTSREPORT | grep '^Full' | grep 'netbackup:' | cut -d"," -f2 |
+		while read BDATE
+		do
+			export BDATE
+			export CHECKDAYS=`getDaysBetween $BDATE $CURRENTDATE`
+			if [ $CHECKDAYS -le 7 ]
+			then
+				export NUMTAPEWIWEEK=`expr $NUMTAPEWIWEEK + 1`
+			fi
+		done
+
+# write report line
+		echo "$DBSERVER|$DB|$GENERATIONS|$TOTALNASMB|$NUMNASDAYS|$TODAY|$NUMTAPEWIWEEK|$NUMNASFULLS|$AVGFULLNASMB|$AVGDAILYNASMB" >> $BACKUP_DATAFILE
+	done
+	echo "\n$DBSERVER GRANDTOTAL=$GRANDMB" >> $BACKUP_DATAFILE
+
+#--------------------------------------------------------------------------
+#  Exit the script
+#--------------------------------------------------------------------------
+exit 0

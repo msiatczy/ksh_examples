@@ -1,0 +1,242 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: manageDbaLogin.scr -S <DBSERVER>|<LOB>|all {-login <DBA login> -fullname <DBA name> -role <role> -modify}
+#
+#  Description: Add one or all DBAs to one or all ASEs
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	07/24/06 M. Siatczynski	Initial Script (combined addDbaLogins.scr and updDbaRoles.scr)
+#	10/24/06 M. Siatczynski	Prompt for password, rather than hardcoding
+#	12/20/06 M. Siatczynski	Remove "NEW" from password prompt
+#	04/05/07 M. Siatczynski	Get DBA logins from ctl file (DBALOGINLIST) rather than hardcoded within script
+#	07/06/07 M. Siatczynski	If login already exists, modify the login (add -modify parm)
+#       10/29/08 J. Aspenleiter Added the role TIGMF_ALL_NOEXPIRE
+#       06/08/10 M. Siatczynski Changed password expiration to 30
+#       04/13/11 M. Siatczynski Enhance loop to create roles which don't exist (consistency with other manage*Login scripts), add ability to add to ASEs for LOB
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|<LOB>|all {-login <DBA login> -fullname <DBA name> -role <role> -modify}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -login)   export ONEDBALOGIN=$2;shift 2;;
+                        -fullname)   export ONEDBANAME=$2;shift 2;;
+                        -role)  export ONEROLE=$2;shift 2;;
+                        -modify)  export MODIFY=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ "$ONEDBALOGIN" -a ! "$ONEDBANAME" ]
+then
+	echo "ERROR - fullname must be specified with specific login"
+	exit 1
+fi
+
+test ! "$MODIFY" && export MODIFY=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/useradmin/central/manageDbaLogin.$DATETIME
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export DBALIST=/tmp/dbalist.$$
+export ROLELIST=/tmp/rolelist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $DBALIST && \rm -f $DBALIST
+	test -f $ROLELIST && \rm -f $ROLELIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Create working lists
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList > $DBSERVERLIST
+else
+	validateLob $ONEDBSERVER
+	test $? -eq 0 && getAseList $ONEDBSERVER > $DBSERVERLIST || echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+if [ "$ONEDBALOGIN" ]
+then
+	echo "$ONEDBALOGIN|$ONEDBANAME" > $DBALIST
+else
+	grep -v '^#' $DBALOGINLIST > $DBALIST
+fi
+
+if [ "$ONEROLE" ]
+then
+	echo "$ONEROLE" > $ROLELIST
+else
+	> $ROLELIST
+	echo "sa_role" >> $ROLELIST
+	echo "sso_role" >> $ROLELIST
+	echo "oper_role" >> $ROLELIST
+	echo "sybase_ts_role" >> $ROLELIST
+	echo "replication_role" >> $ROLELIST
+	echo "mon_role" >> $ROLELIST
+	echo "TIGMF_ALL_NOEXPIRE" >> $ROLELIST
+fi
+
+#--------------------------------------------------------------------------
+# write log headers
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Managing the following DBA login(s):" >> $LOGFILE
+cat $DBALIST >> $LOGFILE
+echo "On the following ASEs:" >> $LOGFILE
+cat $DBSERVERLIST >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Prompt for the password
+# this same password will be used for one or all accounts
+# If MODIFY=1, do not prompt for password
+# Default DBAPWD to NULL so sql syntax will be correct
+#------------------------------------------------------------------------------
+export DBAPWD=NULL
+if [ $MODIFY -eq 0 ]
+then
+	NEWPW1=""
+	while [ "$NEWPW1" = "" ]
+	do
+	        echo "Enter password for the DBA login(s):"
+	        stty -echo
+	        read NEWPW1
+	        stty echo
+	done
+
+	NEWPW2=""
+	while [ "$NEWPW2" = "" ]
+	do
+	        echo "Re-enter password for the DBA login(s):"
+	        stty -echo
+	        read NEWPW2
+	        stty echo
+	done
+
+	if [ "$NEWPW1" = "$NEWPW2" ]
+	then
+	        export DBAPWD=$NEWPW1
+	else
+	        echo "ERROR - Passwords entered for DBA login(s) do not match.  Exiting." | tee -a $LOGFILE
+	        exit 1
+	fi
+else
+	echo "MODIFY=1" >> $LOGFILE
+fi
+
+#--------------------------------------------------------------------------
+#  Format SQL FILE
+#  add roles, if they don't exist
+#  add the login if it doesn't exist
+#  password expiration is 30 days (privileged account)
+#--------------------------------------------------------------------------
+> $SQLFILE
+echo "use master" >> $SQLFILE
+echo "go" >> $SQLFILE
+cat $ROLELIST |
+while read ROLE
+do
+# Format SQL to create role if it doesn't exist
+        export ROLE
+        echo "if not exists (select name from syssrvroles where name = \"$ROLE\")" >> $SQLFILE
+        echo "create role \"$ROLE\"" >> $SQLFILE
+done
+
+cat $DBALIST |
+while read DBALINE
+do
+	export DBALINE
+        export DBALOGIN=`echo $DBALINE | nawk -F"|" '{print $1}'`
+        export DBANAME=`echo $DBALINE | nawk -F"|" '{print $2}'`
+	echo "if exists (select * from master..syslogins where name = \"$DBALOGIN\")" >> $SQLFILE
+	echo "execute sp_modifylogin $DBALOGIN,'passwd expiration','30'" >> $SQLFILE
+	echo "else" >> $SQLFILE
+	echo "execute sp_addlogin $DBALOGIN,$DBAPWD,master,null,\"$DBANAME\",30" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	cat $ROLELIST |
+	while read ROLE
+	do
+		export ROLE
+		echo "grant role $ROLE to $DBALOGIN" >> $SQLFILE
+		echo "go" >> $SQLFILE
+                echo "EXEC sp_modifylogin '$DBALOGIN', 'add default role', '$ROLE'" >> $SQLFILE
+                echo "go" >> $SQLFILE
+
+	done
+done
+
+#------------------------------------------------------------------------------
+# Execute the SQL against each ASE in DBSERVERLIST
+# check for errors
+#------------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password > $SQLOUT
+
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - executing SQL against $DBSERVER" >> $LOGFILE
+		export HIGHRC=1
+	fi
+
+	cat $SQLOUT >> $LOGFILE
+done
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+	echo "\nScript FAILED"
+	echo "Review output in $LOGFILE\n"
+	exit 1
+else
+	echo "\nScript SUCCESSFUL"
+	exit 0
+fi

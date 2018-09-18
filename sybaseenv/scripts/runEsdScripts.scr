@@ -1,0 +1,99 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: runEsdScripts.scr -S <DBSERVER> -f <all|script file>
+#
+#  Description: Quick way to run SQL scripts associated with ESD installation
+#		List of scripts is hardcoded in variable at beginning of script
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#   Parameters:	<DBSERVER>
+#              	<script file> - name of script file
+#
+#  Modification History:
+#	10/08/08 M. Siatczynski Initial script
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Initialize variables
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -f <all|script file>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)		export DBSERVER=$2;shift 2;;
+	                -f)		export INSPEC=$2;shift 2;;
+	                -*)		echo $USAGE;exit 1;;
+	                *)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" -o ! "$INSPEC" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# profile must be sourced after setting DBSERVER
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+# Set FILELIST based on INSPEC
+if [ "$INSPEC" = "all" ]
+then
+	export FILELIST="installmaster installcommit installsecurity instmsgs.ebf"
+else
+	export FILELIST=`echo $INSPEC`
+fi
+
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $FILELIST && \rm -f $FILELIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Execute the SQL from the input file
+#  Check sql output and display results
+#--------------------------------------------------------------------------
+for INSQL in `echo $FILELIST`
+do
+	export INFILE=$SYBASE/$SYBASE_ASE/scripts/$INSQL
+	export OUTFILE=$SYBASE/$SYBASE_ASE/scripts/$INSQL.$DATETIME
+	echo "Running $INSQL..."
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w500 -i$INFILE -o$OUTFILE | grep -v Password:
+
+	checkSqlErr $OUTFILE
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - $INSQL FAILED against $DBSERVER\n"
+	        export HIGHRC=1
+	else
+		echo "$INSQL SUCCESSFUL against $DBSERVER\n"
+	        export HIGHRC=0
+	fi
+done
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 0 ]
+then
+	echo "\n\nALL scripts SUCCESSFUL against $DBSERVER\n\n"
+	exit 0
+else
+	echo "\n\nOne or more scripts FAILED against $DBSERVER\n\n"
+	exit 1
+fi

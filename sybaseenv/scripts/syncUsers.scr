@@ -1,0 +1,354 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: syncUsers.scr -S <DBSERVER> -D <DBNAME>|<DB list> {-F <FROMDBSERVER> -droponly -ddlext <mmddyy.hhmmss>}
+#
+#  Description: Resync users and permissions in a database using saved DDL
+#
+#     Location:	/sccm/dba/sybase/scripts/syncUsers.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - Database server name
+#		<DBNAME> - Database name or list of databases
+#		<DROPONLY> - Drop the users, but do not re-add them
+#		<DDLEXT> - specific date.time extension for DDL file to use for users/perms (full pathname not required)
+#
+#  Modification History:
+#	01/29/03 M. Siatczynski	Initial Script
+#	02/14/03 M. Siatczynski	No need to egrep USER sql file anymore - source is now correct
+#	03/10/03 M. Siatczynski	changed name of outfile
+#	03/24/03 M. Siatczynski	Include DBNAME in reference when deleting from system tables
+#	05/27/03 M. Siatczynski	Added logic to set 'allow updates' only if it's not currently set appropriately
+#	05/26/04 M. Siatczynski	Centralized script, use new user/perm DDL location, change -G to a specific DDL filename
+#	08/10/05 M. Siatczynski	Updated comments related to deleting from sysusers
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	09/20/06 M. Siatczynski	Change USERPERM references to PERM, as all perms are now included in this file, not just user perms
+#				Delete ALL rows from sysprotects
+#				Add code to recreate groups
+#				If rerunning for a specific DDLEXT, uncompress the file if it is currently compressed
+#	10/16/06 M. Siatczynski	Needed to add -f flag to check for compressed file code
+#	02/14/07 M. Siatczynski	Allow -D parm to be a list of databases
+#				Remove DBNAME from LOGFILE name, append pid ($$) to LOGFILE name
+#	07/15/07 M. Siatczynski	Change delete of sysusers to accommodate new system roles in ASE15
+#	09/17/07 M. Siatczynski	Change operator on delete of groups to be >= @@mingroupid (previously just > @@mingroupid)
+#	12/26/07 M. Siatczynski	Change exits:  exit 1 = WARNING; exit 2 = ERROR
+#	05/05/08 M. Siatczynski	Add FROMDBSERVER parm to allow DBSERVER to be synced using SQL from FROMDBSERVER
+#				Also delete from sysroles and sysusers where role ids are mismatches (id=-1)
+#	07/28/08 M. Siatczynski	Ignore 4610 errors - due to tracing procs which must exist in default database
+#	08/17/09 M. Siatczynski	Echo WARNING messages to LOG ONLY, not to console (to avoid stdout msgs when run from Autosys)
+#	04/12/11 M. Siatczynski	Update profile for AMG East
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <DBNAME>|<DB list> {-F <FROMDBSERVER> -droponly -ddlext <mmddyy.hhmmss>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 2
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)		export DBSERVER=$2;shift 2;;
+	                -F)		export FROMDBSERVER=$2;shift 2;;
+	                -D)		export DBSPEC=$2;shift 2;;
+	                -ddlext)	export DDLEXT=$2;shift 2;;
+	                -droponly)	export DROPONLY=1;shift 1;;
+	                -*)		echo $USAGE;exit 2;;
+	                *)		echo $USAGE;exit 2;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBSPEC" ]
+then
+        echo $USAGE
+        exit 2
+fi
+
+test ! "$DROPONLY" && export DROPONLY=0
+# if FROMDBSERVER is not specified, default to DBSERVER
+test ! "$FROMDBSERVER" && export FROMDBSERVER=$DBSERVER
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.syncUsers.$DATETIME.$$
+export DBLIST=/tmp/dblist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export CHECKLOG=/tmp/checklog.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $CHECKLOG && \rm -f $CHECKLOG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#-----------------------------------------------------------------------
+# Init LOGFILE
+#-----------------------------------------------------------------------
+> $LOGFILE
+echo "`date` $DBSERVER: BEGIN Sync users/permissions using SQL from $FROMDBSERVER:" >> $LOGFILE
+
+#------------------------------------------------------------------------------------
+# format list of databases
+# if a file is passed, make sure it's > 0 bytes
+# if it's not clearly a file, make sure it's not an invalid filename
+#------------------------------------------------------------------------------------
+# make sure control file exists and has entries
+if [ -f $DBSPEC ]
+then
+	if [ -s $DBSPEC ]
+	then
+		cat $DBSPEC > $DBLIST
+	else
+		echo "WARNING - $DBSPEC is 0 bytes" >> $LOGFILE
+		exit 1
+	fi
+else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+	echo $DBSPEC | grep '/' > /dev/null
+	if [ $? -eq 0 ]
+	then
+		echo "ERROR - $DBSPEC is not valid--possible invalid filename?"
+		exit 2
+	else
+		echo $DBSPEC > $DBLIST
+	fi
+fi
+
+#-----------------------------------------------------------------------
+# Write log headers
+#-----------------------------------------------------------------------
+echo "`date` $DBSERVER: Affected databases:" >> $LOGFILE
+cat $DBLIST >> $LOGFILE
+
+#-----------------------------------------------------------------------
+# Determine if it's necessary to configure 'allow updates'
+#-----------------------------------------------------------------------
+export CURCONFIG=`$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b <<-! | grep -v Password | sed -e 's/  *//g'
+\`getPass $DBSERVER $ADMINLOGIN\`
+set nocount on
+go
+select b.value from master..sysconfigures a, master..syscurconfigs b
+where a.comment = 'allow updates to system tables'
+and a.config = b.config
+go
+!
+`
+# check the setting - it must be 0 or 1...if it's not, the query probably wasn't successful
+if [ "$CURCONFIG" != "0" -a "$CURCONFIG" != "1" ]
+then
+	echo "CURCONFIG variable not properly set (not 0 or 1) - defaulting to 0" >> $LOGFILE
+	echo "CURCONFIG=$CURCONFIG" >> $LOGFILE
+	export CURCONFIG=0
+	export HIGHRC=1
+fi
+
+#-----------------------------------------------------------------------
+# If 'allow updates' is currently off, then turn it on at the beginning and off at the end
+# If it's already on, do nothing
+# If errors, continue anyway
+#-----------------------------------------------------------------------
+if [ $CURCONFIG -eq 0 ]
+then
+	echo "Allowing updates to system tables" >> $LOGFILE
+	> $SQLOUT
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -e -w200 <<-! | grep -v Password >> $SQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	exec sp_configure "allow updates to system tables",1
+	go
+	!
+
+	cat $SQLOUT >> $LOGFILE
+
+	checkSqlErr $SQLOUT
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - Allowing updates to system tables" | tee -a $LOGFILE
+		export HIGHRC=1
+	fi
+else
+	echo "System table updates already allowed" >> $LOGFILE
+fi
+
+#-----------------------------------------------------------------------
+# Format sql file for each DBNAME to be processed
+# NOTE:  This method of deleting directly from sysusers works in our environment because
+# 	in most cases, all objects are owned by dbo (uid=1).  This method of syncing users
+# 	should NOT be used for databases with objects owned by users other than dbo.  This is 
+#	because the uid field is linked to several other tables in the database and uid
+#	mismatches can occur between sysusers and the other tables.
+#-----------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	> $SQLFILE
+
+	echo "use $DBNAME" >> $SQLFILE	
+	echo "go" >> $SQLFILE	
+# delete all the aliases
+	echo "delete from $DBNAME..sysalternates" >> $SQLFILE	
+	echo "go" >> $SQLFILE	
+# delete all users (excluding public (0) and dbo (1))
+	echo "delete from $DBNAME..sysusers where uid >= 2 and uid < @@mingroupid" >> $SQLFILE	
+	echo "go" >> $SQLFILE	
+# delete all user-defined groups
+	echo "delete from $DBNAME..sysusers where uid >= @@mingroupid and uid not in (select lrid from sysroles)" >> $SQLFILE	
+	echo "go" >> $SQLFILE	
+# delete all user-defined roles or role mismatches (id=-1)
+#	echo "delete from $DBNAME..sysusers where uid >= (select min(lrid) from sysroles where id >= 32)" >> $SQLFILE	
+	echo "delete from $DBNAME..sysusers where uid in (select lrid from sysroles where id >= 32 or id = -1)" >> $SQLFILE	
+	echo "go" >> $SQLFILE	
+	echo "delete from $DBNAME..sysroles where id >= 32 or id = -1" >> $SQLFILE	
+	echo "go" >> $SQLFILE	
+# delete all permissions -- this should probably be in a loop
+	echo "delete from $DBNAME..sysprotects" >> $SQLFILE
+	echo "go" >> $SQLFILE	
+
+#-----------------------------------------------------------------------
+# If droponly flag is NOT passed, format sql to add groups, users and aliases
+# If a specific DDL date.time is passed, then combine user/perm files with that date.time extension
+# Otherwise combine current user and perm ddl files
+#  Set variables specific to DBNAME DDL
+#  Uncompress, if necessary
+#-----------------------------------------------------------------------
+	if [ $DROPONLY -eq 0 ]
+	then
+		export USERSQL=$SQLDIR/useradmin/$FROMDBSERVER/$DBNAME/$FROMDBSERVER.$DBNAME.user.sql
+		export GROUPSQL=$SQLDIR/useradmin/$FROMDBSERVER/$DBNAME/$FROMDBSERVER.$DBNAME.group.sql
+		export PERMSQL=$SQLDIR/useradmin/$FROMDBSERVER/$DBNAME/$FROMDBSERVER.$DBNAME.allperm.sql
+
+
+		if [ "$DDLEXT" ]
+		then
+			export EXTUSERFILE=$SQLDIR/useradmin/$FROMDBSERVER/$DBNAME/$FROMDBSERVER.$DBNAME.user.sql.$DDLEXT
+			export EXTGROUPFILE=$SQLDIR/useradmin/$FROMDBSERVER/$DBNAME/$FROMDBSERVER.$DBNAME.group.sql.$DDLEXT
+			export EXTPERMFILE=$SQLDIR/useradmin/$FROMDBSERVER/$DBNAME/$FROMDBSERVER.$DBNAME.allperm.sql.$DDLEXT
+
+			if [ ! -f "$EXTUSERFILE" ]
+			then
+				if [ "$EXTUSERFILE.Z" ]
+				then
+					uncompress $EXTUSERFILE.Z
+				else
+					echo "ERROR - $EXTUSERFILE does not exist or is 0 bytes"
+					exit 2
+				fi
+			fi
+			if [ ! -f "$EXTGROUPFILE" ]
+			then
+				if [ "$EXTGROUPFILE.Z" ]
+				then
+					uncompress $EXTGROUPFILE.Z
+				else
+					echo "ERROR - $EXTGROUPFILE does not exist or is 0 bytes"
+					exit 2
+				fi
+			fi
+			if [ ! -f "$EXTPERMFILE" ]
+			then
+				if [ "$EXTPERMFILE.Z" ]
+				then
+					uncompress $EXTPERMFILE.Z
+				else
+					echo "ERROR - $EXTPERMFILE does not exist or is 0 bytes"
+					exit 2
+				fi
+			fi
+
+			cat $EXTGROUPFILE >> $SQLFILE
+			cat $EXTUSERFILE >> $SQLFILE
+			cat $EXTPERMFILE >> $SQLFILE
+		else
+			cat $GROUPSQL >> $SQLFILE
+			cat $USERSQL >> $SQLFILE
+			cat $PERMSQL >> $SQLFILE
+		fi
+	else
+		echo "DROPONLY - $DBNAME users will be dropped but not re-added" >> $LOGFILE
+	fi
+
+#-----------------------------------------------------------------------
+# Run the SQL for DBNAME - separate connection for each DBNAME so it's easier to check/report errors
+# Check for errors
+# Ignore Msg 208 - grants on objects that don't exist
+# Ignore Msg 4610 - grants on objects that don't exist in the current database
+#-----------------------------------------------------------------------
+	echo "`date` $DBNAME BEGIN Sync users/permissions" >> $LOGFILE
+
+	> $SQLOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -e -i$SQLFILE -w200 | grep -v Password >> $SQLOUT
+
+	cat $SQLOUT >> $LOGFILE
+
+	egrep -v '(Msg 208,|Msg 4610,)' $SQLOUT > $CHECKLOG
+	checkSqlErr $CHECKLOG
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - Syncing users/permissions for $DBSERVER:$DBNAME" | tee -a $LOGFILE
+		export HIGHRC=1
+	else
+		echo "`date` $DBNAME COMPLETE Sync users/permissions" >> $LOGFILE
+	fi
+done
+
+#-----------------------------------------------------------------------
+# If 'allow updates' was off at the beginning, then turn it off at the end
+# If it's already on, do nothing
+#-----------------------------------------------------------------------
+if [ $CURCONFIG -eq 0 ]
+then
+	echo "Disabling updates to system tables" >> $LOGFILE
+	> $SQLOUT
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -e -w200 <<-! | grep -v Password >> $SQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	exec sp_configure "allow updates to system tables",0
+	go
+	!
+
+	cat $SQLOUT >> $LOGFILE
+
+	checkSqlErr $SQLOUT
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - Disabling updates to system tables" | tee -a $LOGFILE
+		export HIGHRC=1
+	fi
+else
+	echo "System table updates already disabled" >> $LOGFILE
+fi
+
+#-----------------------------------------------------------------------
+# Write log trailers
+# Final exit
+#-----------------------------------------------------------------------
+echo "`date` $DBSERVER: COMPLETE Sync users/permissions" >> $LOGFILE
+if [ $HIGHRC -ne 0 ]
+then
+	exit 2
+else
+	exit 0
+fi

@@ -1,0 +1,340 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: MSA.repLatency.scr -S <PDS> -T1 <RDS> -T2 <TDS> -RSSD <ERSSD> {-m <maildest>} {-p <pagedest>}
+#
+#  Description: Update repmon table in each replicated database on the source.
+#		Compare it to the repmon table on both targets to determin latency.
+#
+#     Location:	/sccm/dba/sybase/scripts/MSA.repLatency.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<PDS> - Source ASE
+#              	<RDS> - First target ASE
+#              	<TDS> - Second target ASE
+#              	<RRS> - Replicate Repserver
+#              	<ERSSD> - Name of Replicate ERSSD
+#
+#  Modification History:
+#	10/11/10 K. Sawant  Original script, copied from RS15.repLatency.scr and modified for MSA
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+USAGE="ERROR - Usage: $0 -S <PDS> -T1 <RDS> -T2 <TDS> -RSSD <ERSSD> {-m <maildest>} {-p <pagedest>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export SRC_DBSERVER=$2;shift 2;;
+	                -T1)	export TGT1_DBSERVER=$2;shift 2;;
+	                -T2)	export TGT2_DBSERVER=$2;shift 2;;
+	                -RSSD)	export RSSD=$2;shift 2;;
+	                -m)	export MAILDEST=$2;shift 2;;
+	                -p)	export PAGEDEST=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# All three servers and RSSD must be passed
+if [ ! "$SRC_DBSERVER" -o ! "$TGT1_DBSERVER" -o ! "$TGT2_DBSERVER" -o ! "$RSSD" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+integer RDS_MINLATE
+integer TDS_MINLATE
+export RPTFILE=$RPTDIR/replication/repLatency/MSA.${SRC_DBSERVER}_to_${TGT1_DBSERVER}_AND_${TGT2_DBSERVER}.repLatency.$MMYYYY
+export DBLIST=/tmp/dblist.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export MAILFILE=/tmp/mailfile.$$
+export SQLOUT=/tmp/sqlout.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DBLIST && \rm -f $DBLIST
+	test $PAGEMSG && \rm -f $PAGEMSG
+	test $MAILFILE && \rm -f $MAILFILE
+	test $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Get list of all replicated databases where BOTH active and standby connections
+#  exist for the source and target dbservers
+#  Check for sql errors against RSSD
+#--------------------------------------------------------------------------
+$OCSBIN/isql -U$ADMINLOGIN -S$RSSD -b <<-! | egrep -v '(Password|rows affected|^$)' > $DBLIST
+	`getPass $RSSD $ADMINLOGIN`
+	set nocount on
+	go
+	use $RSSD
+	go
+	select a.dbname from rs_databases a where a.dsname = "$SRC_DBSERVER" and a.ptype = "A"
+	and a.dbname in (select b.dbname from rs_databases b where b.dsname = "$TGT1_DBSERVER" and b.ptype = "S")
+	order by a.dbname
+	go
+	!
+
+checkSqlErr $DBLIST
+if [ $? -eq 1 ]
+then
+	echo "ERROR - SQL error(s) getting list of replicated databases from $RSSD:$RSSD"
+	cat $DBLIST
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  If there are no databases to process, exit the script
+#--------------------------------------------------------------------------
+test ! -s $DBLIST && exit 0
+
+#--------------------------------------------------------------------------
+#  If database is not read only (status=1024):
+#	Update the repmon table in the database on the source server
+#	Update corresponding entry for database in dba..master_repmon on target server
+#	Insert an entry into dba..master_repmon if none exists for the database
+#  Check for SQL errors following each isql call
+#  THIS SHOULD EVENTUALLY BE CHANGED TO FORMAT THE SQL AND MAKE A SINGLE ISQL CALL.
+#--------------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+	$ISQLEXE -U$ADMINLOGIN -S$SRC_DBSERVER <<-! | grep -v Password > $SQLOUT
+	`getPass $SRC_DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	if (select status&1024 from master..sysdatabases where name = "$DBNAME") <> 1024
+	begin
+		update $DBNAME..repmon 
+		set reptime=getdate()
+		where id=1
+		if (@@rowcount=0)
+			insert into $DBNAME..repmon values (1,getdate())
+	end
+	go
+	!
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - SQL error(s) updating $SRC_DBSERVER:$DBNAME..repmon"
+		cat $SQLOUT
+	fi
+
+	$ISQLEXE -U$ADMINLOGIN -S$TGT1_DBSERVER <<-! | grep -v Password > $SQLOUT
+	`getPass $TGT1_DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	if (select status&1024 from master..sysdatabases where name = "$DBNAME") <> 1024
+	begin
+		update dba..master_repmon
+		set master_reptime=getdate()
+		where dbname="$DBNAME"
+		if (@@rowcount=0)
+			insert into dba..master_repmon values ("$DBNAME",getdate(),getdate())
+	end
+	go
+	!
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - SQL error(s) updating $TGT1_DBSERVER:dba..master_repmon with current time"
+		cat $SQLOUT
+	fi
+
+	$ISQLEXE -U$ADMINLOGIN -S$TGT2_DBSERVER <<-! | grep -v Password > $SQLOUT
+	`getPass $TGT2_DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	if (select status&1024 from master..sysdatabases where name = "$DBNAME") <> 1024
+	begin
+		update dba..master_repmon
+		set master_reptime=getdate()
+		where dbname="$DBNAME"
+		if (@@rowcount=0)
+			insert into dba..master_repmon values ("$DBNAME",getdate(),getdate())
+	end
+	go
+	!
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - SQL error(s) updating $TGT2_DBSERVER:dba..master_repmon with current time"
+		cat $SQLOUT
+	fi
+done
+
+#--------------------------------------------------------------------------
+# Wait 30 seconds and give the replication server time to push the data though
+#--------------------------------------------------------------------------
+sleep 30
+
+#--------------------------------------------------------------------------
+# Use dba..master_repmon on the target server to check the latency
+#--------------------------------------------------------------------------
+export RDS_MINLATE=0
+export TDS_MINLATE=0
+> $MAILFILE
+cat $DBLIST |
+while read DBNAME
+do
+
+#--------------------------------------------------------------------------
+# Update dba..master_repmon with first target database's datetime
+# Do not update databases with offline status--accounts for databases in load (status2=16)
+#--------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$TGT1_DBSERVER <<-! | grep -v Password > $SQLOUT
+	`getPass $TGT1_DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	if (select status&1024 from master..sysdatabases where name = "$DBNAME") <> 1024
+	and (select status2&16 from master..sysdatabases where name = "$DBNAME") <> 16
+	begin
+		update dba..master_repmon
+		set dba.db_reptime=target.reptime
+		from dba..master_repmon dba, $DBNAME..repmon target
+		where dbname="$DBNAME"
+		if (@@rowcount=0)
+			update dba..master_repmon
+			set db_reptime=""
+			where dbname="$DBNAME"
+	end
+	go
+	!
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - SQL error(s) updating $TGT1_DBSERVER:dba..master_repmon with replicated time"
+		cat $SQLOUT
+	fi
+
+#--------------------------------------------------------------------------
+# Update dba..master_repmon with second target database's datetime
+# Do not update databases with offline status--accounts for databases in load (status2=16)
+#--------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$TGT2_DBSERVER <<-! | grep -v Password > $SQLOUT
+	`getPass $TGT2_DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	if (select status&1024 from master..sysdatabases where name = "$DBNAME") <> 1024
+	and (select status2&16 from master..sysdatabases where name = "$DBNAME") <> 16
+	begin
+		update dba..master_repmon
+		set dba.db_reptime=target.reptime
+		from dba..master_repmon dba, $DBNAME..repmon target
+		where dbname="$DBNAME"
+		if (@@rowcount=0)
+			update dba..master_repmon
+			set db_reptime=""
+			where dbname="$DBNAME"
+	end
+	go
+	!
+        checkSqlErr $SQLOUT
+        if [ $? -eq 1 ]
+        then
+                echo "ERROR - SQL error(s) updating $TGT2_DBSERVER:dba..master_repmon with replicated time"
+                cat $SQLOUT
+        fi
+
+#--------------------------------------------------------------------------
+# Calculate how many minutes the target/s server is behind the source server
+#--------------------------------------------------------------------------
+	export RDS_MINLATE="$(print "$($ISQLEXE -U$ADMINLOGIN -S$TGT1_DBSERVER -b <<-! | tee $SQLOUT
+		`getPass $TGT1_DBSERVER $ADMINLOGIN`
+		set nocount on
+		go
+		if (select status&1024 from master..sysdatabases where name = "$DBNAME") <> 1024
+			select ltrim(convert(char(11),(datediff(mi,master_reptime,db_reptime))*(-1))) from dba..master_repmon where dbname="$DBNAME"
+		go
+		! )" | grep -v Password )"
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export COUNTRC=1
+		echo "ERROR - SQL error(s) calculating RDS_MINLATE for $DBNAME"
+		cat $SQLOUT
+	else
+		export COUNTRC=0
+	fi
+	export TDS_MINLATE="$(print "$($ISQLEXE -U$ADMINLOGIN -S$TGT2_DBSERVER -b <<-! | tee $SQLOUT
+		`getPass $TGT2_DBSERVER $ADMINLOGIN`
+		set nocount on
+		go
+		if (select status&1024 from master..sysdatabases where name = "$DBNAME") <> 1024
+			select ltrim(convert(char(11),(datediff(mi,master_reptime,db_reptime))*(-1))) from dba..master_repmon where dbname="$DBNAME"
+		go
+		! )" | grep -v Password )"
+        checkSqlErr $SQLOUT
+        if [ $? -eq 1 ]
+        then
+                export TCOUNTRC=1
+                echo "ERROR - SQL error(s) calculating TDS_MINLATE for $DBNAME"
+                cat $SQLOUT
+        else
+                export TCOUNTRC=0
+        fi
+
+#--------------------------------------------------------------------------
+# If latency > 0 minutes write a log record.
+# If latency >= 60 minutes format a mail message.
+# If latency >= 120 minutes and a page destination is set, send a page.
+# (Send a separate page for each database -- easier to read on pager)
+#--------------------------------------------------------------------------
+	if [ $COUNTRC -eq 0 -a $RDS_MINLATE -gt 0 ]
+	then
+		echo "`date +'%D %T'` : $DBNAME : $TGT1_DBSERVER is behind $SRC_DBSERVER by [minutes]: $RDS_MINLATE" >> $RPTFILE
+		if [ $RDS_MINLATE -ge 60 ]
+		then
+			echo "`date +'%D %T'` : $DBNAME : $TGT1_DBSERVER is behind $SRC_DBSERVER by [minutes]: $RDS_MINLATE" >> $MAILFILE
+			if [ $RDS_MINLATE -ge 120 -a "$PAGEDEST" ]
+			then
+				echo "`date +'%D %T'` $DBNAME : $TGT1_DBSERVER is behind $SRC_DBSERVER by [minutes]: $RDS_MINLATE" > $PAGEMSG
+		        	sendPage
+			fi
+		fi
+        fi
+	if [ $TCOUNTRC -eq 0 -a $TDS_MINLATE -gt 0 ]
+	then
+		echo "`date +'%D %T'` : $DBNAME : $TGT2_DBSERVER is behind $SRC_DBSERVER by [minutes]: $TDS_MINLATE" >> $RPTFILE
+		if [ $TDS_MINLATE -ge 60 ]
+		then
+			echo "`date +'%D %T'` : $DBNAME : $TGT2_DBSERVER is behind $SRC_DBSERVER by [minutes]: $TDS_MINLATE" >> $MAILFILE
+			if [ $TDS_MINLATE -ge 120 -a "$PAGEDEST" ]
+			then
+				echo "`date +'%D %T'` $DBNAME : $TGT2_DBSERVER is behind $SRC_DBSERVER by [minutes]: $TDS_MINLATE" > $PAGEMSG
+		        	sendPage
+			fi
+		fi
+        fi
+done
+
+#--------------------------------------------------------------------------
+#  If MAILFILE exists and has size > 0 bytes, send mail 
+#--------------------------------------------------------------------------
+if [ -s $MAILFILE ]
+then
+	export MAILSUBJECT="$REPSERVER REPLICATION Latency Report"
+	sendMail
+fi 
+
+#--------------------------------------------------------------------------
+#  Exit with 0
+#--------------------------------------------------------------------------
+exit 0

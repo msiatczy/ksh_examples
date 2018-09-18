@@ -1,0 +1,277 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sqlbtBackup.scr -S <DBSERVER> {-D <database>|-L <list of databases> -m <maildest> -tasks <tasks> -to <pool> -B <backup format> -pagehung <pagedest> -pagedone <pagedest>}
+#
+#  Description: Perform full backup of database(s) on DBSERVER
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#              	<database> - single database to back up
+#              	<maildest> - mail destination to receive errors (default=dba)
+#              	<tasks> - number of dumps to run simultaneously (default=3)
+#              	<pool> - override default backup pool in control file
+#              	<backup format> - logical or physical (default=physical)
+#
+#  Modification History:
+#	04/24/02 M. Siatczynski	Initial Script
+#	07/17/02 M. Siatczynski	Set environment according do SETDBSERVER
+#	02/19/03 M. Siatczynski	Added export on RC variables
+#       10/03/03 M. Siatczynski Added call to checkHungSqlbt.scr at completion of full backup
+#                               Add optional -pagehung parm to page if sqlbt process hangs
+#       10/28/03 M. Siatczynski Centralize script, eliminate extra generation copy and write log to central log location
+#       01/07/04 M. Siatczynski If logical format is passed, then can not specify -no_incremental (mutually exclusive)
+#       05/17/04 M. Siatczynski Add parms to page upon completion
+#       08/06/04 M. Siatczynski Add parm to backup list of databases
+# 				Remove single dbname from LOGFILE name
+# 				Write to new DBSERVER-based DR location (rather than host-based)
+#       08/09/04 M. Siatczynski Write to generic DR dest in additional to dated DR dest
+#       07/25/05 M. Siatczynski Replace DT- with BMCBKS (sqlbt 5.0 error message format)
+#       03/15/06 M. Siatczynski Remove hardcoded sbackups and replace with $BACKUPFMT
+#       04/03/06 M. Siatczynski Add code to properly set HRC when 'return code was' is not present in LOGFILE
+#       11/06/06 M. Siatczynski Add PID ($$) to LOGFILE name
+#       12/26/06 M. Siatczynski Comment out call to checkHungSqlbt.scr (hung processes no longer a problem and difficult to programatically detect)
+#--------------------------------------------------------------------------
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>|-L <list of databases> -m <maildest> -to <backup pool> -tasks <tasks> -B <backup format> -pagehung <pagedest> -pagedone <pagedest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -D)	export ONEDBNAME=$2;shift 2;;
+	                -L)	export DBLIST=$2;shift 2;;
+	                -m)	export MAILDEST=$2;shift 2;;
+	                -tasks)	export TASKS=$2;shift 2;;
+	                -to)	export POOL=$2;shift 2;;
+	                -B)	export BACKUPFMT=$2;shift 2;;
+	                -pagehung)	export PAGEHUNG=$2;shift 2;;
+	                -pagedone)	export PAGEDONE=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# NOTE:  SETDBSERVER must be set AFTER case statement and profile must be sourced AFTER case statement
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+test ! "$TASKS" && export TASKS=3
+test ! "$BACKUPFMT" && export BACKUPFMT=physical
+
+#--------------------------------------------------------------------------
+# Initialize variables
+#--------------------------------------------------------------------------
+# Create subdirectories for DR if they don't exist
+test ! -d $DBSERVER_DRDIR && mkdir $DBSERVER_DRDIR
+test ! -d $SQLBT_DRDIR && mkdir $SQLBT_DRDIR
+test ! -d $SQLBT_DRDIR/$DBSERVER && mkdir $SQLBT_DRDIR/$DBSERVER
+test ! -d $SQLBT_DRDIR/$DBSERVER$MMDDYYYY && mkdir $SQLBT_DRDIR/$DBSERVER$MMDDYYYY
+test ! -d $SQLBT_DRDIR/$DBSERVER/$BACKUPFMT && mkdir $SQLBT_DRDIR/$DBSERVER/$BACKUPFMT
+test ! -d $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/$BACKUPFMT && mkdir $SQLBT_DRDIR/$DBSERVER$MMDDYYYY/$BACKUPFMT
+
+export SQLBT_DRDEST=$SQLBT_DRDIR/$DBSERVER/$BACKUPFMT
+export SQLBT_DRDEST_DATE=$SQLBT_DRDIR/$DBSERVER$MMDDYYYY/$BACKUPFMT
+
+export ERRORS=/tmp/errors.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export CTLFILE_LIST=/tmp/ctlfile_list.$$
+export LOGFILE=$LOGDIR/backup/$DBSERVER/$DBSERVER.sqlbtBackup.$$.$DATETIME
+export FMTDIR=$DTBASE/$BACKUPFMT
+
+> $CTLFILE_LIST
+export SQLBT_CTLSTRING=""
+
+> $ERRORS
+
+# initialize return codes
+export SQLBTRC=0
+export HRC=0
+export FILERC=0
+export EXITRC=0
+
+#--------------------------------------------------------------------------
+# Validate parms
+#--------------------------------------------------------------------------
+# single dbname and list of databases is mutually exclusive
+if [ "$ONEDBNAME" -a "$DBLIST" ]
+then
+	echo "ERROR - $CALLED"
+	echo "Single dbname and list of databases are mutually exclusive."
+	exit 1
+fi
+
+# if onedbname or list of databases passed, format list of control files, otherwise we'll use the whole server control directory
+if [ "$ONEDBNAME" ]
+then
+	echo $FMTDIR/$DBSERVER/$ONEDBNAME >> $CTLFILE_LIST
+elif [ "$DBLIST" ]
+then
+	if [ ! -s $DBLIST ]
+	then
+		echo "ERROR - $DBLIST does not exist or is 0 bytes"
+		exit 1
+	else
+		cat $DBLIST |
+		while read DBNAME
+		do
+			export DBNAME
+			echo $FMTDIR/$DBSERVER/$DBNAME >> $CTLFILE_LIST
+		done
+	fi
+else
+	export SQLBT_CTLDIR=$DTBASE/$BACKUPFMT/$DBSERVER
+	if [ ! -d $FMTDIR/$DBSERVER ]
+	then
+		echo "ERROR - $CALLED"
+		echo "$FMTDIR/$DBSERVER does not exist"
+		exit 1
+	else
+		export SQLBT_CTLSTRING=$FMTDIR/$DBSERVER
+
+	fi
+fi
+
+# If backing up one or a list of databases, make sure control files exist for each database
+if [ -s $CTLFILE_LIST ]
+then
+	cat $CTLFILE_LIST |
+	while read FILE
+	do
+		export FILE
+		if [ -f $FILE ]
+		then
+			export SQLBT_CTLSTRING="$SQLBT_CTLSTRING $FILE"
+		else
+			echo "ERROR - control file $FILE does not exist" >> $ERRORS
+			export FILERC=1
+		fi
+	done
+fi
+
+# If a specific pool is passed, verify it exists in the .dtoptions file
+if [ "$POOL" ]
+then
+	grep "begin backup_pool=$POOL" $FMTDIR/.dtoptions > /dev/null
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - $CALLED"
+		echo "Backup pool $POOL does not exist in $FMTDIR/.dtoptions"
+		exit 1
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $ERRORS && \rm -f $ERRORS
+	test $PAGEMSG && \rm -f $PAGEMSG
+	test $CTLFILE_LIST && \rm -f $CTLFILE_LIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# If FILERC = 1 and only backing up one database then don't even attempt the backup
+# -otherwise-
+# Backup the control files/directory and then save the control 
+# file/directory for DR purposes.
+# If the backup format is logical, can not specify -no_incremental
+# Get the highest return code from the log file (the sed cmd accounts for multiple spaces in the "highest return code was" line)
+#--------------------------------------------------------------------------
+export NUMFILES=`wc -l < $CTLFILE_LIST`
+if [ $FILERC -ne 0 -a $NUMFILES -eq 1 ]
+then :
+else
+	test -n "$POOL" && export POOLSPEC="-to $POOL" || export POOLSPEC=""
+	test "$BACKUPFMT" = "physical" && export INCSPEC="-no_incremental" || export INCSPEC=""
+
+	> $LOGFILE
+	$DT_SBACKTRACK_HOME/bin/dtsbackup $SQLBT_CTLSTRING -tasks $TASKS $POOLSPEC $INCSPEC >> $LOGFILE
+	export SQLBTRC=$?
+	HRC=`grep 'return code was' $LOGFILE | sed -e 's/  */ /g' | cut -d" " -f6`
+	test ! "$HRC" && export HRC=99
+
+# If backing up one or list of databases, copy off the individual control files, otherwise copy all files in the dbserver directory
+# Save copy to generic DR directory and dated DR directory
+	if [ -s $CTLFILE_LIST ]
+	then
+		cat $CTLFILE_LIST |
+		while read FILE
+		do
+			export FILE
+			if [ -f $FILE ]
+			then
+				cp -p $FILE $SQLBT_DRDEST
+				cp -p $FILE $SQLBT_DRDEST_DATE
+			fi
+		done
+	else
+		cp -p $SQLBT_CTLSTRING/* $SQLBT_DRDEST
+		cp -p $SQLBT_CTLSTRING/* $SQLBT_DRDEST_DATE
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  Set the exit return code
+#  If sqlbt execution failed (SQLBTRC <> 0), set a non-zero return code
+#  If log file contains non-zero return code (HRC <> 0), set a non-zero return code
+#  If any of the control files specified were invalid,(FILERC <> 0) set a non-zero return code
+#  Override warning to error if errors more severe than missing control files
+#  Override warning to error if sqlbt return code <> 0 but no message in log file
+#--------------------------------------------------------------------------
+if [ $SQLBTRC -ne 0 -o $HRC -ne 0 -o $FILERC -ne 0 ]
+then
+        export EXITRC=1
+	echo "Execution of $CALLED \nended with non-zero return code\n" >> $ERRORS
+	test $SQLBTRC -ne 0 -o $HRC -ne 0 && egrep '(BMCBKS|completed with |^\*\*\*)' $LOGFILE >> $ERRORS
+# The following three tests must be in the order specified
+	test $FILERC -eq 1 && export MAILSUBJECT="$DBSERVER SQLBT Warnings"	
+	test $HRC -eq 1 && export MAILSUBJECT="$DBSERVER SQLBT Warnings" || export MAILSUBJECT="$DBSERVER SQLBT ERRORS"
+	test $SQLBTRC -ne 0 && export MAILSUBJECT="$DBSERVER SQLBT ERRORS"
+	export MAILFILE=$ERRORS
+	sendMail
+fi
+
+#--------------------------------------------------------------------------
+#  If PAGEDONE set, set appropriate page message and send page
+#--------------------------------------------------------------------------
+if [ "$PAGEDONE" ]
+then
+	test $EXITRC -eq 0 && export PAGESTATUS=SUCCESS || export PAGESTATUS="FAILURE/WARNING"
+	echo "`date` $DBSERVER backup completion status=$PAGESTATUS" > $PAGEMSG
+	export PAGEDEST=$PAGEDONE
+	sendPage
+fi
+
+#--------------------------------------------------------------------------
+# Check for hung sqlbt processes
+# If PAGEHUNG is set, send page, otherwise send email
+# At this time, hung processes do not affect SQLBTRC
+#--------------------------------------------------------------------------
+#if [ "$PAGEHUNG" ]
+#then
+#	$SCRDIR/NEW.checkHungSqlbt.scr -S $DBSERVER -dumptype full -p $PAGEHUNG
+#else
+#	$SCRDIR/NEW.checkHungSqlbt.scr -S $DBSERVER -dumptype full
+#fi
+
+#--------------------------------------------------------------------------
+# Exit
+#--------------------------------------------------------------------------
+exit $EXITRC

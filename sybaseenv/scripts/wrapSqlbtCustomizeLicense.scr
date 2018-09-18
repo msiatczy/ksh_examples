@@ -1,0 +1,106 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: wrapSqlbtCustomizeLicense.scr -H <all|host>
+#
+#  Description: This script provides an automated way to ssh to a one or all hosts.
+#		Once on the host, manually run the sqlbtCustomizeLicense.scr to customize programs with license information
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<login> - login
+#              	<host> - specific host
+#
+#  Modification History:
+#	01/11/08 M. Siatczynski	Original script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -H <host|all>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -H)		export ONEHOST=$2;shift 2;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEHOST" ]
+then
+        echo $USAGE
+        echo "ERROR - Login and host MUST be specified"
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export TMPHOSTLIST=/tmp/tmphostlist.$$
+export RPTFILE=$RPTDIR/useradmin/central/wrapSqlbtCustomizeLicense.$DATETIME
+
+if [ "$ONEHOST" = "all" ]
+then
+	export HOSTLIST=$CTLDIR/sqlbtHost.lst
+	if [ ! -s $HOSTLIST ]
+	then										
+		echo "ERROR - $HOSTLIST does not exist"
+		exit 1
+	else
+		cat $HOSTLIST > $TMPHOSTLIST
+	fi
+else
+	echo $ONEHOST > $TMPHOSTLIST
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TMPHOSTLIST && \rm -f $TMPHOSTLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Write report headers
+#--------------------------------------------------------------------------
+> $RPTFILE
+chmod 600 $RPTFILE
+echo "`date` Updating sqlbt programs with license info on the following hosts:" >> $RPTFILE
+cat $TMPHOSTLIST >> $RPTFILE
+
+#------------------------------------------------------------------------------
+# ssh to each host in the list
+# NOTE:  Do not use HOST as the variable--this is a system variable
+#------------------------------------------------------------------------------
+for SSHHOST in `cat $TMPHOSTLIST`
+do
+	export SSHHOST
+	echo "\n\n\n************************************************************"
+	echo "SSHING to $SSHHOST -- EXECUTE $SCRDIR/sqlbtCustomizeLicense.scr -all" | tee -a $RPTFILE
+	echo "************************************************************\n\n\n"
+	/usr/local/bin/ssh -x $SSHHOST
+done
+
+echo "`date` ssh to all hosts complete" >> $RPTFILE
+#------------------------------------------------------------------------------
+# Exit with final status
+#------------------------------------------------------------------------------
+echo "\n\n\nSSH TO ALL HOSTS COMPLETE -- RETURNING TO CALLING HOST\n\n\n"
+
+exit 0

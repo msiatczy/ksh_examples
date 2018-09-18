@@ -1,0 +1,181 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: configAllowUpdates.scr -S | -nonprod | -prod {-noprompt}
+#
+#  Description: Run sp_configure to allow updates to system tables for a specific server,
+#		or all dev/test servers, or all prod servers.
+#
+#     Location:	/sccm/dba/sybase/scripts/configAllowUpdates.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<ONEDBSERVER> - Database server name
+#
+#  Modification History:
+#	06/25/03 M. Siatczynski	Initial Script
+#	07/14/03 K. Hess	Removed ERNIE
+#	05/12/04 M. Siatczynski	Centralize script, add -S, and use aseStatus.lst
+#	06/07/04 M. Siatczynski	Changed -all parm to -nonprod and -prod to be more specific
+#	06/21/04 M. Siatczynski	Use ASEDIRLIST rather than aseStatus.lst
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#       01/10/07 M. Siatczynski Updated to use getAseList which will exclude servers in ASEEXCLUDELIST when processing all servers
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+export USAGE="ERROR - Usage: $0 -S <ONEDBSERVER> | -nonprod | -prod {-noprompt}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)		export ONEDBSERVER=$2;shift 2;;
+                        -nonprod)	export NONPROD=1;shift 1;;
+                        -prod)		export PROD=1;shift 1;;
+                	-noprompt)	export PROMPT=0;shift 1;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$NONPROD" && export NONPROD=0
+test ! "$PROD" && export PROD=0
+test ! "$PROMPT" && export PROMPT=1
+
+if [ ! "$ONEDBSERVER" -a $NONPROD -eq 0 -a $PROD -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ "$ONEDBSERVER" -a \( $NONPROD -eq 1 -o $PROD -eq 1 \) ]
+then
+        echo $USAGE
+        echo "ERROR - DBSERVER and -nonprod or -prod are mutually exclusive"
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export TMPLIST=/tmp/tmplist.$$
+
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+#  Create dbserver list
+#  Append ^ to beginning of TMPLIST and " " to end
+#  is -nonprod, get all non-prod dbservers
+#  is -prod, get prod dbservers
+#  It is valid to get both prod and nonprod servers
+#--------------------------------------------------------------------------
+> $DBSERVERLIST
+if [ "$ONEDBSERVER" ]
+then
+	echo $ONEDBSERVER >> $DBSERVERLIST
+else
+	getAseList | sed -e 's/^/\^/g' -e 's/$/ /g' > $TMPLIST
+	test $NONPROD -eq 1 && egrep -f $TMPLIST $ASEDIRLIST | grep nonprod | cut -d" " -f1 >> $DBSERVERLIST
+	test $PROD -eq 1 && egrep -f $TMPLIST $ASEDIRLIST | grep ' prod' | cut -d" " -f1 >> $DBSERVERLIST
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $TMPLIST && \rm -f $TMPLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Confirm action
+#------------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+        echo "\n**************************************************************************************\n"
+        echo "You are about to run 'sp_configure \"allow updates to system tables\",1'"
+        echo "for the following DBservers:\n"
+        echo "**************************************************************************************\n"
+	cat $DBSERVERLIST
+	echo ""
+        CONTINUE=""
+        while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+        do
+                echo "DO YOU WISH TO CONTINUE? {y/n}"
+                read CONTINUE
+        done
+
+        if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+        then
+                echo "\nScript exiting - no action taken.\n"
+                exit 0
+        fi
+fi
+
+#-----------------------------------------------------------------------
+# Determine if it's necessary to configure 'allow updates'
+#-----------------------------------------------------------------------
+
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export OUTFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.configAllowUpdates.$DATETIME
+	> $OUTFILE
+	date >> $OUTFILE
+	export CURCONFIG=`$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password | sed -e 's/  *//g'
+	\`getPass $DBSERVER $ADMINLOGIN\`
+	set nocount on
+	go
+	select b.value from master..sysconfigures a, master..syscurconfigs b
+	where a.comment = 'allow updates to system tables'
+	and a.config = b.config
+	go
+	!
+	`
+# check the setting - it must be 0 or 1...if it's not, the query probably wasn't successful
+	if [ "$CURCONFIG" != "0" -a "$CURCONFIG" != "1" ]
+	then
+		echo "CURCONFIG variable not properly set (not 0 or 1) - defaulting to 0"
+		echo "CURCONFIG=$CURCONFIG"
+		export CURCONFIG=0
+	fi
+
+#-----------------------------------------------------------------------
+# Format sql file
+# If 'allow updates' is currently off, then turn it on
+# If it's already on, do nothing
+#-----------------------------------------------------------------------
+	if [ $CURCONFIG -eq 0 ]
+	then
+		echo "Allowing updates to system tables for $DBSERVER" >> $OUTFILE
+		$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password >> $OUTFILE
+		`getPass $DBSERVER $ADMINLOGIN`
+		sp_configure "allow updates to system tables",1
+		go
+		!
+	else
+		echo "No config change necessary on $DBSERVER" >> $OUTFILE
+	fi
+	checkSqlErr $OUTFILE
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - configuring 'allow updates' for $DBSERVER"
+		echo "Review errors in $OUTFILE"
+		export HIGHRC=1
+	fi
+done
+
+#-----------------------------------------------------------------------
+# Exit
+#-----------------------------------------------------------------------
+exit $HIGHRC

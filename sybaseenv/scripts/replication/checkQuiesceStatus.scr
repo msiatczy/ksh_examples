@@ -1,0 +1,116 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkQuiesceStatus.scr -RS <repserver> {-seclimit <runtime limit (seconds)>}
+#
+#  Description: Make sure repserver is quiesced (queues empty) before proceeding
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<REPSERVER> - Replication server
+#              	<seclimit> - limit script runtime (seconds)
+#
+#   NOTE:  -L <control list> and other parameters are mutually exclusive.
+#
+#  Modification History:
+#	09/10/10 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+#  Initialize Parameters
+#--------------------------------------------------------------------------
+
+export USAGE="\nERROR - Usage: $0 -RS <repserver> {-seclimit <runtime limit (seconds)>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -RS)    export REPSERVER=$2;shift 2;;
+                        -seclimit)    export SECLIMIT=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+#--------------------------------------------------------------------------
+#  Verify Parameters
+#--------------------------------------------------------------------------
+if [ ! "$REPSERVER" ]
+then
+	echo "$USAGE"
+	echo "\nrepserver MUST be passed\n"
+	exit 1
+fi
+
+# if seconds limit not passed, default to 1800 (30 minutes)
+test ! "$SECLIMIT" && export SECLIMIT=1800
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/replication/$REPSERVER/$REPSERVER.checkQuiesceStatus.$DATETIME
+export SQLOUT=/tmp/sqlout.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Run admin quiesce_check
+#  Continue to run in a loop (10 seconds between iterations) until quiesced
+#  Exit with 0 upon quiesce
+#--------------------------------------------------------------------------
+> $LOGFILE
+
+export SECSUMM=0
+export QUIESCED=0
+while [ $QUIESCED -eq 0 -a $SECSUMM -le $SECLIMIT ]
+do
+	echo "`date` Checking quiesce status for $REPSERVER..." >> $LOGFILE
+	$ISQLEXE -U$ADMINLOGIN -S$REPSERVER -w800 -b <<-! | grep -v Password > $SQLOUT
+	`getPass $REPSERVER $ADMINLOGIN`
+	admin quiesce_check
+	go
+	!
+
+	cat $SQLOUT >> $LOGFILE
+
+	grep "Replication Server $REPSERVER is Quiesced" $SQLOUT > /dev/null
+	if [ $? -eq 0 ]
+	then
+		echo "`date` Script complete" >> $LOGFILE
+		export QUIESCED=1
+	else
+		sleep 10
+		export SECSUMM=`expr $SECSUMM + 10`
+	fi
+done
+
+#--------------------------------------------------------------------------
+# final exit
+# if we exit loop and QUIESCE=1, then time limit was exceeded
+#--------------------------------------------------------------------------
+if [ $QUIESCED -eq 1 ]
+then
+	exit 0
+else
+	echo "`date` ERROR - $REPSERVER not quiesced after $SECLIMIT seconds" >> $LOGFILE
+	exit 1
+fi

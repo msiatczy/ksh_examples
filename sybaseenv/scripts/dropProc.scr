@@ -1,0 +1,87 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dropProc.scr -P <procname>
+#
+#  Description: Drop one proc from all sybase servers
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	08/15/03 M. Siatczynski	Initial Script
+#	04/20/04 M. Siatczynski	Centralized script
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -P <proc>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -P)	export PROC=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$PROC" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+export DBSERVERLIST=/tmp/dbserver.lst.$$
+
+getAseList > $DBSERVERLIST
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Drop the proc from each dbserver
+#--------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	echo "\nDropping proc from $DBSERVER..."
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 <<-! | grep -v Password
+	`getPass $DBSERVER $ADMINLOGIN`
+	use sybsystemprocs
+	go
+	if exists (select * from sysobjects where type = "P" and name = "$PROC")
+	        drop proc $PROC
+	else
+		print "$PROC does not exist on $DBSERVER"
+	go
+	!
+done
+
+#--------------------------------------------------------------------------
+#  Exit with 0
+#--------------------------------------------------------------------------
+exit 0

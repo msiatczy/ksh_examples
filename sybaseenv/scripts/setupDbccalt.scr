@@ -1,0 +1,133 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: setupDbccalt.scr -S <DBSERVER> -C <cache name> -scanmb <scanws Mb> -textmb <textws Mb> -cachemb <max dbcc cache> -worker <max worker processes>
+#
+#  Description: Set up dbccalt configuration
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#       09/22/03 M. Siatczynski	Initial Script (modified version of dbccdbSetup.scr)
+#       08/03/04 M. Siatczynski	Centralized script
+#       02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Validate parms
+#--------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -C <cache name> -scanmb <scanws Mb> -textmb <textws Mb> -cachemb <max dbcc cache> -worker <max worker processes>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)		export DBSERVER=$2;shift 2;;
+	                -C)		export CACHE_NAME=$2;shift 2;;
+			-scanmb)	export SCAN_MB=$2;shift 2;;
+			-textmb)	export TEXT_MB=$2;shift 2;;
+			-worker)	export MAX_WORKER=$2;shift 2;;
+			-cachemb)	export MAX_CACHE=$2;shift 2;;
+	                -*)		echo $USAGE;exit 1;;
+	                *)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$DBSERVER" -o ! "$MAX_WORKER" -o ! "$MAX_CACHE" -o ! "$SCAN_MB" -o ! "$TEXT_MB" -o ! "$CACHE_NAME" ] 
+then
+	echo $USAGE
+	echo "ERROR - ALL parms MUST be supplied"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#  Default SCAN_WS to scan_ws_1 for now
+#  Default TEXT_WS to text_ws_1 for now
+#--------------------------------------------------------------------------
+export SCAN_WS=scan_ws_1
+export TEXT_WS=text_ws_1
+export SQLFILE=/tmp/sqlfile.$$
+export OUTFILE=$LOGDIR/dbcc/$DBSERVER/$DBSERVER.setupDbccalt.$DATETIME
+
+test "$CACHE_NAME" = "default_data_cache" && export CACHE_NAME="default data cache"
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLFILE && \rm -f $SQLFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Format the SQL to configure the scan and text workspaces
+#  Create if they don't exist
+#  Alter if they exist
+#--------------------------------------------------------------------------
+> $SQLFILE
+echo "use dbccalt" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "if exists (select name from dbccalt..sysobjects where name = \"$SCAN_WS\")" >> $SQLFILE
+echo "execute sp_dbcc_alterws \"dbccalt\",\"$SCAN_WS\",\"${SCAN_MB}M\"" >> $SQLFILE
+echo "else" >> $SQLFILE
+echo "execute sp_dbcc_createws \"dbccalt\",\"default\",\"$SCAN_WS\","scan",\"${SCAN_MB}M\"" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "if exists (select name from dbccalt..sysobjects where name = \"$TEXT_WS\")" >> $SQLFILE
+echo "execute sp_dbcc_alterws \"dbccalt\",\"$TEXT_WS\",\"${TEXT_MB}M\"" >> $SQLFILE
+echo "else" >> $SQLFILE
+echo "execute sp_dbcc_createws \"dbccalt\",\"default\",\"$TEXT_WS\","text",\"${TEXT_MB}M\"" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#--------------------------------------------------------------------------
+#  Format the SQL to configure defaults in dbccdb (use max settings for defaults)
+#--------------------------------------------------------------------------
+echo "sp_dbcc_updateconfig dbccdb, \"scan workspace\",\"$SCAN_WS\"" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "sp_dbcc_updateconfig dbccdb, \"text workspace\",\"$TEXT_WS\"" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "sp_dbcc_updateconfig dbccdb, \"max worker processes\",\"$MAX_WORKER\"" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "sp_dbcc_updateconfig dbccdb, \"dbcc named cache\",\"$CACHE_NAME\",\"${MAX_CACHE}M\"" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "sp_dbcc_updateconfig dbccdb, \"OAM count threshold\",\"5\"" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "sp_dbcc_updateconfig dbccdb, \"IO error abort\",\"3\"" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "sp_dbcc_updateconfig dbccdb, \"linkage error abort\",\"8\"" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#--------------------------------------------------------------------------
+#  Execute the SQL
+#--------------------------------------------------------------------------
+> $OUTFILE
+echo "Executing $0 from `hostname`" >> $OUTFILE
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -e -w200 -i$SQLFILE | grep -v Password >> $OUTFILE
+
+#-----------------------------------------------------------------------
+# Check for errors
+# If errors, exit with 1, else exit with 0
+#-----------------------------------------------------------------------
+checkSqlErr $OUTFILE
+if [ $? -ne 0 ]
+then
+	echo "$0 FAILED"
+	echo "Review errors in $OUTFILE"
+	exit 1
+else
+	echo "$0 SUCCESSFUL"
+	exit 0
+fi

@@ -1,0 +1,183 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: scriptName genMassPerms.scr -S <DBSERVER> -D <dbname>|<dblist> -role <rolename> -perm <READ|FULL|RW>
+#
+#  Description: Generate mass perms for a specific role
+#		SQL file is only generated, not executed
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - DBSERVER
+#              	<dbspec> - single database or list of databases
+#              	<perm>- READ - select on all tables and views
+#			FULL - insert,update,delete,select on all tables and views, execute on all procs
+#			RW - insert,update,delete,select on all tables and views
+#
+#  Modification History:
+#	08/31/06 M. Siatczynski Initial Script
+#	10/16/06 M. Siatczynski Updated comments
+#	04/13/11 M. Siatczynski Update profile for AMG East, update DBSPEC to accommodate single database
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname>|<dblist> -role <rolename> -perm <READ|FULL|RW>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBSPEC=$2;shift 2;;
+                        -role)  export ROLE=$2;shift 2;;
+                        -perm)  export PERM=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBSPEC" -o ! "$ROLE" -o ! "$PERM" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ "$PERM" != "FULL" -a "$PERM" != "READ" -a "$PERM" != "RW" ]
+then
+	echo "ERROR - perm must be FULL, READ, or RW"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SQLFILE=/tmp/sqlfile.$$
+export DBLIST=/tmp/dblist.$$
+export PERMFILE=$SQLDIR/$DBSERVER/$DBSERVER.$ROLE.sql
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLFILE && \rm -f $SQLFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------------
+# format list of databases
+# if a file is passed, make sure it's > 0 bytes
+# if it's not clearly a file, make sure it's not an invalid filename
+#------------------------------------------------------------------------------------
+# make sure control file exists and has entries
+if [ -f $DBSPEC ]
+then
+        if [ -s $DBSPEC ]
+        then
+                cat $DBSPEC > $DBLIST
+        else
+                echo "WARNING - $DBSPEC is 0 bytes" >> $LOGFILE
+                exit 1
+        fi
+else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+        echo $DBSPEC | grep '/' > /dev/null
+        if [ $? -eq 0 ]
+        then
+                echo "ERROR - $DBSPEC is not valid--possible invalid filename?"
+                exit 2
+        else
+                echo $DBSPEC > $DBLIST
+        fi
+fi
+
+#--------------------------------------------------------------------------
+# format sql
+#--------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	echo "use $DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "print \"use $DBNAME\"" >> $SQLFILE
+	echo "print \"go\"" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+# if full perms (insert, update, delete, select, execute)
+	if [ "$PERM" = "FULL" ]
+	then
+		echo "select \"grant insert,update,delete,select on \"+name+\" to $ROLE\" from sysobjects" >> $SQLFILE
+		echo "where type in ('U','V') and name not like 'rs[_]%' and name != 'repmon' order by name" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "print \"go\"" >> $SQLFILE
+		echo "go" >> $SQLFILE
+
+		echo "select \"grant execute on \"+name+\" to $ROLE\" from sysobjects" >> $SQLFILE
+		echo "where type = 'P' and name not like 'rs[_]%' and name not like 'SQR[_]%' order by name" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "print \"go\"" >> $SQLFILE
+		echo "go" >> $SQLFILE
+
+# else if read-write (insert, update, delete, select)
+	elif [ "$PERM" = "RW" ]
+	then
+		echo "select \"grant insert,update,delete,select on \"+name+\" to $ROLE\" from sysobjects" >> $SQLFILE
+		echo "where type in ('U','V') and name not like 'rs[_]%' and name != 'repmon' order by name" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "print \"go\"" >> $SQLFILE
+		echo "go" >> $SQLFILE
+
+# else assume read-only
+	else
+		echo "select \"grant select on \"+name+\" to $ROLE\" from sysobjects" >> $SQLFILE
+		echo "where type in ('U','V') and name not like 'rs[_]%' and name != 'repmon' order by name" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "print \"go\"" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	fi
+done
+
+#------------------------------------------------------------------------------
+# pipe in the sql
+#------------------------------------------------------------------------------
+> $PERMFILE
+
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password >> $PERMFILE
+
+#------------------------------------------------------------------------------
+# check for errors
+#------------------------------------------------------------------------------
+checkSqlErr $PERMFILE
+if [ $? -eq 1 ]
+then
+	echo "\nScript FAILED"
+	echo "SQL in $PERMFILE\n"
+	exit 1
+else
+	echo "\nScript SUCCESSFUL"
+	echo "SQL in $PERMFILE\n"
+	exit 0
+fi

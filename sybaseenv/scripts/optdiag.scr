@@ -1,0 +1,183 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: optdiag.scr -S <DBSERVER> -D <dbname> -T <table>|<list of tables> { -outdir <outdir> -outfile <filename> -dtstamp}
+#
+#  Description: run optdiag against one or more tables in a database
+#
+#  NOTE:  Output directory defaults to $LOGDIR/stats/DBSERVER
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - short description of parm if not obvious
+#              	<dbname> - database name
+#              	<T> - single table or list of tables
+#              	<outdir> - directory where optdiag files will be written to
+#              	<outfile> - specific file name - allows for rerun of job
+#              	<dtstamp> - add datetime stamp to output file
+#
+#  Modification History:
+#	05/28/08 M. Siatczynski	Original script
+#	06/03/08 M. Siatczynski	Echo OPTFILE after each table
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname> -T <table>|<list of tables> { -outdir <outdir> -outfile <filename> -dtstamp}"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -T)     export TABLESPEC=$2;shift 2;;
+                        -outdir)    export OUTDIR=$2;shift 2;;
+                        -outfile)   export OUTFILESPEC=$2;shift 2;;
+                        -dtstamp)    export DTSTAMP=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBNAME" -o ! "$TABLESPEC" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# NOTE:  SETDBSERVER must be set AFTER case statement and profile must be sourced AFTER case statement
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+# default output directory
+test ! "$OUTDIR" && export OUTDIR=$LOGDIR/stats/$DBSERVER
+
+# make sure the output directory exists -- this accomodates if specific dir was passed
+if [ ! -d $OUTDIR ]
+then
+	echo "ERROR - $OUTDIR is not a valid directory"
+	exit 1
+fi
+
+test ! "$DTSTAMP" && export DTSTAMP=0
+
+#--------------------------------------------------------------------------
+#  Initialize and validate Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/stats/$DBSERVER/$DBSERVER.$DBNAME.optdiag.$DATETIME
+export HIGHRC=0
+
+export TEMPOUT=/tmp/tempout.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export TABLELIST=/tmp/tablelist.$$
+
+# validate single table or list of tables
+if [ "$TABLESPEC" ]
+then
+# if the login spec is a file, validate the file contains something
+        if [ -f $TABLESPEC ]
+        then
+                if [ -s $TABLESPEC ]
+                then
+                        cat $TABLESPEC > $TABLELIST
+# if the tablelist is valid, verify a specific datfile name was not passed -- only valid with single table
+                        if [ "$OUTFILESPEC" ]
+			then
+                        	echo "ERROR - datfile name can only be specified when single table is passed"
+	                        exit 1
+			fi
+                else
+                        echo "ERROR - $TABLESPEC is 0 bytes"
+                        exit 1
+                fi
+        else
+# make sure the tablespec doesn't contain slashes--otherwise it may be an invalid file reference
+# if it doesn't contain slashes, then it's probably a login name
+                echo $TABLESPEC | grep '/' > /dev/null
+                if [ $? -eq 0 ]
+                then
+                        echo "ERROR - $TABLESPEC is not valid--possible invalid filename?"
+                        exit 1
+                else
+                        echo $TABLESPEC > $TABLELIST
+                fi
+        fi
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $TEMPOUT && \rm -f $TEMPOUT
+	test $PAGEMSG && \rm -f $PAGEMSG
+	test $TABLELIST && \rm -f $TABLELIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------------
+# run optdiag
+# check for errors
+#------------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Running optdiag for the following tables from $DBSERVER.$DBNAME:" >> $LOGFILE
+cat $TABLELIST >> $LOGFILE
+
+cat $TABLELIST |
+while read TABLE
+do
+	export TABLE
+	if [ "$OUTFILESPEC" ]
+	then
+		export OPTFILE=$OUTDIR/$OUTFILESPEC
+	else
+		if [ $DTSTAMP -eq 1 ]
+		then
+			export OPTFILE=$OUTDIR/$DBSERVER.$DBNAME.$TABLE.$DATETIME.opt
+		else
+			export OPTFILE=$OUTDIR/$DBSERVER.$DBNAME.$TABLE.opt
+		fi
+	fi
+
+	> $TEMPOUT
+	export OPTCHECK1=0
+	export OPTCHECK2=0
+	echo "\n`date` START optdiag TABLE:$TABLE" >> $LOGFILE
+
+	getPass $DBSERVER $ADMINLOGIN | $SYBASE/$SYBASE_ASE/bin/optdiag statistics ${DBNAME}..${TABLE} -o ${OPTFILE} -U $ADMINLOGIN -S $DBSERVER | grep -v Password: >> $TEMPOUT
+
+	cat $TEMPOUT >> $LOGFILE
+
+	checkOptdiagErr $OPTFILE
+	export OPTCHECK1=$?
+
+	checkOptdiagErr $TEMPOUT
+	export OPTCHECK2=$?
+
+	if [ $OPTCHECK1 -eq 1 -o $OPTCHECK2 -eq 1 ]
+	then
+		echo "`date` END optdiag FAILED for TABLE:$TABLE" >> $LOGFILE
+	        export HIGHRC=1
+	else
+		echo "`date` END optdiag SUCCESSFUL for TABLE:$TABLE" >> $LOGFILE
+		echo "optdiag file:  $OPTFILE"
+	fi
+done
+	
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+if [ $HIGHRC -ne 0 ]
+then
+	echo "\n`date` END optdiag COMPLETED with ERRORS" >> $LOGFILE
+	exit 1
+else
+	echo "\n`date` END optdiag COMPLETED SUCCESSFULLY" >> $LOGFILE
+	exit 0
+fi

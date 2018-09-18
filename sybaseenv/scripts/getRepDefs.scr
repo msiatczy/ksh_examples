@@ -1,0 +1,88 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getRepDefs.scr -RS <REPSERVER> -RSASE <RSSD DBSERVER> -RSSD <RSSD> {-quiet}
+#
+#  Description: Get list of all replication definitions
+#		Use quiet mode for batch execution.
+#
+#     Location:	/sccm/dba/sybase/scripts/getRepDefs.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<REPSERVER> - repserver
+#		<RSSD DBSERVER> - Database server name
+#		<RSSD> - RSSD
+#
+#
+#  Modification History:
+#	07/29/05 M. Siatczynski	Initial Script
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -RS <REPSERVER> -RSASE <RSSD DBSERVER> -RSSD <RSSD> {-quiet}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -RS)		export REPSERVER=$2;shift 2;;
+	                -RSASE)		export DBSERVER=$2;shift 2;;
+	                -RSSD)		export RSSD=$2;shift 2;;
+	                -quiet)		export QUIET=1;shift 1;;
+	                -*)		echo $USAGE;exit 1;;
+	                *)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$REPSERVER" -o ! "$DBSERVER" -o ! "$RSSD" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$QUIET" && export QUIET=0
+
+# generate output file
+export OUTFILE=$RPTDIR/replication/repDefs/$REPSERVER/$REPSERVER.$RSSD.repDefs.$DATETIME
+
+#-----------------------------------------------------------------------
+# Run the SQL
+# If generating a control file, remove leading space and convert multiple spaces to single space
+#-----------------------------------------------------------------------
+> $OUTFILE
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e <<-! | grep -v Password >> $OUTFILE
+	`getPass $DBSERVER $ADMINLOGIN`
+	use $RSSD
+	go
+	rs_helprep
+	go
+	rcl_repdefs
+	go
+	!
+
+checkSqlErr $OUTFILE
+if [ $? -ne 0 ]
+then
+        echo "\nGeneration of $OUTFILE FAILED"
+        echo "Review errors in $OUTFILE\n"
+        exit 1
+else
+	test $QUIET -eq 0 && echo "\nOutput file created: $OUTFILE\n"
+fi
+
+#-----------------------------------------------------------------------
+# Exit with 0
+#-----------------------------------------------------------------------
+exit 0

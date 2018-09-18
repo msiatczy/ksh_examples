@@ -1,0 +1,158 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: updSqlbtThresh.scr -S <DBSERVER> -D <dbname> -pct <thresh pct>
+#
+#  Description: Modify SQLBT threshold to x pct
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#              	<DBNAME> - database name
+#              	<PCT> - percent of log space at which to add the threshold
+#
+#  Modification History:
+#	06/08/04 M. Siatczynski	Initial Script
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname> -pct <thresh pct>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -pct)   export PCT=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBNAME" -o ! "$PCT" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SQLOUT=/tmp/sqlout.$$
+export LOGFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.$DBNAME.updSqlbtThresh.$DATETIME
+
+> $LOGFILE
+date >> $LOGFILE
+echo "Modifying SQLBT threshold for $DBSERVER:$DBNAME to $PCT %" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#---------------------------------------------------------------------------------------
+# Get free pages for current sqlbt threshold
+# If there is more than one sqlbt threshold, then threshold needs to be updated manually
+#---------------------------------------------------------------------------------------
+> $SQLOUT
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password | sed -e 's/  *//g' >> $SQLOUT
+`getPass $DBSERVER $ADMINLOGIN`
+set nocount on
+go
+use $DBNAME
+go
+if (select count(*) from $DBNAME..systhresholds where proc_name = 'sp_threshold_sqlbt') = 0
+print "0"
+else
+select free_space from $DBNAME..systhresholds where proc_name = 'sp_threshold_sqlbt'
+go
+!
+
+checkSqlErr $SQLOUT
+if [ $? -eq 0 ]
+then
+	if [ `cat $SQLOUT | wc -l` -gt 1 ]
+	then
+		echo "ERROR - more than one SQLBT threshold exists for $DBSERVER:$DBNAME" | tee -a $LOGFILE
+		echo "SQLBT threshold should be updated manually" | tee -a $LOGFILE
+		exit 1
+	fi
+	export FREEPGS=`cat $SQLOUT`
+	if [ $FREEPGS -eq 0 ]
+	then
+		echo "ERROR - No SQLBT threshold exists for $DBSERVER:$DBNAME" | tee -a $LOGFILE
+		exit 1
+	fi
+else
+	echo "ERROR - getting free pages for current SQLBT threshold for $DBSERVER:$DBNAME" | tee -a $LOGFILE
+	cat $SQLOUT >> $LOGFILE
+	exit 1
+fi
+
+#---------------------------------------------------------------------------------------
+# Calculate new free pages based on current log size and pct
+#---------------------------------------------------------------------------------------
+> $SQLOUT
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password | sed -e 's/  *//g' >> $SQLOUT
+`getPass $DBSERVER $ADMINLOGIN`
+set nocount on
+go
+select convert(int,((sum(size))*.${PCT}))
+from master..sysusages
+where dbid = db_id("$DBNAME") and segmap = 4 group by dbid
+go
+!
+
+checkSqlErr $SQLOUT
+if [ $? -eq 0 ]
+then
+	export NEWFREEPGS=`cat $SQLOUT`
+else
+	echo "ERROR - calculating new free pages for SQLBT threshold for $DBSERVER:$DBNAME" | tee -a $LOGFILE
+	cat $SQLOUT >> $LOGFILE
+	exit 1
+fi
+
+#---------------------------------------------------------------------------------------
+# modify the threshold
+# check for errors
+# exit
+#---------------------------------------------------------------------------------------
+> $SQLOUT
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e <<-! | grep -v Password >> $SQLOUT
+`getPass $DBSERVER $ADMINLOGIN`
+use $DBNAME
+go
+sp_modifythreshold $DBNAME,logsegment,$FREEPGS,sp_threshold_sqlbt,$NEWFREEPGS
+go
+!
+
+checkSqlErr $SQLOUT
+if [ $? -ne 0 ]
+then
+	cat $SQLOUT >> $LOGFILE
+	echo "Modification of threshold $DBSERVER:$DBNAME FAILED" | tee -a $LOGFILE
+	exit 1
+else
+	cat $SQLOUT >> $LOGFILE
+	echo "Modification of threshold for $DBSERVER:$DBNAME SUCCESSFUL" >> $LOGFILE
+	exit 0
+fi

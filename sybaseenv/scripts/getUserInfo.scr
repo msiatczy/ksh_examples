@@ -1,0 +1,437 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getUserInfo.scr -S <DBSERVER> {-D <dbname>|<DB list> -N <num days to keep>}
+#
+#  Description: Generate DDL for database users, groups, aliases and permissions.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER>
+#              	<DBSPEC> - single database or list of databases
+#              	<NDAYS> - number of DAYS of files to keep, default is 7
+#
+#  Modification History:
+#	05/25/04 M. Siatczynski	Initial Script
+#				(Consolidated-previously in 4 scripts)
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	09/21/06 M. Siatczynski	Update code to pull perms for groups and roles in addition to users
+#	09/26/06 M. Siatczynski	Add code to detect additional system permissions
+#	02/15/07 M. Siatczynski	Allow -D parm to be a list of databases
+#				Remove DBNAME from LOGFILE name, append pid ($$) to LOGFILE name
+#	05/09/07 M. Siatczynski	Ignore offline databases (status2=16)
+#	09/17/07 M. Siatczynski	Change format of sp_adduser - s/b login,user...not user,login
+#	12/26/07 M. Siatczynski	Change exits:  exit 1 = WARNING; exit 2 = ERROR
+#	05/28/09 M. Siatczynski	Ignore databases created for load (status=32)
+#	05/29/09 M. Siatczynski	Updated to use getDbList function
+#	08/17/09 M. Siatczynski	Echo WARNING messages to LOG ONLY, not to console (to avoid stdout msgs when run from Autosys)
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>|<DB list> -N <num days to keep>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 2
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBSPEC=$2;shift 2;;
+                        -N)     export NDAYS=$2;shift 2;;
+                        -*)     echo $USAGE;exit 2;;
+                        *)      echo $USAGE;exit 2;;
+                esac
+        done
+fi
+
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 2
+fi
+
+test ! "$NDAYS" && export NDAYS=7
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/dblist.$$
+export USERSQLOUT=/tmp/usersqlout.$$
+export GROUPSQLOUT=/tmp/groupsqlout.$$
+export PERMSQLOUT=/tmp/permsqlout.$$
+export PERMREFOUT=/tmp/permrefout.$$
+export HIGHRC=0
+
+export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.userInfo.$DATETIME.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $USERSQLOUT && \rm -f $USERSQLOUT
+	test -f $GROUPSQLOUT && \rm -f $GROUPSQLOUT
+	test -f $PERMSQLOUT && \rm -f $PERMSQLOUT
+	test -f $PERMREFOUT && \rm -f $PERMREFOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Define function to delete old files
+# If any generation cannot be copied of moved, exit the script with non-0 RC.
+#--------------------------------------------------------------------------
+function removeOldFiles {
+export FILE=$1
+
+DIRPATH=`dirname $FILE`
+FILENAME=`basename $FILE`
+
+find $DIRPATH -name "$FILENAME.*" -mtime +$NDAYS -exec \rm {} \;
+
+}
+
+#------------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` $DBSERVER: BEGIN Get user info/permissions" >> $LOGFILE
+
+#------------------------------------------------------------------------------------
+# format list of databases
+# if a file is passed, make sure it's > 0 bytes
+# if it's not clearly a file, make sure it's not an invalid filename
+#------------------------------------------------------------------------------------
+if [ "$DBSPEC" ]
+then
+# make sure control file exists and has entries
+	if [ -f $DBSPEC ]
+	then
+		if [ -s $DBSPEC ]
+		then
+			cat $DBSPEC > $DBLIST
+		else
+			echo "WARNING - $DBSPEC is 0 bytes" >> $LOGFILE
+			exit 1
+		fi
+	else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+		echo $DBSPEC | grep '/' > /dev/null
+		if [ $? -eq 0 ]
+		then
+			echo "ERROR - $DBSPEC is not valid--possible invalid filename?"
+			exit 2
+		else
+			echo $DBSPEC > $DBLIST
+		fi
+	fi
+else
+	getDbList -S $DBSERVER -user -system > $DBLIST
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - getting list of databases from $DBSERVER" | tee -a $LOGFILE
+		cat $DBLIST | tee -a $LOGFILE
+		exit 2
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# START OF MAIN LOOP
+# Create DBSERVER and DBNAME subdirectories if they don't exist
+#------------------------------------------------------------------------------
+echo "`date` Getting users/perms for the following databases:" >> $LOGFILE
+cat $DBLIST >> $LOGFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+
+	test ! -d $SQLDIR/useradmin/$DBSERVER && mkdir $SQLDIR/useradmin/$DBSERVER
+	test ! -d $SQLDIR/useradmin/$DBSERVER/$DBNAME && mkdir $SQLDIR/useradmin/$DBSERVER/$DBNAME
+
+	export USERSQL=$SQLDIR/useradmin/$DBSERVER/$DBNAME/$DBSERVER.$DBNAME.user.sql
+	export GROUPSQL=$SQLDIR/useradmin/$DBSERVER/$DBNAME/$DBSERVER.$DBNAME.group.sql
+	export PERMSQL=$SQLDIR/useradmin/$DBSERVER/$DBNAME/$DBSERVER.$DBNAME.allperm.sql
+
+	export PERMREF=$SQLDIR/useradmin/$DBSERVER/$DBNAME/$DBSERVER.$DBNAME.allperm.ref
+
+#------------------------------------------------------------------------------
+# Get groups
+# (This code was taken from the sp_helpgroup system stored proc.)
+#------------------------------------------------------------------------------
+	echo "`date` - $DBSERVER:$DBNAME Getting group DDL" >> $LOGFILE
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $GROUPSQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	use $DBNAME
+	go
+
+	select "exec sp_addgroup "+name+convert(char(1),0xa)+"go" from $DBNAME..sysusers G
+	where G.uid between @@mingroupid and @@maxgroupid
+	and not exists (select * from $DBNAME..sysroles R where G.uid = R.lrid)
+	order by name
+	go
+	!
+
+#------------------------------------------------------------------------------
+# Check for errors related to groups
+# Remove old files only if new code was generated successfully
+# Create the base SQL file and duplicate as a datetime stamped copy
+#------------------------------------------------------------------------------
+	checkSqlErr $GROUPSQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "ERROR - getting group info for $DBSERVER:$DBNAME" | tee -a $LOGFILE
+		cat $GROUPSQLOUT | tee -a $LOGFILE
+	else
+		removeOldFiles $GROUPSQL
+		> $GROUPSQL
+		echo "-- GROUP DDL generated for $DBSERVER:$DBNAME `date`" >> $GROUPSQL
+		echo "use $DBNAME" >> $GROUPSQL
+		echo "go" >> $GROUPSQL
+		cat $GROUPSQLOUT >> $GROUPSQL
+		cp -p $GROUPSQL $GROUPSQL.$DATETIME
+	fi
+
+#------------------------------------------------------------------------------
+# Get users (check for guest user with separate query)
+# (This code was taken from the sp_helpuser system stored proc.)
+# Get aliases
+# (Code is custom -- not based on a system stored proc.)
+#------------------------------------------------------------------------------
+	echo "`date` - $DBSERVER:$DBNAME Getting user/alias DDL" >> $LOGFILE
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $USERSQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	use $DBNAME
+	go
+
+	select "exec sp_adduser "+m.name+","+u.name+","+g.name+convert(char(1),0xa)+"go"
+	from $DBNAME..sysusers u, $DBNAME..sysusers g, master.dbo.syslogins m
+	where u.suid *= m.suid
+	and u.gid *= g.uid
+	and ((u.uid < @@mingroupid and u.uid != 0 and u.name not in ('dbo','guest'))
+	or (u.uid > @@maxgroupid))
+	order by u.name
+	go
+	select "exec sp_adduser "+name+convert(char(1),0xa)+"go" from $DBNAME..sysusers where name = 'guest'
+	go
+
+	select "exec sp_addalias "+suser_name(a.suid)+","+u.name+convert(char(1),0xa)+"go" from $DBNAME..sysalternates a, $DBNAME..sysusers u where a.altsuid = u.suid
+	go
+	!
+
+#------------------------------------------------------------------------------
+# Check for errors related to users/aliases
+# Remove old files only if new code was generated successfully
+# Create the base SQL file and duplicate as a datetime stamped copy
+# Use sed to put double quotes around "public" groups (syntax)
+#------------------------------------------------------------------------------
+	checkSqlErr $USERSQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "ERROR - getting user/alias info for $DBSERVER:$DBNAME" | tee -a $LOGFILE
+		cat $USERSQLOUT | tee -a $LOGFILE
+	else
+		removeOldFiles $USERSQL
+		> $USERSQL
+		echo "-- USER/ALIAS DDL generated for $DBSERVER:$DBNAME `date`" >> $USERSQL
+		echo "use $DBNAME" >> $USERSQL
+		echo "go" >> $USERSQL
+		sed -e 's/,public$/,"public"/g' $USERSQLOUT >> $USERSQL
+		cp -p $USERSQL $USERSQL.$DATETIME
+	fi
+
+#------------------------------------------------------------------------------
+# Get system and object permissions granted directly to users.
+# This code is needed when resyncing users.
+# Code base was taking from a SQL trace done with DBArtisan.
+# Group permissions are not needed, as they are included with a database restore.
+#------------------------------------------------------------------------------
+	echo "`date` - $DBSERVER:$DBNAME Getting all permissions" >> $LOGFILE
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $PERMSQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	use $DBNAME
+	go
+
+-- system permissions
+	select
+	case
+		when protecttype = 1
+		then "grant "
+		when protecttype = 2
+		then "revoke "
+	end+
+	upper(A.name)+
+	case
+		when protecttype = 1
+		then " to "
+		when protecttype = 2
+		then " from "
+	end+
+	user_name(P.uid)+
+	convert(char(1),0xa)+"go"
+	from
+	sysprotects P,
+	master.dbo.spt_values A
+	where
+	-- the next line gets only users, not groups or roles
+--	((P.uid < @@mingroupid and P.uid != 0) or (P.uid > @@maxgroupid))
+--198=Create Table
+--203=Create Database
+--207=Create View
+--221=Create Trigger
+--222=Create Procedure
+--228=Dump Database
+--233=Create Default
+--235=Dump Transaction
+--236=Create Rule
+--253=Connect
+--317=DBCC
+	P.action IN (198,203,207,221,222,228,233,235,236,253,317)
+	and A.type='T'
+	and A.number=P.action
+	--order by protecttype to get grants first and then revokes
+	order by P.protecttype
+	go
+
+-- object permissions
+	select distinct
+	case
+		when P.protecttype = 1
+		then "grant "
+		when P.protecttype = 2
+		then "revoke "
+	end+
+	upper(A.name)+
+	" on "+
+	O.name+
+	case
+		when col_name(P.id,C.number) is not NULL
+		then "("+col_name(P.id,C.number)+") "
+		when col_name(P.id,C.number) is NULL
+		then " "
+	end+
+	case
+		when P.protecttype = 1
+		then "to "
+		when P.protecttype = 2
+		then "from "
+	end+
+	user_name(P.uid)+
+	convert(char(1),0xa)+"go"
+	from
+	sysprotects P,
+	sysobjects O,
+	master.dbo.spt_values A,
+	master.dbo.spt_values C
+	where
+	-- the next line gets only users, not groups and roles
+--	((P.uid < @@mingroupid and P.uid != 0) or (P.uid > @@maxgroupid))
+	convert(tinyint,substring(isnull(P.columns,0x1),C.low,1))&C.high!=0
+	and C.type = 'P'
+	and C.number<=255
+	and A.type='T'
+	and A.number=P.action
+	and O.id=P.id
+	--order by protecttype to get grants first and then revokes
+	order by P.protecttype,O.id,P.uid
+	go
+	!
+
+#------------------------------------------------------------------------------
+# Check for errors related to users/aliases
+# Remove old files only if new code was generated successfully
+# Create the base SQL file and duplicate as a datetime stamped copy
+# Compress the dated file.  The undated file is the one used by syncUsers.scr.
+#------------------------------------------------------------------------------
+	checkSqlErr $PERMSQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "ERROR - getting user/alias info for $DBSERVER:$DBNAME" | tee -a $LOGFILE
+		cat $PERMSQLOUT | tee -a $LOGFILE
+	else
+		removeOldFiles $PERMSQL
+		> $PERMSQL
+		echo "-- USER PERMISSION DDL generated for $DBSERVER:$DBNAME `date`" >> $PERMSQL
+		echo "-- NOTE:  Group perms are not included in this SQL file" >> $PERMSQL
+		echo "-- See $PERMREF to reference all permissions" >> $PERMSQL
+		echo "use $DBNAME" >> $PERMSQL
+		echo "go" >> $PERMSQL
+		cat $PERMSQLOUT >> $PERMSQL
+		cp -p $PERMSQL $PERMSQL.$DATETIME
+		compress -f $PERMSQL.$DATETIME
+	fi
+
+#------------------------------------------------------------------------------
+# Get all permissions granted/revoked (for reference only)
+#------------------------------------------------------------------------------
+	echo "`date` - $DBSERVER:$DBNAME Executing sp_helprotect (for reference)" >> $LOGFILE
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 <<-! | grep -v Password > $PERMREFOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	use $DBNAME
+	go
+	sp_helprotect
+	go
+	!
+
+#------------------------------------------------------------------------------
+# Check for errors getting all perms
+# Remove old files only if new code was generated successfully
+# Create the base SQL file and compress it to conserve space
+# Duplicate the compressed base file as a datetime stamped copy
+#------------------------------------------------------------------------------
+	checkSqlErr $PERMREFOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "ERROR - getting all permissions for $DBSERVER:$DBNAME" | tee -a $LOGFILE
+		cat $PERMREFOUT | tee -a $LOGFILE
+	else
+		removeOldFiles $PERMREF
+		> $PERMREF
+		echo "-- Reference file of all permissisions for $DBSERVER:$DBNAME `date`" >> $PERMREF
+		cat $PERMREFOUT >> $PERMREF
+		compress -f $PERMREF
+		cp -p $PERMREF.Z $PERMREF.Z.$DATETIME
+	fi
+
+#------------------------------------------------------------------------------
+# END OF MAIN LOOP
+#------------------------------------------------------------------------------
+done
+
+#------------------------------------------------------------------------------
+# Write log trailer
+#------------------------------------------------------------------------------
+echo "`date` $DBSERVER: COMPLETE Get user info/permissions" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Exit with final return code based on HIGHRC
+#------------------------------------------------------------------------------
+if [ $HIGHRC -ne 0 ]
+then
+	echo "ERROR - getting user DDL for $DBSERVER" | tee -a $LOGFILE
+	exit 2
+else
+	exit 0
+fi

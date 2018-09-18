@@ -1,0 +1,118 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sqlbtCustomizeLicense.scr -all | -S <DBSERVER>
+#
+#  Description: Run dtsinstall customize for one or all ASEs on a host
+#		This script is used following distribution of a new license key
+#		to customize programs with the new license information.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	07/24/08 M. Siatczynski New script (copy of sqlbtAdminPassword.scr)
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -all | -S <DBSERVER>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -all)   export ALL=1;shift 1;;
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$ALL" && export ALL=0
+
+# can't pass both -all and -S
+if [ "$ONEDBSERVER" -a $ALL -eq 1 ]
+then
+        echo $USAGE
+        echo "ERROR - -all and single dbserver are mutually exclusive"
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SERVICENAMES=/tmp/servicenames.$$
+export ASELIST=/tmp/aselist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SERVICENAMES && \rm -f $SERVICENAMES
+	test -f $ASELIST && \rm -f $ASELIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Format list of ASEs
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" ]
+then
+	echo $ONEDBSERVER > $ASELIST
+else
+# get list of service names available on this host
+# reformat the list of servicenames so exact matches are found (put a space before and after)
+	> $SERVICENAMES
+	/sccm/software/bin/get_service_name |
+	while read SN
+	do
+		echo " $SN " >> $SERVICENAMES
+	done
+	echo " $HOST " >> $SERVICENAMES
+
+# from the service name list, get list of Sybase ASEs
+	if [ -s $SERVICENAMES ]
+	then
+		egrep -f $SERVICENAMES $ASEDIRLIST | cut -d" " -f1 > $ASELIST
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  For each ASE on this host...
+#  Run dtsinstall customize for each ASE
+#--------------------------------------------------------------------------
+if [ -s $ASELIST ]
+then
+	for DBSERVER in `cat $ASELIST`
+	do
+		export SETDBSERVER=$DBSERVER
+# re-source profile to set environment for ASE
+		. /sccm/dba/sybase/.dbaSybProfile
+
+		echo "\n\n\n$DBSERVER - Running dtsinstall customize...\n"
+
+		$DT_SBACKTRACK_HOME/install/dtsinstall customize
+	done
+else
+	echo "INFO:  There are no ASEs on `hostname`"
+fi
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+exit 0

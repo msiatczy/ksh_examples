@@ -1,0 +1,75 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getFundsUsage.scr -S <DBSERVER>
+#
+#  Description: Get disk usage for cif, cifhist, docproc, and docproc2
+#
+#     Location:	/sccm/dba/sybase/scripts/getFundsUsage.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:
+#
+#  Modification History:
+#	01/21/03 M. Siatczynski	Initial Script
+#	08/03/04 M. Siatczynski	Centralized script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+#export DBUSAGE=/tmp/dbusage.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+#function tempCleanup {
+#	test -f $DBUSAGE && \rm -f $DBUSAGE
+#}
+#
+#trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Get total usage on the server
+#------------------------------------------------------------------------------
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password
+`getPass $DBSERVER $ADMINLOGIN`
+set nocount on
+go
+declare @total int
+declare @dbusage int
+declare @pct money
+select @total=(sum(size)/512)/1000 from master..sysusages
+select @dbusage=(sum(size)/512)/1000 from master..sysusages where db_name(dbid) in ('cif','cifhist','docproc2','docproc')
+select @pct=(convert(numeric(8,2),@dbusage)/convert(numeric(8,2),@total))*100.00
+/* print "%1! %2! %3!",@total,@dbusage,@pct */
+print "DBServer = $DBSERVER"
+print "Total Gb = %1!",@total
+print "Funds DB Usage = %1! Gb",@dbusage
+print "Funds Pct/Total = %1!%%",@pct
+go
+!

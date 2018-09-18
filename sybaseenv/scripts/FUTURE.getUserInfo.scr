@@ -1,0 +1,229 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getUserInfo.scr -S <DBSERVER> {-D <dbname> -N <num days to keep>}
+#
+#  Description: Generate DDL for database users, groups, aliases and permissions.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER>
+#              	<DBNAME>
+#              	<NDAYS> - number of copies of file to keep, default is 7
+#
+#  NOTE:  This script executes ddlgen and MUST be run on the host where the
+# 		DBSERVER is currently active.
+#
+#  Modification History:
+#	04/16/04 M. Siatczynski	Initial Script
+#	06/20/06 M. Siatczynski	New location for ddlgen
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname> -N <num days to keep>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -N)     export NDAYS=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$NDAYS" && export NDAYS=7
+
+#--------------------------------------------------------------------------
+# Source the profile AFTER setting SETDBSERVER--Necessary in order to find path to ddlgen
+#--------------------------------------------------------------------------
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/dblist.$$
+export TEMPSQL=/tmp/tempsql.$$
+export SQLOUT=/tmp/sqlout.$$
+export DDLLOG=/tmp/ddllog.$$
+export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.$DBNAME.userInfo.$DATETIME
+
+> $LOGFILE
+echo "`date` - generating user ddl for $DBSERVER" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $TEMPSQL && \rm -f $TEMPSQL
+	test -f $SQLOUT && \rm -f $SQLOUT
+	test -f $DDLLOG && \rm -f $DDLLOG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Define function to delete old files
+# If any generation cannot be copied of moved, exit the script with non-0 RC.
+#--------------------------------------------------------------------------
+function removeOldFiles {
+export FILE=$1
+
+DIRPATH=`dirname $FILE`
+FILENAME=`basename $FILE`
+
+#find $DIRPATH -name "$FILENAME.*" -mtime +$NDAYS -exec \rm {} \;
+find $DIRPATH -name "$FILENAME.*" -mtime +$NDAYS -exec ls -l {} \;
+
+}
+
+#--------------------------------------------------------------------------
+# Get the service name and port for this dbserver - needed for ddlgen
+# Verify the service name is active on this host--script MUST run on service name host
+#--------------------------------------------------------------------------
+export SN=`grep "^$DBSERVER " $ASEDIRLIST | cut -d" " -f2`
+export PORT=`grep "^$DBSERVER " ASEDIRLIST | cut -d" " -f8`
+
+/sccm/software/bin/get_service_name | grep "$SN" > /dev/null
+if [ $? -ne 0 ]
+then
+	echo "\nERROR - This script MUST run on current host for $SN" | tee -a $LOGFILE
+	echo "$SN is not active on this host (`hostname`)" | tee -a $LOGFILE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# Create a working dblist - exclude tempdbs
+# Check for errors
+#--------------------------------------------------------------------------
+if [ "$DBNAME" ]
+then
+	echo $DBNAME > $DBLIST
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases where name not like 'tempdb%' order by name
+	go
+	!
+fi
+checkSqlErr $DBLIST
+if [ $? -eq 1 ]
+then
+	echo $USAGE | tee -a $LOGFILE
+	echo "ERROR - getting list of databases from $DBSERVER" | tee -a $LOGFILE
+	cat $DBLIST | tee -a $LOGFILE
+	exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Set the main return code for the whole ddlgen process (checked at end of script)
+#------------------------------------------------------------------------------
+export DDLRC=0
+
+#------------------------------------------------------------------------------
+# Run ddlgen (twice)
+# Create DBSERVER and DBNAME subdirectories if they don't exist
+# First ddlgen run:  get user, alias and any perms granted directly to users 
+# Second ddlgen run:  get groups and any perms granted to groups
+# ddlgen only appears to exit with 0, so difficult to check for errors
+# NOTE:  ddlgen does not pick up guest user
+# If the guest user is present in the database, tack it onto the USERSQL file
+#------------------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	echo "`date` - Generating USR DDL for $DBSERVER:$DBNAME" >> $LOGFILE
+
+	test ! -d $SQLDIR/useradmin/$DBSERVER && mkdir $SQLDIR/useradmin/$DBSERVER
+	test ! -d $SQLDIR/useradmin/$DBSERVER/$DBNAME && mkdir $SQLDIR/useradmin/$DBSERVER/$DBNAME
+
+	export USERSQL=$SQLDIR/useradmin/$DBSERVER/$DBNAME/$DBSERVER.$DBNAME.user.sql
+	export GROUPSQL=$SQLDIR/useradmin/$DBSERVER/$DBNAME/$DBSERVER.$DBNAME.group.sql
+
+	removeOldFiles $USERSQL
+	> $USERSQL
+	> $DDLLOG
+	$SYBASE/ASEP/bin/ddlgen -U$ADMINLOGIN -S$SN:$PORT -TUSR -D$DBNAME -N% -P`getPass $DBSERVER $ADMINLOGIN` -O$USERSQL > $DDLLOG
+	egrep -i '(error|unable)' $DDLLOG > /dev/null
+#	if [ $? -eq 0 -o ! -s $USERSQL ]
+	if [ $? -eq 0 ]
+	then
+		export DDLRC=1
+		echo "ERROR - ddlgen -TUSR unsuccessful for $DBNAME - errors follow" | tee -a $LOGFILE
+		cat $DDLLOG | tee -a $LOGFILE
+	else
+# check for guest user
+		$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $SQLOUT
+		`getPass $DBSERVER $ADMINLOGIN`
+		set nocount on
+		go
+		use $DBNAME
+		go
+		if exists (select * from $DBNAME..sysusers where name = 'guest')
+		begin
+			print "exec sp_adduser guest"
+			print "go"
+		end
+		go
+		!
+	
+		checkSqlErr $SQLOUT
+		if [ $? -eq 1 ]
+		then
+			echo "ERROR - checking guest user for $DBSERVER:$DBNAME" | tee -a $LOGFILE
+			cat $SQLOUT | tee -a $LOGFILE
+		else
+			cat $SQLOUT >> $USERSQL
+		fi
+
+		cp -p $USERSQL $USERSQL.$DATETIME
+	fi
+
+	removeOldFiles $GROUPSQL
+	> $GROUPSQL
+	> $DDLLOG
+	$SYBASE/ASEP/bin/ddlgen -U$ADMINLOGIN -S$SN:$PORT -TGRP -D$DBNAME -N% -P`getPass $DBSERVER $ADMINLOGIN` -O$GROUPSQL > $DDLLOG
+	egrep -i '(error|unable)' $DDLLOG > /dev/null
+#	if [ $? -eq 0 -o ! -s $GROUPSQL ]
+	if [ $? -eq 0 ]
+	then
+		export DDLRC=1
+		echo "ERROR - ddlgen -TGRP unsuccessful for $DBNAME - errors follow" | tee -a $LOGFILE
+		cat $DDLLOG | tee -a $LOGFILE
+	else
+		cp -p $GROUPSQL $GROUPSQL.$DATETIME
+	fi
+
+
+done
+
+#------------------------------------------------------------------------------
+# Write log trailer and exit with final return code based on ddlgen status
+#------------------------------------------------------------------------------
+echo "`date` User DDL COMPLETE" >> $LOGFILE
+test $DDLRC -eq 1 && exit 1 || exit 0

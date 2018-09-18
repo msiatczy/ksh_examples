@@ -1,0 +1,162 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: setPasswdExpr.scr -U <user> -login <login>|-L <login list> -S <DBSERVER> {-days <n days>}
+#
+#  Description: Set password expiration for one or more logins. (default=60)
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<user> - login of the user running the add
+#		<login> - login
+#		<days> - number of days
+#
+#
+#  Modification History:
+#	05/17/10 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -U <user> -login <login>|-L <login list> -S <DBSERVER> {-days <n days>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-U)		export EXEUSER=$2;shift 2;;
+			-login)		export ONELOGIN=$2;shift 2;;
+			-L)		export INPUTLIST=$2;shift 2;;
+			-S)		export DBSERVER=$2;shift 2;;
+			-days)		export NDAYS=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# user and login must be passed
+if [ ! "$EXEUSER" -o ! "$DBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# either login name or list must be passed
+if [ ! "$ONELOGIN" -a ! "$INPUTLIST" ]
+then
+        echo $USAGE
+        echo "ERROR - login name or list of logins MUST be passed"
+        exit 1
+fi
+
+# default NDAYS to 60
+test ! "$NDAYS" && export NDAYS=60
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.setPasswdExpr.$DATETIME
+export SQLFILE=/tmp/loginsql.$$
+export SQLOUT=/tmp/sqlout.$$
+export LOGINLIST=/tmp/loginlist.$$
+export HIGHRC=0
+
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $LOGINLIST && \rm -f $LOGINLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create a working login list
+#------------------------------------------------------------------------------
+if [ "$INPUTLIST" ]
+then
+        if [ ! -s $INPUTLIST ]
+        then
+                echo "ERROR - $INPUTLIST does not exist or is 0 bytes"
+                exit 1
+        else
+                cat $INPUTLIST > $LOGINLIST
+        fi
+else
+        echo $ONELOGIN > $LOGINLIST
+fi
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Set passwd expiration" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Format sql for each login in the list
+#------------------------------------------------------------------------------
+> $SQLFILE
+
+echo "use master" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $LOGINLIST |
+while read LOGIN
+do
+	export LOGIN
+	echo "print \"Setting  passwd expiration to $NDAYS for $LOGIN on %1!...\",@@servername" >> $SQLFILE
+	echo "execute sp_modifylogin $LOGIN,\"passwd expiration\",\"$NDAYS\"" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#------------------------------------------------------------------------------
+# run the sql
+#------------------------------------------------------------------------------
+echo "`date` Setting password expiration to $NDAYS on $DBSERVER for the following logins:" >> $LOGFILE
+cat $LOGINLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+getPass $DBSERVER $EXEUSER | $ISQLEXE -U$EXEUSER -S$DBSERVER -w200 -i $SQLFILE > $SQLOUT
+
+cat $SQLOUT >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Check for errors
+#------------------------------------------------------------------------------
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	export HIGHRC=1
+	echo "`date` Passwd expiration config FAILED for $DBSERVER" >> $LOGFILE
+else
+	echo "`date` Passwd expiration config SUCCESSFUL for $DBSERVER" >> $LOGFILE
+fi
+
+echo "`date` END Set passwd expiration" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+        echo "\nPasswd expiration config FAILED - output in $LOGFILE"
+	echo "\nREMINDER:  THIS SCRIPT MUST BE EXECUTED AGAINST ALL ASES IN A REPLICATED ENVIRONMENT.\n"
+        exit 1
+else
+	echo "\nPasswd expiration config SUCCESSFUL"
+	echo "\nREMINDER:  THIS SCRIPT MUST BE EXECUTED AGAINST ALL ASES IN A REPLICATED ENVIRONMENT.\n"
+        exit 0
+fi

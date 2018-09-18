@@ -1,0 +1,202 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: fmtRsinit.scr -L <control list> -RS <repserver> | -PDS <primary DBSERVER> -RDS <replicate DBSERVER> -D <dbname> -RS <repserver>
+#
+#  Description: Format rs_init resource files for active and standby definitions
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<control list> - input list of databases to be replicated
+#              	<primary DBSERVER> - primary database server
+#              	<replicate DBSERVER> - replicate database server
+#              	<dbname> - database to be replicated
+#              	<repserver> - replication server
+#
+#   NOTE:  -L <control list> and other parameters are mutually exclusive.
+#
+#  Modification History:
+#	02/10/03 M. Siatczynski	Initial Script
+#	08/03/04 M. Siatczynski	Centralized script
+#	03/11/05 M. Siatczynski	Chmod resource files for access by owner (sybase) only
+#	10/13/06 M. Siatczynski	Decrypt sa password using getPass
+#	12/01/06 M. Siatczynski	Replace sa with ADMINLOGIN, get SYBASEDIR from REPDIRLIST, prompt for maint user password
+#	01/24/06 M. Siatczynski	New logical DS name
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+#  Initialize Parameters
+#--------------------------------------------------------------------------
+export USAGE="\nERROR - Usage: $0 -L <control list> -RS <repserver> | -PDS <from DBSERVER> -RDS <to DBSERVER> -D <dbname> -RS <repserver>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -L)     export LISTFILE=$2;shift 2;;
+                        -PDS)   export PDS=$2;shift 2;;
+                        -RDS)   export RDS=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -RS)    export REPSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+export TEMPLATE_ACTIVE=$CTLDIR/replication/template.active.rs
+export TEMPLATE_STANDBY=$CTLDIR/replication/template.standby.rs
+export TEMPFILE=/tmp/tempfile.$$
+export SEDFILE=/tmp/sedfile.$$
+export TEMPSED=/tmp/tempsed.$$
+
+# save the original stty settings
+export STTY_ORIG=`stty -g`
+
+#--------------------------------------------------------------------------
+#  Verify Parameters
+#--------------------------------------------------------------------------
+if [ "$LISTFILE" ]
+then
+
+#LISTFILE cannot be passed with any other parameters
+	if [ "$PDS" -o "$RDS" -o "$DBNAME" ]
+	then
+		echo "$USAGE"
+		echo "\ncontrol list and other parameters are mutually exclusive\n"
+		exit 1
+	fi
+
+#REPSERVER must be passed if LISTFILE is valid
+	if [ ! "$REPSERVER" ]
+	then
+		echo "$USAGE"
+		echo "\nREPSERVER must be passed\n"
+		exit 1
+	fi
+
+#LISTFILE must exist under central control directory
+	CTLFILE=$CTLDIR/replication/$LISTFILE
+	if [ ! -s $CTLFILE ]
+	then
+	        echo "\nERROR - $CALLED"
+	        echo "\n$CTLFILE does not exist or is 0 bytes\n"
+	        exit 1
+	fi
+else
+#if LISTFILE wasn't passed, all other parameters must be passed
+	if [ ! "$PDS" -o ! "$RDS" -o ! "$DBNAME" -o ! "$REPSERVER" ]
+	then
+		echo "$USAGE"
+		echo "\nIf control list is not passed, ALL other parameters MUST be passed."
+		exit 1
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TEMPFILE && \rm -f $TEMPFILE
+	test -f $SEDFILE && \rm -f $SEDFILE
+	test -f $TEMPSED && \rm -f $TEMPSED
+
+# reinstate the original stty settings
+        stty $STTY_ORIG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Prompt for the maint user password
+#--------------------------------------------------------------------------
+export MAINTPWD=""
+export PW1=""
+while [ "$PW1" = "" ]
+do
+        echo "Enter maint user password:"
+        stty -echo
+        read PW1
+        stty echo
+done
+export PW2=""
+while [ "$PW2" = "" ]
+do
+        echo "Re-enter maint user password:"
+        stty -echo
+        read PW2
+        stty echo
+done
+if [ "$PW1" = "$PW2" ]
+then
+        export MAINTPWD=$PW1
+else
+        echo "ERROR - Passwords entered do not match.  Exiting."
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Format the list of databases to setup
+#--------------------------------------------------------------------------
+if [ "$LISTFILE" ]
+then
+	cat $CTLFILE > $TEMPFILE
+else
+	echo "$PDS $DBNAME $RDS dummy dummy" > $TEMPFILE
+fi
+
+#--------------------------------------------------------------------------
+#  Get sybase directory from REPDIRLIST
+#  Reformat the SYBASEDIR variable so sed can interpret it correctly
+#--------------------------------------------------------------------------
+export SYBASEDIR=`grep "^$REPSERVER " $REPDIRLIST | cut -d" " -f3`
+echo 's/\//\\\\\//g' > $TEMPSED
+export SYBASEDIR_RFMT=`echo $SYBASEDIR | sed -f $TEMPSED`
+
+#--------------------------------------------------------------------------
+#  Create sed file and make substitutions
+#  Assumption - ADMINLOGIN password for all servers must be the same
+#  Use the ADMINLOGIN password for the Active DS
+#  chmod the file for owner (sybase) access only
+#--------------------------------------------------------------------------
+cat $TEMPFILE |
+while read PDS DBNAME RDS LDS LDB
+do
+	export PDS DBNAME RDS LDS LDB
+	export ADMINPWD=`getPass $PDS $ADMINLOGIN`
+# create sed file
+	> $SEDFILE
+	echo "s/LOGICALDS/$LDS/g" >> $SEDFILE
+	echo "s/ACTIVEDS/$PDS/g" >> $SEDFILE
+	echo "s/STANDBYDS/$RDS/g" >> $SEDFILE
+	echo "s/DBNAME/$DBNAME/g" >> $SEDFILE
+	echo "s/MAINTPWD/$MAINTPWD/g" >> $SEDFILE
+	echo "s/REPSERVER/$REPSERVER/g" >> $SEDFILE
+	echo "s/ADMINLOGIN/$ADMINLOGIN/g" >> $SEDFILE
+	echo "s/ADMINPWD/$ADMINPWD/g" >> $SEDFILE
+	echo "s/SYBASEDIR/$SYBASEDIR_RFMT/g" >> $SEDFILE
+
+        export RSFILE_ACTIVE=$SQLDIR/replication/$REPSERVER.$DBNAME.active.rs
+        export RSFILE_STANDBY=$SQLDIR/replication/$REPSERVER.$DBNAME.standby.rs
+        > $RSFILE_ACTIVE
+        > $RSFILE_STANDBY
+	chmod 600 $RSFILE_ACTIVE
+	chmod 600 $RSFILE_STANDBY
+	sed -f $SEDFILE $TEMPLATE_ACTIVE >> $RSFILE_ACTIVE
+	sed -f $SEDFILE $TEMPLATE_STANDBY >> $RSFILE_STANDBY
+done 
+
+#--------------------------------------------------------------------------
+# exit
+#--------------------------------------------------------------------------
+exit 0

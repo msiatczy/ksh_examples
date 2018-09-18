@@ -1,0 +1,207 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: evgSearchDb.scr -U <user> -L <object|object list> -S <DBSERVER> -D <database|all>
+#
+#  Description: Search one or more databases for a list of objects
+#
+#     Location:	/sccm/dba/sybase/scripts/evgSearchDb.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	
+#
+#  Modification History:
+#       12/11/09 M. Siatczynski Initial script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -U <user> -L <object|object list> -S <DBSERVER> -D <database|all"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-U)		export EXEUSER=$2;shift 2;;
+			-L)		export OBJECTSPEC=$2;shift 2;;
+			-S)		export DBSERVER=$2;shift 2;;
+			-D)		export ONEDBNAME=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$EXEUSER" -o ! "$DBSERVER" -o ! "$ONEDBNAME" -o ! "$OBJECTSPEC" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBLIST=/tmp/dblist.$$
+export OBJECTLIST=/tmp/objectlist.$$
+export LOGFILE=$LOGDIR/misc/$DBSERVER/evgSearchDb.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $DBLIST && \rm -f $DBLIST
+	test $OBJECTLIST && \rm -f $OBJECTLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create a working object list
+#------------------------------------------------------------------------------
+if [ -f $OBJECTSPEC ]
+then
+	if [ -s $OBJECTSPEC ]
+	then
+		cat $OBJECTSPEC > $OBJECTLIST
+	else
+		echo "WARNING - $OBJECTSPEC is 0 bytes"
+		exit 1
+	fi
+else
+# make sure the objectspec doesn't contain slashes--otherwise it may be an invalid file reference
+	echo $OBJECTSPEC | grep '/' > /dev/null
+	if [ $? -eq 0 ]
+	then
+		echo "ERROR - $OBJECTSPEC is not valid--possible invalid filename?"
+		exit 1
+	else
+		echo $OBJECTSPEC > $OBJECTLIST
+	fi
+fi
+
+#DEBUG
+#cat $OBJECTLIST
+#exit
+#exit
+#exit
+
+
+#------------------------------------------------------------------------------
+# Do the following for each ASE in DBSERVERLIST...
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Search for objects" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Create a working dblist
+#------------------------------------------------------------------------------
+if [ "$ONEDBNAME" = "all" ]
+then
+	$ISQLEXE -U$EXEUSER -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $EXEUSER`
+	set nocount on
+	go
+	select name from master..sysdatabases where name not like '%tempdb%' order by name
+	go
+	!
+
+	checkSqlErr $DBLIST
+	if [ $? -eq 1 ]
+	then
+	        echo "ERROR - getting list of database names from $DBSERVER"
+	        cat $DBLIST >> $LOGFILE
+	        exit 1
+	fi
+else
+	echo $ONEDBNAME > $DBLIST
+fi
+
+
+#DEBUG
+#cat $DBLIST
+#exit
+#exit
+#exit
+
+#------------------------------------------------------------------------------
+# Format the SQL
+#------------------------------------------------------------------------------
+echo "`date` Formatting SQL for $DBSERVER" >> $LOGFILE
+> $SQLFILE
+	echo "set nocount on" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	echo "print \"$DBNAME\"" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	echo "exec $DBNAME..sp_tablespace" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	cat $OBJECTLIST |
+	while read OBJNAME
+	do
+		echo "select convert(char(20),@@servername),convert(char(30),\"$DBNAME\"),convert(char(40),name),type" >> $SQLFILE
+		echo "from $DBNAME..sysobjects where name = \"$OBJNAME\"" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+done
+
+#DEBUG
+#cat $SQLFILE
+#exit
+#exit
+#exit
+
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# Append the output to the logfile
+#------------------------------------------------------------------------------
+echo "`date` Searching for objects on $DBSERVER" >> $LOGFILE
+
+getPass $DBSERVER $EXEUSER | $ISQLEXE -U$EXEUSER -S$DBSERVER -b -w200 -i$SQLFILE | grep -v Password > $SQLOUT
+
+echo "" >> $LOGFILE
+cat $SQLOUT >> $LOGFILE
+echo "" >> $LOGFILE
+#------------------------------------------------------------------------------
+# Check for errors
+# If any errors found, see if error related to account owning objects (18790)--if so, print informational message
+#------------------------------------------------------------------------------
+checkSqlErr $SQLOUT
+if [ $? -eq 1 ]
+then
+	export HIGHRC=1
+	echo "`date` Object search FAILED for $DBSERVER" | tee -a $LOGFILE
+else
+	echo "`date` Object search SUCCESSFUL for $DBSERVER" | tee -a $LOGFILE
+fi
+
+echo "`date` END Object search" >> $LOGFILE
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+        echo "\nScript FAILED - output in $LOGFILE"
+	exit 1
+else
+        echo "\nScript SUCCESSFUL - output in $LOGFILE"
+	exit 0
+fi

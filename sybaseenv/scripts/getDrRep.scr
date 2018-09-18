@@ -1,0 +1,95 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getDrRep.scr
+#
+#  Description: Make copies of Sybase replication server files necessary
+#		for disaster recovery
+#
+#     Location: /sccm/dba/sybase/scripts
+#
+#    Called by: AutoSys
+#
+#   Parameters: DBSERVER
+#
+#  Modification History:
+#       02/24/04 K. Hess        Initial script
+#       01/26/07 M. Siatczynski RSM not used anymore, removed code related to RSM
+#       09/03/08 M. Siatczynski Add copy of interfaces file local to RS install (in prep for replication across storagenet)
+# 				Do not overwrite files if 0 bytes
+# 				Use existing env variables rather than grepping from control list
+#       10/17/08 M. Siatczynski Change RPTFILE to LOGFILE and change $RPTDIR to $LOGDIR
+#				Change LOGFILE filename to include script name and $DATETIME stamp
+#----------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Parameters:  Database server
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -RS <REPSERVER>"
+ 
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -RS)    export REPSERVER=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+ 
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export SETREPSERVER=$REPSERVER
+
+. /sccm/dba/sybase/.dbaSybProfile
+ 
+export LOGFILE=$LOGDIR/dr/$REPSERVER/$REPSERVER.getDrRep.$DATETIME
+
+#--------------------------------------------------------------------------
+#  Verify dr directory exists; if not, create the directory
+#--------------------------------------------------------------------------
+test ! -d $REPSERVER_DRDIR && mkdir $REPSERVER_DRDIR
+
+#--------------------------------------------------------------------------
+#  Init LOGFILE
+#  Header for DR Report
+#--------------------------------------------------------------------------
+echo "--$REPSERVER DR Report for $DATETIME" > $LOGFILE
+
+#----------------------------------------------------------------------------
+# Rep Server
+# Save copy of .cfg and RUN_server files
+#----------------------------------------------------------------------------
+if [ -s $SYBASE/$SYBASE_REP/$REPSERVER.cfg ]
+then
+	cp -p $SYBASE/$SYBASE_REP/$REPSERVER.cfg $REPSERVER_DRDIR/. 
+else
+	echo "--$REPSERVER.cfg not found or 0 bytes" >> $LOGFILE
+fi
+
+if [ -s $SYBASE/$SYBASE_REP/install/RUN_${REPSERVER} ]  
+then   
+	cp -p $SYBASE/$SYBASE_REP/install/RUN_${REPSERVER} $REPSERVER_DRDIR/.
+else
+	echo "--RUN_${REPSERVER} not found or 0 bytes" >> $LOGFILE
+fi
+
+#----------------------------------------------------------------------------
+# Save copy of interfaces file
+#----------------------------------------------------------------------------
+if [ -s $SYBASE/interfaces ]
+then
+	cp -p $SYBASE/interfaces $REPSERVER_DRDIR/.
+else
+	echo "--$SYBASE/interfaces file not found or 0 bytes" >> $LOGFILE
+fi
+
+#--------------------------------------------------------------------------
+#  Exit with 0
+#--------------------------------------------------------------------------
+exit 0

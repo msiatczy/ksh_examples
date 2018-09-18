@@ -1,0 +1,157 @@
+#!/bin/ksh 
+#--------------------------------------------------------------------------
+#        Usage: dbccDeletehistory -S <DBSERVER> -N <num days> {-D <dbname> -m <maildest> -p <pagedest>}
+#
+#  Description: Delete dbcc history for one or all databases
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	DBSERVER - database server
+#              	NUMDAYS - number of days to keep
+#              	DBNAME - database name
+#              	MAILDEST - override default maildest of dba
+#              	PAGEDEST - page destination/flag
+#
+#
+#  Modification History:
+#	02/24/03 M. Siatczynski	Rewrite original script
+#	04/04/03 M. Siatczynski	Update delete from dbccalt to reference dbccdb (procs are now centrally accessible in 12.5.0.3)
+#	10/31/03 M. Siatczynski	Centralized
+#	03/21/11 M. Siatczynski	Update to accommodate AMG East
+#--------------------------------------------------------------------------
+if [ -f /sccm/dba/sybase/.dbaSybProfile ]
+then
+	. /sccm/dba/sybase/.dbaSybProfile
+elif [ -f /sybase/.dbaSybProfile ]
+then
+	. /sybase/.dbaSybProfile
+fi
+
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -N <num days> {-D <dbname> -m <maildest> -p <pagedest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -N)     export NUMDAYS=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -p)     export PAGEDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+if [ ! "$NUMDAYS" ]
+then
+    echo $USAGE
+    exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export ERRORFLAG=0
+export DBCCSQL=/tmp/dbccsql.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export ERRORS=/tmp/errors.$$
+if [ "$DBNAME" ]
+then
+	export LOGFILE=$LOGDIR/dbcc/$DBSERVER/$DBSERVER.$DBNAME.dbccDeletehistory.$DATETIME
+else
+	export LOGFILE=$LOGDIR/dbcc/$DBSERVER/$DBSERVER.dbccDeletehistory.$DATETIME
+fi
+
+> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBCCSQL && \rm -f $DBCCSQL
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Format and execute the SQL
+#  delete history for a single database or all databases
+#--------------------------------------------------------------------------
+> $DBCCSQL
+
+echo "use dbccdb" > $DBCCSQL
+echo "go" >> $DBCCSQL
+if [ "$DBNAME" ]
+then
+	echo "sp_dbcc_summaryreport \"$DBNAME\"" >> $DBCCSQL
+else
+	echo "sp_dbcc_summaryreport" >> $DBCCSQL
+fi
+echo "go" >> $DBCCSQL
+echo "declare @del_date datetime" >> $DBCCSQL
+echo "select @del_date=dateadd(day, -${NUMDAYS}, getdate())" >> $DBCCSQL
+if [ "$DBNAME" ]
+then
+	echo "exec sp_dbcc_deletehistory @del_date, \"$DBNAME\"" >> $DBCCSQL
+else
+	echo "exec sp_dbcc_deletehistory @del_date" >> $DBCCSQL
+fi
+echo "go" >> $DBCCSQL
+
+echo "use dbccalt" >> $DBCCSQL
+echo "go" >> $DBCCSQL
+echo "declare @del_date datetime" >> $DBCCSQL
+echo "select @del_date=dateadd(day, -${NUMDAYS}, getdate())" >> $DBCCSQL
+echo "exec sp_dbcc_deletehistory @del_date, \"dbccdb\"" >> $DBCCSQL
+echo "go" >> $DBCCSQL
+
+$SCRDIR/sqlTimer.scr -S $DBSERVER -i $DBCCSQL -o $LOGFILE -m $MAILFILE
+if [ $? -ne 0 ]
+then
+	export ERRORFLAG=1
+# Ignore Msg 18472 which means there is no history to delete
+	egrep '(Msg|CT-LIB)' $LOGFILE | sort | uniq | grep -v 18472 > $ERRORS
+	test -s $ERRORS && export ERRORFLAG=1 || export ERRORFLAG=0
+fi
+
+#--------------------------------------------------------------------------
+# If there were any failures, send email
+# If a page destination is set, then send a page
+#--------------------------------------------------------------------------
+if [ $ERRORFLAG -eq 1 ]
+then
+	echo "\nNOTE: Check $LOGFILE for further details.\n" >> $MAILFILE
+	export MAILSUBJECT="$DBSERVER DBCC DELETE HISTORY FAILED"
+	sendMail
+	if [ "$PAGEDEST" ]
+	then
+		echo "$DBSERVER DBCC DELETE HISTORY FAILED" > $PAGEMSG
+	        sendPage
+	fi
+fi

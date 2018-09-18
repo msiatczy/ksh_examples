@@ -1,0 +1,157 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findOrphanBackupFiles.scr -S <DBSERVER> {-remove}
+#
+#  Description: Find native backup files that do not exists in sybdb..dl_dumpfile
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  NOTE:  THIS SCRIPT MUST RUN FROM A HOST IN THE SAME NAS ENV AS THE ASE.
+#
+#  Modification History:
+#	07/30/10 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-remove}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -remove)     export REMOVE=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$REMOVE" && export REMOVE=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DLID_ERRLIST=/tmp/dlid.error.lst.$$
+export DIRLIST=/tmp/dir.lst.$$
+export FILELIST=/tmp/file.lst.$$
+export LOGFILE=$LOGDIR/backup/$DBSERVER/$DBSERVER.findOrphanBackupFiles.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DLID_ERRLIST && \rm -f $DLID_ERRLIST
+	test -f $DIRLIST && \rm -f $DIRLIST
+	test -f $FILELIST && \rm -f $FILELIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Write headers
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Checking $DBSERVER for orphaned native backup files..." >> $LOGFILE
+
+#--------------------------------------------------------------------------
+#  Get list of all dumps which ended in error
+#  dl_log contains entry for every dump action
+#  dl_hist ONLY contains entry for SUCCESSFUL dump actions
+#--------------------------------------------------------------------------
+> $DLID_ERRLIST
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password | sed -e 's/ //g' >> $DLID_ERRLIST
+`getPass $DBSERVER $ADMINLOGIN`
+set nocount on
+go
+select dl_id from sybdb..dl_log where action_type = 'DUMP' and status = 'ERROR' and dl_id not in (select distinct dl_id from sybdb..dl_dumpfile)
+order by dl_id
+go
+!
+
+#--------------------------------------------------------------------------
+#  get full dump pool locations for the ASE
+#  get tran dump pool locations for the ASE
+#--------------------------------------------------------------------------
+> $DIRLIST
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password | sed -e 's/ //g' >> $DIRLIST
+`getPass $DBSERVER $ADMINLOGIN`
+set nocount on
+go
+select distinct full_dump_path from sybdb..dl_dump_pools
+go
+!
+
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password | sed -e 's/ //g' >> $DIRLIST
+`getPass $DBSERVER $ADMINLOGIN`
+set nocount on
+go
+select distinct tran_dump_path from sybdb..dl_dump_pools
+go
+!
+
+#--------------------------------------------------------------------------
+#  for each dl_id, look for dump files containing this dl_id under each dump directory
+#  If remove flag set, remove the file
+#--------------------------------------------------------------------------
+> $FILELIST
+cat $DIRLIST |
+while read DIRPATH
+do
+	export DIRPATH
+	cat $DLID_ERRLIST |
+	while read DLID
+	do
+		export DLID
+		find $DIRPATH -name ${DBSERVER}_*_${DLID}_* -print >> $FILELIST
+	done
+done
+
+if [ -s $FILELIST ]
+then
+	echo "Orphaned files found for $DBSERVER:" | tee -a $LOGFILE
+	cat $FILELIST >> $LOGFILE
+#DEBUG
+	cat $FILELIST
+	if [ $REMOVE -eq 1 ]
+	then
+		echo "\nRemoving orphaned files" | tee -a $LOGFILE
+		cat $FILELIST |
+		while read FILENAME
+		do
+			export FILENAME
+			echo "Removing $FILENAME" | tee -a $LOGFILE
+			\rm $FILENAME
+		done
+	fi
+else
+	echo "NO orphaned files found for $DBSERVER" | tee -a $LOGFILE
+fi
+
+#--------------------------------------------------------------------------
+#  Exit the script
+#--------------------------------------------------------------------------
+echo "`date` Check complete" >> $LOGFILE
+exit 0

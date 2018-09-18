@@ -1,0 +1,180 @@
+#!/bin/ksh
+#------------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-full -D <dbname>|<DB list> -date <mmddyyyy>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBSPEC=$2;shift 2;;
+                        -full)  export FULL=1;shift 1;;
+                        -date)  export PARMDATE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$FULL" && export FULL=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/backup/$DBSERVER/$DBSERVER.fmtSqlbtCtl.$DATETIME
+export SEDFILE=/tmp/sedfile.$$
+export DBLIST=/tmp/dblist.$$
+export FILELIST=/tmp/filelist.$$
+export XDBLIST=/tmp/exclude.dblist.$$
+export TEMPDIR=/tmp/$DBSERVER
+export TARFILE=/tmp/$DBSERVER.sqlbt.ctl.tar
+
+
+if [ "$PARMDATE" ]
+then
+	export SQLBTCTLDIR=$SYBDRDIR/$DBSERVER/sqlbt/$DBSERVER$PARMDATE/physical
+else
+	export SQLBTCTLDIR=$SYBDRDIR/$DBSERVER/sqlbt/$DBSERVER/physical
+fi
+
+> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SEDFILE && \rm -f $SEDFILE
+	test $DBLIST && \rm -f $DBLIST
+	test $FILELIST && \rm -f $FILELIST
+	test $XDBLIST && \rm -f $XDBLIST
+	test -d $TEMPDIR && \rm -rf $TEMPDIR
+}
+
+trap 'tempCleanup' EXIT INT TEM
+
+#------------------------------------------------------------------------------------
+# make the tempdir, if it doesn't exist
+#------------------------------------------------------------------------------------
+test ! -d $TEMPDIR && mkdir $TEMPDIR
+
+#------------------------------------------------------------------------------------
+# format list of system databases to exclude
+#------------------------------------------------------------------------------------
+> $XDBLIST
+echo "^dba$" >> $XDBLIST
+echo "^dbccdb$" >> $XDBLIST
+echo "^dbccalt$" >> $XDBLIST
+echo "^lookjack$" >> $XDBLIST
+echo "^master$" >> $XDBLIST
+echo "^model$" >> $XDBLIST
+echo "^sybsecurity$" >> $XDBLIST
+echo "^sybsecurity_archive$" >> $XDBLIST
+echo "^sybsystemdb$" >> $XDBLIST
+echo "^sybsystemprocs$" >> $XDBLIST
+
+#------------------------------------------------------------------------------------
+# format list of databases
+# if a file is passed, make sure it's > 0 bytes 
+# if it's not clearly a file, make sure it's not an invalid filename
+#------------------------------------------------------------------------------------
+if [ "$DBSPEC" ]
+then
+# make sure control file exists and has entries
+	if [ -f $DBSPEC ]
+	then
+		if [ -s $DBSPEC ]
+		then
+			cat $DBSPEC > $DBLIST
+		else
+			echo "ERROR - $DBSPEC is 0 bytes"
+			exit 1
+		fi
+	else
+# make sure the dbspec doesn't contain slashes--otherwise it may be an invalid file reference
+		echo $DBSPEC | grep '/' > /dev/null
+		if [ $? -eq 0 ]
+		then
+			echo "ERROR - $DBSPEC is not valid--possible invalid filename?"
+			exit 1
+		else
+			echo $DBSPEC > $DBLIST
+		fi
+	fi
+else
+	ls $SQLBTCTLDIR | grep -v '\.skip$' | egrep -vf $XDBLIST | sort > $DBLIST
+fi
+
+#------------------------------------------------------------------------------------
+# For each database copy the most recent backup file to the transfer directory
+#------------------------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+	export OLDCTLDIR=$SQLBTCTLDIR
+	export NEWCTLDIR=$TEMPDIR
+	if [ ! -d $NEWCTLDIR ]
+	then
+		mkdir $NEWCTLDIR
+		touch $NEWCTLDIR/.dtoptions
+	fi
+	> $NEWCTLDIR/$DBNAME
+#------------------------------------------------------------------------------------
+# grab the 'options' section from the control file.
+#------------------------------------------------------------------------------------
+	head -`grep -n 'end options' $OLDCTLDIR/$DBNAME | cut -d":" -f1` $OLDCTLDIR/$DBNAME >> $NEWCTLDIR/$DBNAME
+
+#------------------------------------------------------------------------------------
+# grab the 'dump' section for the last level 0 dump from the control file.
+# this is hardcoded to grab a certain number of lines.  if sqlbt version changes, verify this is still accurate.
+# if FULL=1, get only the last level 0, else get level 0 plus all tran dumps
+#------------------------------------------------------------------------------------
+	if [ $FULL -eq 1 ]
+	then
+		tail +`grep -n 'dump=0' $OLDCTLDIR/$DBNAME | tail -1 | cut -d":" -f1` $OLDCTLDIR/$DBNAME | head -7 >> $NEWCTLDIR/$DBNAME
+	else
+		tail +`grep -n 'dump=0' $OLDCTLDIR/$DBNAME | tail -1 | cut -d":" -f1` $OLDCTLDIR/$DBNAME >> $NEWCTLDIR/$DBNAME
+	fi
+
+#------------------------------------------------------------------------------------
+# validate that the last line of the control file = "end dump"
+#------------------------------------------------------------------------------------
+	if [ "`tail -1 $NEWCTLDIR/$DBNAME`" != "end dump" ]
+	then
+		echo "ERROR - $NEWCTLDIR/$DBNAME DUMP SECTION NOT ENDED PROPERLY"
+		exit 1
+	fi
+
+	echo "Control file created for $DBNAME" >> $LOGFILE
+done
+
+#------------------------------------------------------------------------------------
+# tar up all the sqlbt control files and place it under the /tmp directory
+#------------------------------------------------------------------------------------
+echo "Tar'ing all control files" >> $LOGFILE
+cd $TEMPDIR
+tar -cvf $TARFILE * >> $LOGFILE 2>&1
+cd
+
+echo "tar file of sqlbt control files create under $TARFILE"
+
+#------------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------------
+exit 0

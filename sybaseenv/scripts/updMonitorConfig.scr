@@ -1,0 +1,86 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: updMonitorConfig.scr
+#  Description: Enable or disable Sybase monitoring on specified database server
+#     Location: /sccm/dba/sybase/scripts
+#    Called by: AutoSys
+#   Parameters: DBSERVER
+#  Modification History:
+#       05/28/04 K. Hess        Initial script
+#       02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#----------------------------------------------------------------------------
+
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Parameters:  Database server
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -enable|-disable"
+ 
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)		export DBSERVER=$2;shift 2;;
+                        -enable)	export ENABLE=1;shift 1;;
+                        -disable)	export DISABLE=1;shift 1;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$ENABLE" && export ENABLE=0
+test ! "$DISABLE" && export DISABLE=0
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+elif [ $ENABLE -eq 0 -a $DISABLE -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ $ENABLE -eq 1 -a $DISABLE -eq 1 ]
+then
+        echo "ERROR - -enable and -disable are mutually exclusive"
+        exit 1
+fi
+
+test $ENABLE -eq 1 && export STATUS=1 || export STATUS=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.monitorConfig.$DATETIME 
+
+#----------------------------------------------------------------------------
+# Update monitoring configuration on specified database server
+#----------------------------------------------------------------------------
+
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password >> $LOGFILE
+`getPass $DBSERVER $ADMINLOGIN`
+set nocount on
+go
+use master
+go
+print ""
+go
+print "Update monitoring config for ${DBSERVER}"
+go
+print ""
+go
+sp_configure "enable monitoring",$STATUS
+go
+!
+
+#--------------------------------------------------------------------------
+#  Exit with 0
+#--------------------------------------------------------------------------
+exit 0

@@ -1,0 +1,438 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: rebuildClusteredIndexes.scr -S <DBSERVER> -D <dbname> -L <table list> -fmt -run {-dropnc -m <maildest> -p <pagedest>}
+#
+#  Description: Generate and execute DDL to rebuild clustered indexes for a list of tables.
+#		Table list gets sorted so index rebuilds start with smallest tables.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  NOTE:  THIS SCRIPT SHOULD REALLY CHECK FREE SPACE IN THE DATABASE BEFORE ATTEMPTING AN INDEX REBUILD.  THIS CODE MAY NOT BE EASY TO ADD, AS IT NEED TO CHECK SPACE ON THE APPROPRIATE SEGMENT FOR THE TABLE IN QUESTION.
+#
+#  NOTE:  This script executes ddlgen and MUST be run on the host where the
+# 		DBSERVER is currently active.
+#
+#  Modification History:
+#	03/10/04 M. Siatczynski	Initial Script
+#	06/02/04 M. Siatczynski	Added DBNAME to SQL file names
+#	06/03/04 M. Siatczynski	Add sp_recompile following index recreation
+#	06/21/04 M. Siatczynski	Update code for proper use of ASEDIRLIST
+#	07/21/04 M. Siatczynski	Added exit message for ddlgen errors
+#	11/02/05 M. Siatczynski	Changed LOGFILE to go to RPTDIR so we have a permanent history of timings
+#	11/03/05 M. Siatczynski	Update code for empty INDEXLIST
+#	02/13/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	02/21/06 M. Siatczynski	Implement getPass, ADMINLOGIN for ddlgen
+#	06/20/06 M. Siatczynski	New location for ddlgen
+#	06/27/06 M. Siatczynski	Update code to accommodate primary key constraints
+#	06/30/06 M. Siatczynski	Add code to drop all NC indexes before rebuild of clustered (to free up additional space)
+#	07/03/06 M. Siatczynski	Direct RPTFILE and LOGFILE to reorg subdir of $RPTDIR and $LOGDIR
+#	01/11/11 M. Siatczynski	Update script used to get service names
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname> -L <table list> -fmt -run {-dropnc -m <maildest> -p <pagedest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -L)     export TABLELIST=$2;shift 2;;
+                        -fmt)   export FMT=1;shift 1;;
+                        -run)   export RUN=1;shift 1;;
+                        -dropnc)   export DROPNC=1;shift 1;;
+                        -m)     export MAILTO=$2;shift 2;;
+                        -p)     export PAGETO=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$FMT" && export FMT=0
+test ! "$RUN" && export RUN=0
+test ! "$DROPNC" && export DROPNC=0
+
+if [ ! "$DBSERVER" -o ! "$DBNAME" -o ! "$TABLELIST" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ ! -s "$TABLELIST" ]
+then
+	echo "ERROR - $TABLELIST does not exists or is 0 bytes"
+	exit 1
+fi
+
+# fmt and/or run must be passed
+if [ $FMT -eq 0 -a $RUN -eq 0 ]
+then
+	echo "$USAGE"
+	echo "\n-fmt and/or -run MUST be passed\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# Source the profile AFTER setting SETDBSERVER--Necessary in order to find path to ddlgen
+#--------------------------------------------------------------------------
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+## reset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+## reset the centrally-set MAILDEST variable if a different maildest was passed
+test "$PAGETO" && export PAGEDEST=$PAGETO || unset PAGEDEST
+test "$MAILTO" && export MAILDEST=$MAILTO
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export TEMPSQL=/tmp/tempsql.$$
+export DDLSQL=/tmp/ddlsql.$$
+export SIZELIST=/tmp/sizelist.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export DDLLOG=/tmp/ddllog.$$
+export NCLIST=/tmp/nclist.$$
+export WORKLIST=$CTLDIR/$DBSERVER/$DBSERVER.$DBNAME.rciwork.lst
+export RPTFILE=$RPTDIR/reorg/$DBSERVER/$DBSERVER.$DBNAME.rebuildClusteredIndexes.$DATETIME
+
+export INDEXRC=0
+
+> $RPTFILE
+
+#--------------------------------------------------------------------------
+# Get the service name and port for this dbserver - needed for ddlgen
+# Verify the service name is active on this host--script MUST run on service name host
+#--------------------------------------------------------------------------
+export SN=`grep "^$DBSERVER " $ASEDIRLIST | cut -d" " -f2`
+export PORT=`grep "^$DBSERVER " $ASEDIRLIST | cut -d" " -f8`
+
+/apps/OSscripts/srvnamesLOC | grep "$SN" > /dev/null
+if [ $? -ne 0 ]
+then
+	echo "\nERROR - This script MUST run on current host for $SN" | tee -a $RPTFILE
+	echo "$SN is not active on this host (`hostname`)" | tee -a $RPTFILE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SIZELIST && \rm -f $SIZELIST
+	test -f $TEMPSQL && \rm -f $TEMPSQL
+	test -f $DDLSQL && \rm -f $DDLSQL
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+	test -f $DDLLOG && \rm -f $DDLLOG
+	test -f $NCLIST && \rm -f $NCLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# If FMT=1 then format the ddl to recreate indexes
+# Format and run sql to get list of tables by size
+# Output is sorted by reserved column
+# Check for isql errors
+#--------------------------------------------------------------------------
+if [ $FMT -eq 1 ]
+then
+	echo "`date` FORMAT SQL" >> $RPTFILE
+	> $TEMPSQL
+	echo "use $DBNAME" >> $TEMPSQL
+	echo "go" >> $TEMPSQL
+	echo "set nocount on" >> $TEMPSQL
+	echo "go" >> $TEMPSQL
+
+	cat $TABLELIST |
+	while read TABLE
+	do
+		export TABLE
+		echo "if exists (select * from $DBNAME..sysobjects where name = \"$TABLE\")" >> $TEMPSQL
+		echo "exec sp_spaceused $TABLE" >> $TEMPSQL
+		echo "else" >> $TEMPSQL
+		echo "print \"$TABLE does not exist in $DBNAME\"" >> $TEMPSQL
+		echo "go" >> $TEMPSQL
+	done
+
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$TEMPSQL | egrep -v '(Password:|return status)' | sed -e 's/^ //g' -e 's/  */ /g' | sort -n +2 > $SIZELIST
+
+	checkSqlErr $SIZELIST
+	if [ $? -eq 1 ]
+	then
+		echo $CALLED | tee -a $RPTFILE
+		echo "ERROR - getting space information for tables" | tee -a $RPTFILE
+		cat $SIZELIST | tee -a $RPTFILE
+		exit 1
+	fi
+
+#------------------------------------------------------------------------------
+# Query sysindexes to get the clustered index for each table
+# If DROPNC=1, then get list of nonclustered indexes as well
+# Print warning message for those tables with clustered indexes created as primary key constraints
+# Prefix each row with CINDEX or CONSTR for those APL tables on which we will drop/create the index
+# sysobjects..sysstat2=8192=APL table
+# sysindexes..status=16=clustered index
+# sysindexes..status=2048=primary key constraint
+# sysindexes..status<>2048=normal clustered index
+# Check for isql errors
+#------------------------------------------------------------------------------
+	> $WORKLIST
+	cut -d" " -f1 $SIZELIST |
+	while read TABLE
+	do
+		export TABLE
+		$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -D$DBNAME -w200 -b <<-! | grep -v Password: | sed -e 's/^ //g' >> $WORKLIST
+		`getPass $DBSERVER $ADMINLOGIN`
+		set nocount on
+		go
+		select case
+		when i.status&16=16 and i.status&2048<>2048 then 'CINDEX'
+		when i.status&16=16 and i.status&2048=2048 then 'CONSTR'
+		end+" "+ o.name+" "+i.name from $DBNAME..sysindexes i, $DBNAME..sysobjects o
+		where o.name = "$TABLE"
+		and o.id = i.id
+		and i.status&16=16
+		and o.sysstat2&8192=8192
+		go
+		!
+	done
+
+	checkSqlErr $WORKLIST
+	if [ $? -eq 1 ]
+	then
+		echo $CALLED | tee -a $RPTFILE
+		echo "ERROR - getting list of clustered indexes for tables" | tee -a $RPTFILE
+		cat $WORKLIST | tee -a $RPTFILE
+		exit 1
+	fi
+
+	if [ $DROPNC -eq 1 ]
+	then
+		> $NCLIST
+		cut -d" " -f1 $SIZELIST |
+		while read TABLE
+		do
+			export TABLE
+			$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -D$DBNAME -w200 -b <<-! | grep -v Password: | sed -e 's/^ //g' >> $NCLIST
+			`getPass $DBSERVER $ADMINLOGIN`
+			set nocount on
+			go
+			select object_name(id)+" "+name from $DBNAME..sysindexes
+			where object_name(id) = "$TABLE"
+			and status&16<>16
+			and indid > 0 and indid < 255
+			go
+			!
+		done
+	
+		checkSqlErr $NCLIST
+		if [ $? -eq 1 ]
+		then
+			echo $CALLED | tee -a $RPTFILE
+			echo "ERROR - getting list of nonclustered indexes for tables" | tee -a $RPTFILE
+			cat $NCLIST | tee -a $RPTFILE
+			exit 1
+		fi
+	fi
+
+#------------------------------------------------------------------------------
+# Run ddlgen to get clustered index ddl or constraint ddl
+# Append SQL to drop index to beginning of sql file
+# ddlgen only appears to exit with 0, so difficult to check for errors
+# ddlgen code doesn't always have a carriage return at the end, so sometimes we echo a newline
+#------------------------------------------------------------------------------
+	export DDLRC=0
+	if [ -s $WORKLIST ]
+	then
+		echo "Formatting SQL for the following tables:" >> $RPTFILE
+		cat $WORKLIST |
+		while read CTYPE TABLE CINDEX
+		do
+			export CTYPE TABLE CINDEX
+			echo $TABLE >> $RPTFILE
+			export INDEXSQL=$SQLDIR/$DBSERVER/$DBSERVER.$DBNAME.$TABLE.$CINDEX.sql
+			> $INDEXSQL
+			> $DDLSQL
+			> $TEMPSQL
+			> $DDLLOG
+			echo "use $DBNAME" >> $INDEXSQL
+			echo "go" >> $INDEXSQL
+			echo "exec sp_dbfull $DBNAME" >> $INDEXSQL
+			echo "go" >> $INDEXSQL
+			echo "exec sp_spaceused $TABLE,1" >> $INDEXSQL
+			echo "go" >> $INDEXSQL
+			echo "select convert(char,getdate(),9)" >> $INDEXSQL
+			echo "go" >> $INDEXSQL
+
+## where to put the logic for nc indexes -- ddlgen to extract one by one or all indexes (which includes clustered)?
+
+			if [ "$CTYPE" = "CINDEX" ]
+			then
+				echo "drop index $TABLE.$CINDEX" >> $INDEXSQL
+				echo "go" >> $INDEXSQL
+				echo "select convert(char,getdate(),9)" >> $INDEXSQL
+				echo "go" >> $INDEXSQL
+
+				if [ $DROPNC -eq 1 ]
+				then
+					grep "^$TABLE " $NCLIST |
+					while read NCTABLE NCINDEX
+					do
+						echo "drop index $NCTABLE.$NCINDEX" >> $INDEXSQL
+						echo "go" >> $INDEXSQL
+					done
+					echo "select convert(char,getdate(),9)" >> $INDEXSQL
+					echo "go" >> $INDEXSQL
+# get ddl for all indexes
+					$SYBASE/ASEP/bin/ddlgen -U$ADMINLOGIN -S$SN:$PORT -TI -D$DBNAME -Ndbo.$TABLE.% -P`getPass $DBSERVER $ADMINLOGIN` -O$DDLSQL > $DDLLOG
+				else
+# get ddl for clustered index only
+					$SYBASE/ASEP/bin/ddlgen -U$ADMINLOGIN -S$SN:$PORT -TI -D$DBNAME -Ndbo.$TABLE.$CINDEX -P`getPass $DBSERVER $ADMINLOGIN` -O$DDLSQL > $DDLLOG
+				fi
+
+				egrep -i '(error|unable)' $DDLLOG > /dev/null
+				if [ $? -eq 0 -o ! -s $DDLSQL ]
+				then
+					export DDLRC=1
+					cat $DDLLOG | tee -a $RPTFILE
+				fi
+				cat $DDLSQL >> $TEMPSQL
+				echo "" >> $TEMPSQL
+
+			elif [ "$CTYPE" = "CONSTR" ]
+			then
+				echo "alter table $TABLE drop constraint $CINDEX" >> $INDEXSQL
+				echo "go" >> $INDEXSQL
+
+				if [ $DROPNC -eq 1 ]
+				then
+					grep "^$TABLE " $NCLIST |
+					while read NCTABLE NCINDEX
+					do
+						echo "drop index $NCTABLE.$NCINDEX" >> $INDEXSQL
+						echo "go" >> $INDEXSQL
+					done
+					echo "select convert(char,getdate(),9)" >> $INDEXSQL
+					echo "go" >> $INDEXSQL
+# get ddl for constraint
+					$SYBASE/ASEP/bin/ddlgen -U$ADMINLOGIN -S$SN:$PORT -TKC -D$DBNAME -Ndbo.$TABLE.$CINDEX -P`getPass $DBSERVER $ADMINLOGIN` -O$DDLSQL > $DDLLOG
+					egrep -i '(error|unable)' $DDLLOG > /dev/null
+					if [ $? -eq 0 -o ! -s $DDLSQL ]
+					then
+						export DDLRC=1
+						cat $DDLLOG | tee -a $RPTFILE
+					fi
+					cat $DDLSQL >> $TEMPSQL
+					echo "" >> $TEMPSQL
+# get ddl for nc indexes
+					$SYBASE/ASEP/bin/ddlgen -U$ADMINLOGIN -S$SN:$PORT -TI -D$DBNAME -Ndbo.$TABLE.% -P`getPass $DBSERVER $ADMINLOGIN` -O$DDLSQL > $DDLLOG
+					egrep -i '(error|unable)' $DDLLOG > /dev/null
+					if [ $? -eq 0 -o ! -s $DDLSQL ]
+					then
+						export DDLRC=1
+						cat $DDLLOG | tee -a $RPTFILE
+					fi
+					cat $DDLSQL >> $TEMPSQL
+					echo "" >> $TEMPSQL
+				else
+# only need to get ddl for constraint
+					$SYBASE/ASEP/bin/ddlgen -U$ADMINLOGIN -S$SN:$PORT -TKC -D$DBNAME -Ndbo.$TABLE.$CINDEX -P`getPass $DBSERVER $ADMINLOGIN` -O$DDLSQL > $DDLLOG
+					egrep -i '(error|unable)' $DDLLOG > /dev/null
+					if [ $? -eq 0 -o ! -s $DDLSQL ]
+					then
+						export DDLRC=1
+						cat $DDLLOG | tee -a $RPTFILE
+					fi
+					cat $DDLSQL >> $TEMPSQL
+					echo "" >> $TEMPSQL
+				fi
+			fi
+			cat $TEMPSQL >> $INDEXSQL
+
+			echo "select convert(char,getdate(),9)" >> $INDEXSQL
+			echo "go" >> $INDEXSQL
+			echo "exec sp_recompile $TABLE" >> $INDEXSQL
+			echo "go" >> $INDEXSQL
+			echo "exec sp_spaceused $TABLE,1" >> $INDEXSQL
+			echo "go" >> $INDEXSQL
+			echo "exec sp_dbfull $DBNAME" >> $INDEXSQL
+			echo "go" >> $INDEXSQL
+		done
+
+		if [ $DDLRC -eq 1 ]
+		then
+			echo "ERROR - generating index SQL with DDLGEN - exiting" | tee -a $RPTFILE
+			exit 1
+		fi
+	else
+		echo "No clustered index(es) for any APL tables in $TABLELIST" | tee -a $RPTFILE
+	fi
+
+	echo "`date` FORMAT SQL COMPLETE" >> $RPTFILE
+fi
+
+#------------------------------------------------------------------------------
+# If RUN=1, execute the SQL to rebuild the clustered indexes
+# Check for errors -- always send mail, send page if page flag set
+#------------------------------------------------------------------------------
+if [ $RUN -eq 1 ]
+then
+	if [ -s $WORKLIST ]
+	then
+		echo "`date` EXECUTE SQL" >> $RPTFILE
+		echo "`date` Rebuilding indexes for the following tables:" >> $RPTFILE
+		cat $WORKLIST >> $RPTFILE
+		cut -d" " -f2,3 $WORKLIST |
+		while read TABLE CINDEX
+		do
+			echo "`date` REBUILDING $TABLE $CINDEX" >> $RPTFILE
+			export INDEXSQL=$SQLDIR/$DBSERVER/$DBSERVER.$DBNAME.$TABLE.$CINDEX.sql
+			export INDEXOUT=$LOGDIR/reorg/$DBSERVER/$DBSERVER.$DBNAME.$TABLE.$CINDEX.$DATETIME
+			getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e -i$INDEXSQL | grep -v Password: > $INDEXOUT
+			cat $INDEXOUT >> $RPTFILE
+
+			checkSqlErr $INDEXOUT
+			if [ $? -eq 1 ]
+			then
+				export INDEXRC=1
+				echo "ERROR rebuilding index $DBSERVER:$DBNAME:$TABLE:$CINDEX" >> $RPTFILE
+				export MAILSUBJECT="ERROR rebuilding index $DBSERVER:$DBNAME:$TABLE:$CINDEX"
+				cat $INDEXOUT > $MAILFILE
+				sendMail
+
+				if [ "$PAGEDEST" ]
+				then
+					echo "ERROR rebuilding index $DBSERVER:$DBNAME:$TABLE:$CINDEX" > $PAGEMSG
+					sendPage
+				fi
+			fi
+		done
+	else
+		echo "$WORKLIST: invalid filename or no entries" | tee -a $RPTFILE
+	fi
+
+	echo "`date` EXECUTE SQL COMPLETE" >> $RPTFILE
+	test $INDEXRC -eq 0 && exit 0 || exit 1
+fi
+#------------------------------------------------------------------------------
+# if we made it this far, exit with 0
+#------------------------------------------------------------------------------
+exit 0

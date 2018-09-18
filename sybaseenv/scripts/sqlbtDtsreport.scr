@@ -1,0 +1,107 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: sqlbtDtsreport.scr -S <DBSERVER> -D <dbname> -fmt <txt|html|xml|csv>
+#
+#  Description: Generate a dtsreport for a given dbserver/dbname, echoed output is name of output file
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - DBSERVER
+#              	<dbname> - database name
+#              	<fmt> - txt, html, xml, or csv
+#
+#  NOTE:  This script MUST run on the host where the sqlbt control files are currently mounted.
+#
+#  Modification History:
+#	05/05/04 M. Siatczynski	Initial Script
+#	05/07/04 M. Siatczynski	Change location of report files from ADHOCDIR to tempdata dir
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname> -fmt <txt|html|xml|csv>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+			-fmt)	export FMT=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBNAME" -o ! "$FMT" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ "$FMT" != "txt" -a "$FMT" != "html" -a "$FMT" != "xml" -a "$FMT" != "csv" ]
+then
+	echo $USAGE
+	echo "ERROR - format must be txt, html, xml or csv"
+	exit 1
+fi
+
+# source the profile after setting DBSERVER so the correct DT variables get set
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DTSOUT=/tmp/dtsout.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DTSOUT && \rm -f $DTSOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------
+# Generate a dtsreport for DBSERVER/dbname
+# Verify the control file contains dump info (not just the header), otherwise
+# dtsreport will hang waiting for user response.
+#------------------------------------------------------------------------
+export CTLFILE=$DT_PHYSICAL/$DBSERVER/$DBNAME
+if [ -f $CTLFILE ]
+then
+	grep '^begin dump' $CTLFILE > /dev/null
+	if [ $? -eq 0 ]
+	then
+		dtsreport -path $CTLFILE -output $DBADIR/tempdata -listorder L -template $DT_SBACKTRACK_HOME/templates/template.$FMT > $DTSOUT
+		export RPTFILE=`grep 'To:' $DTSOUT | cut -d" " -f2`
+		if [ -f $RPTFILE ]
+		then
+			echo $RPTFILE
+			exit 0
+		else
+			echo "ERROR - a valid report file was not generated"
+			cat $DTSOUT
+			exit 1
+		fi
+	else
+		echo "ERROR - $CTLFILE does not contain any dump information"
+		exit 1
+	fi
+else
+	echo "ERROR - $CTLFILE does not exist"
+	exit 1
+fi

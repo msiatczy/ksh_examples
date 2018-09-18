@@ -1,0 +1,43 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: startNorad.scr 
+#
+#  Description: Start norad products on a machine boot
+#
+#     Location: /sccm/dba/sybase/scripts
+#
+#    Called by: (optional) Script or Autosys script that calls this script
+#
+#        Calls: (optional) Any scripts this script executes
+#
+#   Parameters: <parm1> - short description of parm if not obvious
+#               <parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#       10/15/08 John Aspenleiter - Script Created
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.norad
+#--------------------------------------------------------------------------
+#  Set ulimit (-n = Maximum file descriptor plus 1)
+#    -it's being set because that's what the sybase start up script is doing...
+#--------------------------------------------------------------------------
+ulimit -n 1024
+
+#--------------------------------------------------------------------------
+# Start Norad SAM Agent 
+#--------------------------------------------------------------------------
+if [ -f $BRADMARK_HOME/bin/dbgstart.sh ]
+then
+	echo "Starting Norad SAM agent"
+	$BRADMARK_HOME/bin/dbgstart.sh
+else
+	echo "$BRADMARK_HOME/bin/dbgstart.sh file not found"
+fi
+
+#------------------------------------------------------------------------------
+# exit
+#------------------------------------------------------------------------------
+exit 0
+
+

@@ -1,0 +1,133 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findLoginOverrides.scr -S <DBSERVER>|all
+#
+#  Description: Find login overrides on one or more ASEs
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - DBSERVER on which to change password
+#
+#  Modification History:
+#	07/06/07 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER>|all"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export ONEDBSERVER=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# user and login must be passed
+if [ ! "$ONEDBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/useradmin/central/findLoginOverrides.$DATETIME
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLOUT && \rm -f $SQLOUT
+	test $SQLFILE && \rm -f $SQLFILE
+	test $DBBSERVERLIST && \rm -f $DBBSERVERLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create working list
+#------------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#------------------------------------------------------------------------------
+# Format SQL
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "select @@servername," >> $SQLFILE
+echo "case when attribute=0 then 'pwdexp'" >> $SQLFILE
+echo "when attribute=1 then 'pwdlength'" >> $SQLFILE
+echo "when attribute=2 then 'maxfailed'" >> $SQLFILE
+echo "else 'other'" >> $SQLFILE
+echo "end," >> $SQLFILE
+echo "object,suser_name(object),int_value from sysattributes where object_cinfo='login' and object_type='PS' order by attribute,object" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Checking login overrides on the following ASEs:" >> $LOGFILE
+cat $DBSERVERLIST >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# run the sql against each ASE
+# Check for errors
+#------------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	echo "\n`date` Checking login overrides on $DBSERVER" >> $LOGFILE
+	> $SQLOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -i$SQLFILE | grep -v Password: >> $SQLOUT
+
+	checkSqlErr $SQLOUT
+	if [ $? -ne 0 ]
+	then
+	        echo "$DBSERVER - SQL FAILED" | tee -a $LOGFILE
+	        export HIGHRC=1
+	else
+	        echo "$DBSERVER - SQL SUCCESSFUL" | tee -a $LOGFILE
+	fi
+
+	cat $SQLOUT >> $LOGFILE
+done
+
+#------------------------------------------------------------------------------
+# Exit
+#------------------------------------------------------------------------------
+if [ $HIGHRC -ne 0 ]
+then
+        echo "\nERROR - SQL FAILED on one or more ASEs"
+        echo "Results in $LOGFILE"
+        exit 1
+else
+        echo "Results in $LOGFILE"
+        exit 0
+fi

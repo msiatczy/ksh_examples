@@ -1,0 +1,244 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dropUser.scr -U <user> -login <user to be dropped>|-L <login list> -S <DBSERVER>|<LOB>|all -D <database|all>
+#
+#  Description: Drop one user or a list of users from one or all databases on a dbserver
+#
+#     Location:	/sccm/dba/sybase/scripts/dropUser.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<user> - login of the user running the drop
+#		<login> - user to be dropped
+#		<db> - database to drop from
+#
+#  Modification History:
+#       07/12/05 M. Siatczynski Initial script
+#       09/22/05 M. Siatczynski Change USER to EXEUSER (USER is a unix env variable)
+#       02/07/06 M. Siatczynski Add all option to -S parm, allow script to be run by non-sa user, use EXEISQL call
+#       08/14/06 M. Siatczynski Update code to drop aliases
+#       09/06/07 M. Siatczynski cat SQL output to log file if error
+#       09/12/07 M. Siatczynski Update code to check for specific error when userid owns objects (Msg 18790)
+#       09/13/10 M. Siatczynski Update code to check for specific error when database is READ ONLY
+#       04/26/11 M. Siatczynski Update code to accommodate LOB designation for ASE
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -U <user> -login <user to be dropped>|-L <login list> -S <DBSERVER>|<LOB>|all -D <database|all>"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-U)		export EXEUSER=$2;shift 2;;
+			-login)		export ONELOGIN=$2;shift 2;;
+			-L)		export INPUTLIST=$2;shift 2;;
+			-S)		export ONEDBSERVER=$2;shift 2;;
+			-D)		export ONEDBNAME=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$EXEUSER" -o ! "$ONEDBSERVER" -o ! "$ONEDBNAME" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+# either login name or list must be passed
+if [ ! "$ONELOGIN" -a ! "$INPUTLIST" ]
+then
+	echo $USAGE
+	echo "ERROR - login name or list of logins MUST be passed"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export SQLFILE=/tmp/usersql.$$
+export SQLOUT=/tmp/sqlout.$$
+export DBLIST=/tmp/dblist.$$
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export LOGINLIST=/tmp/loginlist.$$
+export LOGFILE=$LOGDIR/useradmin/central/dropUser.$DATETIME
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+	test $DBLIST && \rm -f $DBLIST
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $LOGINLIST && \rm -f $LOGINLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create a working login list
+#------------------------------------------------------------------------------
+if [ "$INPUTLIST" ]
+then
+	if [ ! -s $INPUTLIST ]
+	then
+		echo "ERROR - $INPUTLIST does not exist or is 0 bytes"
+		exit 1
+	else
+		cat $INPUTLIST > $LOGINLIST
+	fi
+else
+	echo $ONELOGIN > $LOGINLIST
+fi
+ #------------------------------------------------------------------------------
+# Create working list of ASEs
+# If a LOB is passed, get the list for that LOB, if all, then all, else single ASE
+#------------------------------------------------------------------------------
+validateLob $ONEDBSERVER
+if [ $? -eq 0 ]
+then
+	getAseList $ONEDBSERVER > $DBSERVERLIST
+else
+	if [ "$ONEDBSERVER" = "all" ]
+	then
+		getAseList > $DBSERVERLIST
+	else
+		echo $ONEDBSERVER > $DBSERVERLIST
+	fi
+fi
+
+#------------------------------------------------------------------------------
+# Do the following for each ASE in DBSERVERLIST...
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START User drop" >> $LOGFILE
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+
+#------------------------------------------------------------------------------
+# Create a working dblist
+#------------------------------------------------------------------------------
+	if [ "$ONEDBNAME" = "all" ]
+	then
+		$ISQLEXE -U$EXEUSER -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+		`getPass $DBSERVER $EXEUSER`
+		set nocount on
+		go
+		select name from master..sysdatabases order by name
+		go
+		!
+
+		checkSqlErr $DBLIST
+		if [ $? -eq 1 ]
+		then
+		        echo "ERROR - getting list of database names from $DBSERVER"
+		        cat $DBLIST >> $LOGFILE
+		        exit 1
+		fi
+	else
+		echo $ONEDBNAME > $DBLIST
+	fi
+
+#------------------------------------------------------------------------------
+# Format the SQL
+# Set replication off so drops do not replicate
+#  (this code should be improved to only issue the command if EXEUSER has replication_role
+#------------------------------------------------------------------------------
+	echo "Formatting SQL for $DBSERVER" >> $LOGFILE
+	> $SQLFILE
+	echo "set replication off" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+	cat $DBLIST |
+	while read DBNAME
+	do
+		export DBNAME
+		echo "use $DBNAME" >> $SQLFILE
+		echo "go" >> $SQLFILE
+
+		cat $LOGINLIST |
+		while read LOGIN
+		do
+			echo "if exists (select 1 from $DBNAME..sysusers where name = \"$LOGIN\")" >> $SQLFILE
+			echo "begin" >> $SQLFILE
+			echo "print \"Dropping USER ($LOGIN) from %1!:$DBNAME...\",@@servername" >> $SQLFILE
+			echo "execute sp_dropuser $LOGIN" >> $SQLFILE
+			echo "end" >> $SQLFILE
+			echo "else" >> $SQLFILE
+			echo "if exists (select 1 from $DBNAME..sysalternates where suid = suser_id(\"$LOGIN\"))" >> $SQLFILE
+			echo "begin" >> $SQLFILE
+			echo "print \"Dropping ALIAS ($LOGIN) from %1!:$DBNAME...\",@@servername" >> $SQLFILE
+			echo "execute sp_dropalias $LOGIN" >> $SQLFILE
+			echo "end" >> $SQLFILE
+			echo "else" >> $SQLFILE
+			echo "print \"USER ($LOGIN) doesn't exist in %1!:$DBNAME\",@@servername" >> $SQLFILE
+			echo "go" >> $SQLFILE
+		done
+	done
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# Append the output to the logfile
+#------------------------------------------------------------------------------
+	echo "Dropping users on $DBSERVER" >> $LOGFILE
+
+	getPass $DBSERVER $EXEUSER | $ISQLEXE -U$EXEUSER -S$DBSERVER -w200 -e -i$SQLFILE > $SQLOUT
+
+	cat $SQLOUT >> $LOGFILE
+#------------------------------------------------------------------------------
+# Check for errors
+# If any errors found, see if error related to account owning objects (18790)--if so, print informational message
+#------------------------------------------------------------------------------
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "USER drop FAILED for $DBSERVER" | tee -a $LOGFILE
+		grep '^Msg 18790' $SQLOUT > /dev/null
+		if [ $? -eq 0 ]
+		then
+			echo "\nNOTE:  User owns objects in a particular database." | tee -a $LOGFILE
+			echo "See $LOGFILE for details."
+			echo "Use ownNonSaObjects.scr to change object ownership, then re-attempt the user drop." | tee -a $LOGFILE
+		fi
+		grep '^Msg 3906' $SQLOUT > /dev/null
+		if [ $? -eq 0 ]
+		then
+			echo "\nNOTE:  Unable to drop user in READ ONLY database." | tee -a $LOGFILE
+			echo "See $LOGFILE for details."
+			echo "MANUALLY change database status and drop user." | tee -a $LOGFILE
+		fi
+	else
+		echo "USER drop SUCCESSFUL for $DBSERVER" | tee -a $LOGFILE
+	fi
+
+done
+
+echo "`date` END User drop" >> $LOGFILE
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+        echo "USER DROP script FAILED - output in $LOGFILE\n"
+	exit 1
+else
+        echo "USER DROP script SUCCESSFUL - output in $LOGFILE\n"
+	exit 0
+fi

@@ -1,0 +1,179 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: pushNfs.scr -E <nfsenv>,<nfsenv>,etc|all -F <filename> {-noprompt -quiet}
+#
+#  Description: Pushes a single file from PROD to one or more NFS targets
+#
+#     Location: /sccm/dba/sybase/scripts
+#
+#     Parameters:
+#	<nfsenv> - one or more NFS envs, separated by comma, or 'all'
+#	<filename> - full path/filename
+#
+#  Modification History:
+#       11/17/10 M. Siatczynski Initial Script
+#       02/04/11 M. Siatczynski Add -quiet parm for automated execution
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -E <nfsenv>,<nfsenv>,etc|all -F <filename> {-noprompt -quiet}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+			-E)	export NFSSPEC=$2;shift 2;;
+			-F)	export FILENAME=$2;shift 2;;
+			-noprompt)	export PROMPT=0;shift 1;;
+			-quiet)	export QUIET=1;shift 1;;
+			-*)	echo $USAGE;exit 1;;
+			*)	echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$PROMPT" && export PROMPT=1
+test ! "$QUIET" && export QUIET=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export NFSCTLLIST=$CTLDIR/nfsHost.lst
+export HOSTLIST=/tmp/hostlist.$$
+export ENVLIST=/tmp/envlist.$$
+export TMPOUT=/tmp/tmpout.$$
+export LOGFILE=$LOGDIR/central/pushNfs.$$.$DATETIME
+export HIGHRC=0
+
+# if running in quiet mode, then use OUTDEST to send WARNING messages to log rather than console
+# NOTE:  eval MUST be used when specifying OUTDEST
+test $QUIET -eq 1 && export OUTDEST=" >> $LOGFILE" || export OUTDEST="| tee -a $LOGFILE"
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $HOSTLIST && \rm -f $HOSTLIST
+	test -f $ENVLIST && \rm -f $ENVLIST
+	test -f $TMPOUT && \rm -f $TMPOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# if path is not fully qualified, use PWD
+# NOTE:  if filename is not fuly qualified, dirname will return '.', therefore condition below will not be true and pwd will be appended to filename
+#  filename MUST be fully qualified ssary so file gets copied to correct location on target host
+# validate file name passed
+#--------------------------------------------------------------------------
+if [ "`dirname $FILENAME`" = "." ]
+then
+	export FILENAME="$PWD/$FILENAME"
+fi
+
+if [ ! -f $FILENAME ]
+then
+	echo "ERROR - $FILENAME is not a valid file"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  format host list based on desired NFS envs
+#  includes validation of NFS env name
+#  if resulting hostlist is empty, exit with error
+#--------------------------------------------------------------------------
+> $HOSTLIST
+if [ "$NFSSPEC" = "all" ]
+then
+	grep -v '^#' $NFSCTLLIST | cut -d" " -f2 >> $HOSTLIST
+else
+	export ENVLIST=`echo $NFSSPEC | sed -e 's/,/ /g'`
+	for NFSENV in `echo $ENVLIST`
+	do
+# first check to see if valid nfsenv was passed, needs to be done this way to check RC of grep
+		grep "^${NFSENV} " $NFSCTLLIST > /dev/null
+		export GREPRC=$?
+		if [ $GREPRC -ne 0 ]
+		then
+			echo "ERROR - $NFSENV is not a valid NFS environment...copy will proceed for remaining NFS envs"
+			export HIGHRC=1
+		else
+			grep "^${NFSENV} " $NFSCTLLIST | cut -d" " -f2 >> $HOSTLIST
+		fi
+	done
+fi
+
+# if the host list is empty, stop here
+if [ ! -s $HOSTLIST ]
+then
+	echo "ERROR - No valid hosts to push to...exiting"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  prompt to continue
+#--------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+	echo "\nYou are about to push $FILENAME to the following hosts:\n"
+	cat $HOSTLIST
+	echo ""
+	export CONTINUE=""
+	while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+	do
+		echo "DO YOU WISH TO CONTINUE? {y/n}"
+		read CONTINUE
+	done
+
+	if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+	then
+		echo "\nExiting - File will NOT be pushed\n"
+		exit 0
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  Copy the file(s) to the target host(s)
+#  Send stdout and stderr to TMPOUT, write to LOGFILE if scp fails
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Pushing $FILENAME to the following NFS environments:" >> $LOGFILE
+cat $HOSTLIST >> $LOGFILE
+echo "" >> $LOGFILE
+
+cat $HOSTLIST |
+while read HOSTNAME
+do
+	echo "Copying $FILENAME to $HOSTNAME..." >> $LOGFILE
+	scp -p $FILENAME $HOSTNAME:$FILENAME > $TMPOUT 2>&1
+	export SCPRC=$?
+
+	if [ $SCPRC -eq 0 ]
+	then
+		eval echo "Copy SUCCESSFUL to $HOSTNAME" $OUTDEST
+	else
+		eval echo "Copy FAILED to $HOSTNAME" $OUTDEST
+		cat $TMPOUT >> $LOGFILE
+		export HIGHRC=1
+	fi
+done
+
+#--------------------------------------------------------------------------
+#  Exit with overall status
+#--------------------------------------------------------------------------
+if [ $HIGHRC -eq 0 ]
+then
+	eval echo "Overall pushNfs status:  SUCCESSFUL" $OUTDEST
+	exit 0
+else
+	eval echo "Overall pushNfs status:  FAILED" $OUTDEST
+	exit 1
+fi

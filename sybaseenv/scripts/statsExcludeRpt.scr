@@ -1,0 +1,73 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: statsExcludeRpt.scr
+#
+#  Description: Report on databases excluded from update statistics
+#
+#     Location:	/sccm/dba/sybase/scripts/statsExcludeRpt.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	05/16/05 M. Siatczynski	Initial Script (based on dbccExcludeRpt.scr)
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SERVERLIST=/tmp/serverlist.$$
+export MAILFILE=/tmp/mailfile.$$
+export RPTFILE=$RPTDIR/stats/central/statsExcludeRpt.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SERVERLIST && \rm -f $SERVERLIST
+	test -f $MAILFILE && \rm -f $MAILFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Get list of servers
+#--------------------------------------------------------------------------
+getAseList | sort > $SERVERLIST
+
+#--------------------------------------------------------------------------
+#  Query each server for excluded DBs
+#--------------------------------------------------------------------------
+cat $SERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	export EXFILE=$CTLDIR/$DBSERVER/$DBSERVER.statsExclude.lst
+	if [ -s $EXFILE ]
+	then
+		if [ ! -s $RPTFILE ]
+		then
+		        > $RPTFILE
+		        echo `date` >> $RPTFILE
+			echo "The following databases are EXCLUDED from update statistics:" >> $RPTFILE	
+		fi
+		echo "\n--------$DBSERVER--------" >> $RPTFILE
+		cat $EXFILE >> $RPTFILE
+	fi
+done
+
+#--------------------------------------------------------------------------
+#  If there are any exclusions, mail dba
+#--------------------------------------------------------------------------
+if [ -s $RPTFILE ]
+then
+	cat $RPTFILE > $MAILFILE
+	export MAILSUBJECT="REPORT: Update Stats Exclusions"
+	sendMail
+fi

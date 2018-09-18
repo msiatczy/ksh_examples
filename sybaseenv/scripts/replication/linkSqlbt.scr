@@ -1,0 +1,133 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: linkSqlbt.scr -L <control list> -S <dbserver> {-noprompt}
+#
+#  Description: Create links for SQLBT that can be used to backup/recover control directory of databases
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<control list> - input list of databases to be replicated
+#              	<DBSERVER> - primary database server
+#
+#  Modification History:
+#	11/10/08 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+#  Initialize Parameters
+#--------------------------------------------------------------------------
+
+export USAGE="\nERROR - Usage: $0 -L <control list> -S <dbserver> {-noprompt}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -L)     export LISTFILE=$2;shift 2;;
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -noprompt)   export PROMPT=0;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$PROMPT" && export PROMPT=1
+
+# must source profile after setting DBSERVER to get env for SQLBT
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Verify Parameters
+#--------------------------------------------------------------------------
+#LISTFILE must exist under central control directory
+CTLFILE=$CTLDIR/replication/$LISTFILE
+if [ ! -s $CTLFILE ]
+then
+	echo "\nERROR - $CALLED"
+	echo "\n$CTLFILE does not exist or is 0 bytes\n"
+	exit 1
+fi
+
+export DBLIST=/tmp/dblist.$$
+export REPBASE=$DT_PHYSICAL/${DBSERVER}_REP
+export PHYSBASE=$DT_PHYSICAL/$DBSERVER
+
+#--------------------------------------------------------------------------
+#  Define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  PROMPT TO CONTINUE
+#--------------------------------------------------------------------------
+if [ $PROMPT -eq 1 ]
+then
+	echo "\nYou are about to create links for $DBSERVER under $REPBASE\n"
+	export CONTINUE=""
+	while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+	do
+		echo "DO YOU WISH TO CONTINUE? {y/n}"
+		read CONTINUE
+	done
+	if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+	then
+		echo "\nExiting - No links created for $DBSERVER\n"
+		exit 0
+	fi
+fi
+#--------------------------------------------------------------------------
+#  Get list of databases
+#--------------------------------------------------------------------------
+cut -d" " -f2 $CTLFILE > $DBLIST
+
+#--------------------------------------------------------------------------
+#  Make the control directory if it doesn't exist
+#--------------------------------------------------------------------------
+test ! -d $REPBASE && mkdir $REPBASE
+
+#--------------------------------------------------------------------------
+#  Create link to .dtoptions file from the physical control directory
+#  Copy the empty .dtoptions file under tran/DBSERVER control directory
+#--------------------------------------------------------------------------
+test ! -f $REPBASE/.dtoptions && cp -p $PHYSBASE/.dtoptions $REPBASE/.dtoptions
+
+#--------------------------------------------------------------------------
+#  Create the links
+#--------------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+        export $DBNAME
+        export REPFILE=$REPBASE/$DBNAME
+        export PHYSFILE=$PHYSBASE/$DBNAME
+
+        if [ ! -L $REPFILE ]
+        then
+                echo "Creating link:  $REPFILE -> $PHYSFILE"
+                ln -s $PHYSFILE $REPFILE
+        else
+                echo "LINK EXISTS:  $REPFILE -> $PHYSFILE"
+        fi
+done
+echo "\nReview links under $REPBASE\n"
+
+#--------------------------------------------------------------------------
+#  exit
+#--------------------------------------------------------------------------
+exit 0

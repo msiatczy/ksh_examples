@@ -1,0 +1,4 @@
+#!/bin/ksh
+
+echo "base $$"
+sub.scr $$

@@ -1,0 +1,191 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: lockMaintLogins.scr -L <control list> -S <DBSERVER> -lock|-unlock -fmt|-run {-noprompt}
+#
+#  Description: Lock maint logins on a server.
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<control list> - input list of servers and databases
+#              	<DBSERVER> - database server
+#
+#   NOTE:  -L <control list> and other parameters are mutually exclusive.
+#
+#  Modification History:
+#	05/14/03 M. Siatczynski	Initial Script
+#	07/09/04 M. Siatczynski	Remove status echoes
+#	07/23/04 M. Siatczynski	Centralized script
+#	02/21/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#       09/23/10 K. Sawant      Added dummy connection to incorporate MSA's control list
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+#  Initialize Parameters
+#--------------------------------------------------------------------------
+
+export USAGE="\nERROR - Usage: $0 -L <control list> -S <dbserver> -lock|-unlock -fmt|-run {-noprompt}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -L)     export LISTFILE=$2;shift 2;;
+                        -S)    export DBSERVER=$2;shift 2;;
+                        -lock)   export LOCK=1;shift 1;;
+                        -unlock)   export UNLOCK=1;shift 1;;
+                        -fmt)   export FMT=1;shift 1;;
+                        -run)   export RUN=1;shift 1;;
+                        -noprompt)   export PROMPT=0;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$FMT" && export FMT=0
+test ! "$RUN" && export RUN=0
+test ! "$PROMPT" && export PROMPT=1
+test ! "$LOCK" && export LOCK=0
+test ! "$UNLOCK" && export UNLOCK=0
+
+#--------------------------------------------------------------------------
+#  Verify Parameters
+#--------------------------------------------------------------------------
+# fmt and/or run must be passed
+if [ $FMT -eq 0 -a $RUN -eq 0 ]
+then
+	echo "$USAGE"
+	echo "\n-fmt and/or -run MUST be passed\n"
+	exit 1
+fi
+
+# dbserver must be passed
+if [ ! "$DBSERVER" ]
+then
+	echo "$USAGE"
+	echo "\ndbserver MUST be passed\n"
+	exit 1
+fi
+
+# lock or unlock must be passed but both can not be passed
+if [ $LOCK -eq 1 ]
+then
+	if [ $UNLOCK -eq 1 ]
+	then
+		echo "$USAGE"
+		echo "\n-lock and -unlock are mutually exclusive\n"
+		exit 1
+	fi
+	export LOCKSET=lock
+else
+	if [ $UNLOCK -eq 0 ]
+	then
+		echo "$USAGE"
+		echo "\nEither -lock or -unlock MUST be passed\n"
+		exit 1
+	fi
+	export LOCKSET=unlock
+fi
+
+export SQLFILE=$SQLDIR/replication/$DBSERVER.lockMaintLogins.sql
+export OUTFILE=$LOGDIR/replication/$DBSERVER/$DBSERVER.lockMaintLogins.$DATETIME
+
+if [ "$LISTFILE" ]
+then
+#LISTFILE must exist under central control directory
+        CTLFILE=$CTLDIR/replication/$LISTFILE
+        if [ ! -s $CTLFILE ]
+        then
+                echo "\nERROR - $CALLED"
+                echo "\n$CTLFILE does not exist or is 0 bytes\n"
+                exit 1
+        fi
+else
+#if LISTFILE wasn't passed, dbserver and -run must be passed
+        if [ ! "$DBSERVER" -o $RUN -eq 0 ]
+        then
+                echo "$USAGE"
+                echo "\nIf control list is not passed, <dbserver> and -run MUST be passed.\n"
+                exit 1
+# verify sql file exists
+	else
+		if [ ! -s "$SQLFILE" ]
+		then
+                	echo "$USAGE"
+	                echo "\n$SQLFILE does not exist - rerun script with -fmt option.\n"
+	                exit 1
+		fi			
+        fi
+fi
+
+#--------------------------------------------------------------------------
+#  Format the sql
+#--------------------------------------------------------------------------
+if [ $FMT -eq 1 ]
+then
+	> $SQLFILE
+	cat $CTLFILE |
+	while read dummy DBNAME dummy dummy dummy dummy
+	do
+		export dummy DBNAME dummy dummy dummy dummy
+		echo "sp_locklogin ${DBNAME}_maint,\"$LOCKSET\"" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+#	echo "\nSQL file generated:  $SQLFILE"
+fi
+
+#--------------------------------------------------------------------------
+#  Run the SQL
+#--------------------------------------------------------------------------
+if [ $RUN -eq 1 ]
+then
+#--------------------------------------------------------------------------
+#  PROMPT TO CONTINUE
+#--------------------------------------------------------------------------
+	if [ $PROMPT -eq 1 ]
+	then
+		echo "\nYou are about to $LOCKSET maint users on $DBSERVER using SQL in $SQLFILE\n"
+		export CONTINUE=""
+		while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+		do
+			echo "DO YOU WISH TO CONTINUE? {y/n}"
+			read CONTINUE
+		done
+		if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+		then
+			echo "\nExiting - No SQL run against $DBSERVER\n"
+			exit 0
+		fi
+	fi
+
+#	echo "Running SQL in $SQLFILE..."
+	> $OUTFILE
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e -i$SQLFILE | grep -v Password >> $OUTFILE
+
+#--------------------------------------------------------------------------
+#  Check output
+#--------------------------------------------------------------------------
+	checkSqlErr $OUTFILE
+	if [ $? -ne 0 ]
+	then
+	        echo "Script FAILED"
+	        echo "\nReview output in $OUTFILE\n"
+	        exit 1
+	else
+	        echo "Script SUCCESSFUL"
+	        exit 0
+	fi
+fi
+
+exit 0

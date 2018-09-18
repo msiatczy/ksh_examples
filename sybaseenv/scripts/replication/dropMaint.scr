@@ -1,0 +1,190 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dropMaint.scr -S <DBSERVER> {-D <dbname>} -fmt|-run {-noprompt}
+#
+#  Description: Drop maint users to DBSERVER
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - database server
+#		<dbname> - name of database
+#
+#  Modification History:
+#	08/11/04 M. Siatczynski	Initial Script - copied from addMaint.scr
+#	02/21/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+#  Initialize and verify Parameters
+#--------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>} -fmt|-run {-noprompt}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export ONEDBNAME=$2;shift 2;;
+                        -fmt)   export FMT=1;shift 1;;
+                        -run)   export RUN=1;shift 1;;
+                        -noprompt)   export PROMPT=0;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$FMT" && export FMT=0
+test ! "$RUN" && export RUN=0
+test ! "$PROMPT" && export PROMPT=1
+
+export SQLFILE=$SQLDIR/replication/$DBSERVER.dropMaint.sql
+export DBLIST=/tmp/dblist.$$
+
+# fmt and/or run must be passed
+if [ $FMT -eq 0 -a $RUN -eq 0 ]
+then
+	echo "$USAGE"
+	echo "\n-fmt and/or -run MUST be passed\n"
+	exit 1
+fi
+
+# if -run is passed, <dbserver> must be passed
+if [ $RUN -eq 1 -a ! "$DBSERVER" ]
+then
+	echo "$USAGE"
+	echo "\ndbserver MUST be passed with -run\n"
+	exit 1
+fi
+
+#if DBSERVER and -run passed, SQLFILE must already exist
+if [ ! "$DBSERVER" -a $RUN -eq 1 ]
+then
+	if [ ! -s "$SQLFILE" ]
+	then
+               	echo "$USAGE"
+                echo "\n$SQLFILE does not exist - rerun script with -fmt option.\n"
+		exit 1
+	fi			
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+#--------------------------------------------------------------------------
+if [ "$ONEDBNAME" ]
+then
+	echo $ONEDBNAME > $DBLIST
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from master..sysdatabases order by name
+	go
+	!
+fi
+
+#--------------------------------------------------------------------------
+#  format sql file
+#--------------------------------------------------------------------------
+if [ $FMT -eq 1 ]
+then
+	> $SQLFILE
+
+	cat $DBLIST |
+	while read DBNAME
+	do
+		export DBNAME
+		export MAINTUSER=${DBNAME}_maint
+
+		echo "use $DBNAME" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "if exists (select * from $DBNAME..sysusers where name = '$MAINTUSER')" >> $SQLFILE
+		echo "exec sp_dropuser $MAINTUSER" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "if exists (select * from $DBNAME..sysalternates where suid = suser_id('$MAINTUSER'))" >> $SQLFILE
+		echo "exec sp_dropalias $MAINTUSER" >> $SQLFILE
+		echo "go" >> $SQLFILE
+
+		echo "use master" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "if exists (select * from master..syslogins where name = '$MAINTUSER')" >> $SQLFILE
+		echo "exec sp_droplogin $MAINTUSER" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done 
+fi
+
+#--------------------------------------------------------------------------
+#  Run the SQL
+#  PROMPT TO CONTINUE
+#--------------------------------------------------------------------------
+if [ $RUN -eq 1 ]
+then
+	if [ $PROMPT -eq 1 ]
+	then
+		echo "\nYou are about to drop maint users and logins on $DBSERVER using SQL in $SQLFILE\n"
+		export CONTINUE=""
+		while [ "$CONTINUE" != "Y" -a "$CONTINUE" != "y" -a "$CONTINUE" != "N" -a "$CONTINUE" != "n" ]
+		do
+			echo "DO YOU WISH TO CONTINUE? {y/n}"
+			read CONTINUE
+		done
+		if [ "$CONTINUE" = "n" -o "$CONTINUE" = "N" ]
+		then
+			echo "\nExiting - No SQL run against $DBSERVER\n"
+			exit 0
+		fi
+	fi
+
+	if [ ! -s "$SQLFILE" ]
+	then
+	        echo "ERROR - $SQLFILE does not exist - rerun script with -fmt option.\n"
+	        exit 1
+	fi			
+
+	export OUTFILE=$LOGDIR/useradmin/$DBSERVER/$DBSERVER.dropMaint.$DATETIME
+	> $OUTFILE
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e -i$SQLFILE | grep -v Password >> $OUTFILE
+
+#--------------------------------------------------------------------------
+#  Check output
+#--------------------------------------------------------------------------
+	checkSqlErr $OUTFILE
+	if [ $? -ne 0 ]
+	then
+	        echo "Script FAILED"
+	        echo "\nReview output in $OUTFILE\n"
+	        exit 1
+	else
+	        echo "Script SUCCESSFUL"
+	        exit 0
+	fi
+elif [ $FMT -eq 1 ]
+then
+	echo "\nSQL file created:  $SQLFILE\n"
+fi
+
+#--------------------------------------------------------------------------
+# exit
+#--------------------------------------------------------------------------
+exit 0

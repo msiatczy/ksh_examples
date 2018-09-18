@@ -1,0 +1,154 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dbccFaultreport.scr -S <DBSERVER> {-D <DBNAME> -m <maildest> -p <pagedest>}
+#
+#  Description: Run sp_dbcc_faultreport against database(s)
+#
+#     Location:	/sccm/dba/sybase/scripts/dbccFaultreport.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	DBSERVER - database server
+#              	DBNAME - database name
+#              	maildest - override default mail destination of dba
+#              	pagedest - Page flag and destination
+#
+#
+#  Modification History:
+#	12/01/01 K. Hess	Initial Script
+#	10/31/03 M. Siatczynski	Centralized script
+#	04/12/05 M. Siatczynski	Removed exclusion coding for syslogs - exclusion logic moved internal to dbccdb
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+## unset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+unset PAGEDEST
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname> -m <maildest> -p <pagedest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -p)     export PAGEDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export PARSERPT=/tmp/parserpt.$$
+export TEMPMAIL=/tmp/tempmail.$$
+export MAILFILE=/tmp/faultmail.$$
+
+if [ "$DBNAME" ]
+then
+	export RPTFILE=$RPTDIR/dbcc/$DBSERVER/$DBSERVER.$DBNAME.dbccFaultreport.$DATETIME
+else
+	export RPTFILE=$RPTDIR/dbcc/$DBSERVER/$DBSERVER.dbccFaultreport.$DATETIME
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TEMPMAIL && \rm -f $TEMPMAIL
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PARSERPT && \rm -f $PARSERPT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Generate the fault report
+#--------------------------------------------------------------------------
+> $MAILFILE
+> $RPTFILE
+echo `date` >> $RPTFILE
+echo "\nFAULT Report for $DBSERVER $DBNAME\n" >> $RPTFILE
+
+test "$DBNAME" && export DBSTRING=", $DBNAME"
+
+$ISQLEXE -U$ADMINLOGIN -S$DBSERVER <<-! | grep -v Password >> $RPTFILE
+`getPass $DBSERVER $ADMINLOGIN`
+use dbccdb
+go
+sp_dbcc_faultreport "long"${DBSTRING}
+go
+!
+
+#--------------------------------------------------------------------------
+# Format the report
+#--------------------------------------------------------------------------
+# the following two lines don't do anything - comment out before deleting (MJS 4/12/05)
+#egrep -i hard $RPTFILE > /dev/null
+#export RC=$?
+egrep -i '(^generating|hard)' $RPTFILE | sed -e 's/^Type Code/---> (table on previous line) Type Code/g' > $PARSERPT
+
+GENER=1
+
+cat $PARSERPT | 
+while read LINE
+do
+	export LINE
+	export KEY=`echo $LINE | nawk '{print $1}'`
+	if [ $KEY = 'Generating' ]
+	then
+#		export OBJECT=`echo $LINE | nawk '{print $6}'`
+		export SAVELINE=$LINE
+		export GENER=1
+#		if [ $OBJECT = 'syslogs' ]
+#		then
+#			export IGNORE=1
+#		else
+#			export IGNORE=0
+#		fi
+	else
+#		if [ $IGNORE != 1 ]
+#		then
+			if [ $GENER -eq 1 ]
+			then
+				echo " " >> $TEMPMAIL
+				echo $SAVELINE >> $TEMPMAIL
+				echo $LINE >> $TEMPMAIL
+				export GENER=0
+			else
+				echo $LINE >> $TEMPMAIL
+			fi
+#		fi
+	fi
+done
+
+#--------------------------------------------------------------------------
+#  Add uniq before sending MAILFILE to minimize duplicate messages
+#--------------------------------------------------------------------------
+if [ -s $TEMPMAIL ]
+then
+	> $MAILFILE
+        echo "Report Date:  `date`\n" >> $MAILFILE
+	uniq $TEMPMAIL >> $MAILFILE
+	export MAILSUBJECT="$DBSERVER DBCC FAULT REPORT"
+	sendMail
+fi

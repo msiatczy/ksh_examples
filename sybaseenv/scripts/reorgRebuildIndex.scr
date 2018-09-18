@@ -1,0 +1,251 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: reorgRebuildIndex.scr -S <DBSERVER> -D <dbname> (-T <table> -I <index>|-L <table/index list>) -fmt -run {-abort -m <maildest> -p <pagedest> -pagedone <pagedest>}
+#
+#  Description: Generate and execute SQL to run reorg rebuild for a single table/index or list of tables/indexes (single database ONLY).
+#		COMMENTED OUT FOR NOW.....Table list gets sorted so reorgs start with smallest tables.
+#		reorg rebuild of index can only be used on DOL tables
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	DBSERVER - ASE name
+#              	DBNAME - database name
+#		TABLE - single table
+#		INDEX - single index
+#              	table list - list of tables/indexes
+#              	abort - abort entire process on any reorg error, default=do NOT abort
+#
+# NOTE:  select into/bulkcopy -- NOT required for index reorgs on DOL tables
+#
+#  Modification History:
+#	01/25/11 M. Siatczynski	Initial scripts (copied from reorgRebuild)
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname> (-T <table> -I <index>|-L <table/index list>) -fmt -run {-abort -m <maildest> -p <pagedest> -pagedone <pagedest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -T)     export ONETABLE=$2;shift 2;;
+                        -I)     export ONEINDEX=$2;shift 2;;
+                        -L)     export TILIST=$2;shift 2;;
+                        -fmt)   export FMT=1;shift 1;;
+                        -run)   export RUN=1;shift 1;;
+                        -abort)   export ABORT=1;shift 1;;
+                        -m)     export MAILTO=$2;shift 2;;
+                        -p)     export PAGETO=$2;shift 2;;
+                        -pagedone)     export PAGEDONE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$FMT" && export FMT=0
+test ! "$RUN" && export RUN=0
+test ! "$ABORT" && export ABORT=0
+
+# must specify ASE and DBNAME
+if [ ! "$DBSERVER" -o ! "$DBNAME" ]
+then
+        echo $USAGE
+	echo "ERROR - DBSERVER and DBNAME are required"
+        exit 1
+fi
+
+# must pass individual table/index or list, but not all 3 parms
+# if list passed, make sure it's not 0 bytes
+if [ "$ONETABLE" -a "$ONEINDEX" ]
+then
+	if [ "$TILIST" ]
+	then
+		echo "$USAGE"
+		echo "ERROR - Individual TABLE/INDEX and LIST of tables/indexes are mutually exclusive"
+		exit 1
+	fi
+elif [ "$TILIST" ]
+then
+	if [ "$ONETABLE" -o "$ONEINDEX" ]
+	then
+		echo "ERROR - Individual TABLE/INDEX not valid when LIST of tables/indexes is specified"
+		exit 1
+	fi
+	if [ ! -s "$TILIST" ]
+	then
+		echo "ERROR - $TILIST does not exist or is 0 bytes"
+		exit 1
+	fi
+else
+	echo "$USAGE"
+	echo "ERROR - Either individual TABLE/INDEX or LIST of tables/indexes MUST be specified"
+	exit 1
+fi
+
+# fmt and/or run must be passed
+if [ $FMT -eq 0 -a $RUN -eq 0 ]
+then
+	echo "$USAGE"
+	echo "\n-fmt and/or -run MUST be passed\n"
+	exit 1
+fi
+
+## reset the centrally-set PAGEDEST variable - setting determines whether or not to send page
+## reset the centrally-set MAILDEST variable if a different maildest was passed
+test "$PAGETO" && export PAGEDEST=$PAGETO || unset PAGEDEST
+test "$MAILTO" && export MAILDEST=$MAILTO
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export WORKLIST=/tmp/worklist.$$
+export MAILFILE=/tmp/mailfile.$$
+export PAGEMSG=/tmp/pagemsg.$$
+export RPTFILE=$RPTDIR/reorg/$DBSERVER/$DBSERVER.$DBNAME.reorgRebuildIndex.$DATETIME
+
+> $RPTFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#  If PAGEDONE set, set appropriate page message and send page
+#--------------------------------------------------------------------------
+function tempCleanup {
+	if [ "$PAGEDONE" ]
+	then
+		test $REORGRC -eq 0 && export PAGESTATUS=SUCCESS || export PAGESTATUS="FAILURE"
+		echo "`date` $DBSERVER $DBNAME reorg status=$PAGESTATUS" > $PAGEMSG
+		export PAGEDEST=$PAGEDONE
+		sendPage
+	fi
+	test -f $WORKLIST && \rm -f $WORKLIST
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $PAGEMSG && \rm -f $PAGEMSG
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create working list of tables/indexes
+#--------------------------------------------------------------------------
+> $WORKLIST
+if [ "$TILIST" ]
+then
+	cat $TILIST >> $WORKLIST
+else
+	echo "$ONETABLE $ONEINDEX" >> $WORKLIST
+fi
+
+#--------------------------------------------------------------------------
+# If FMT=1 then format the reorg sql
+#--------------------------------------------------------------------------
+if [ $FMT -eq 1 ]
+then
+	echo "`date` FORMAT SQL" >> $RPTFILE
+
+#------------------------------------------------------------------------------
+# Format the reorg SQL
+# Include select @@servername so we know exactly where we are running if running against a VIP
+# Separate file generated for EACH table/index
+#------------------------------------------------------------------------------
+	cat $WORKLIST |
+	while read TABLE INDEX
+	do
+		export TABLE INDEX
+		export REORGSQL=$SQLDIR/$DBSERVER/$DBSERVER.$DBNAME.$TABLE.$INDEX.reorg.sql
+
+		> $REORGSQL
+		echo "select @@servername" >> $REORGSQL
+		echo "go" >> $REORGSQL
+		echo "use $DBNAME" >> $REORGSQL
+		echo "go" >> $REORGSQL
+		echo "exec sp_dbfull $DBNAME" >> $REORGSQL
+		echo "go" >> $REORGSQL
+
+		echo "exec sp_spaceused $TABLE,1" >> $REORGSQL
+		echo "go" >> $REORGSQL
+		echo "select convert(char,getdate(),9)" >> $REORGSQL
+		echo "go" >> $REORGSQL
+		echo "reorg rebuild $TABLE $INDEX" >> $REORGSQL
+		echo "go" >> $REORGSQL
+		echo "select convert(char,getdate(),9)" >> $REORGSQL
+		echo "go" >> $REORGSQL
+		echo "exec sp_spaceused $TABLE,1" >> $REORGSQL
+		echo "go" >> $REORGSQL
+
+		echo "exec sp_dbfull $DBNAME" >> $REORGSQL
+		echo "go" >> $REORGSQL
+	done
+
+	echo "`date` FORMAT SQL COMPLETE" >> $RPTFILE
+fi
+
+#------------------------------------------------------------------------------
+# If RUN=1, execute the SQL to run reorg rebuild - use sqlTimer.scr
+# Check for errors -- always send mail, send page if page flag set
+# If error occurs, stop at that point and don't try to do any more tables---because they will probably fail too
+#------------------------------------------------------------------------------
+if [ $RUN -eq 1 ]
+then
+	echo "`date` EXECUTE SQL" >> $RPTFILE
+	echo "`date` Reorging the following indexes (in order listed):" >> $RPTFILE
+	cat $WORKLIST >> $RPTFILE
+
+	cat $WORKLIST |
+	while read TABLE INDEX
+	do
+		echo "`date` REORGING $TABLE $INDEX" >> $RPTFILE
+		export REORGSQL=$SQLDIR/$DBSERVER/$DBSERVER.$DBNAME.$TABLE.$INDEX.reorg.sql
+		export REORGOUT=$LOGDIR/reorg/$DBSERVER/$DBSERVER.$DBNAME.$TABLE.$INDEX.reorg.$DATETIME
+
+		export REORGRC=0
+		> $REORGOUT
+		$SCRDIR/sqlTimer.scr -S $DBSERVER -i $REORGSQL -o $REORGOUT -m $MAILFILE
+		if [ $? -ne 0 ]
+		then
+			export REORGRC=1
+			cat $REORGOUT >> $RPTFILE
+			echo "ERROR reorging $DBSERVER:$DBNAME:$TABLE:$INDEX" >> $RPTFILE
+			export MAILSUBJECT="ERROR reorging $DBSERVER:$DBNAME:$TABLE:$INDEX"
+			cat $REORGOUT > $MAILFILE
+			sendMail
+
+			if [ "$PAGEDEST" ]
+			then
+				echo "ERROR reorging $DBSERVER:$DBNAME:$TABLE:$INDEX" > $PAGEMSG
+				sendPage
+			fi
+
+# if abort flag is 1, then stop upon error, otherwise, continue with next table/index in list
+			if [ $ABORT -eq 1 ]
+			then
+				echo "`date` ABORTING index reorgs for database $DBNAME...script exiting." >> $RPTFILE
+				exit 1
+			else
+				echo "Continuing with next table/index..." >> $RPTFILE
+				continue
+			fi
+		else
+			cat $REORGOUT >> $RPTFILE
+		fi
+	done
+
+	echo "`date` EXECUTE SQL COMPLETE" >> $RPTFILE
+	exit 0
+else
+	exit 0
+fi

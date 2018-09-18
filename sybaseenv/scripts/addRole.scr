@@ -1,0 +1,125 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: addRole.scr -U <user> -role <role> -S <DBSERVER>,<DBSERVER>,etc
+#
+#  Description: Add a new role to one or more ASEs
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<user> - login of the user running the add
+#		<role> - role to be added
+#
+#
+#  Modification History:
+#	02/21/07 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -U <user> -role <role> -S <DBSERVER>,<DBSERVER>,etc"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-U)		export EXEUSER=$2;shift 2;;
+			-role)		export ROLE=$2;shift 2;;
+			-S)		export DBSERVERSPEC=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# user and role must be passed
+if [ ! "$EXEUSER" -o ! "$ROLE" -o ! "$DBSERVERSPEC" ]
+then
+	echo $USAGE
+	exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/useradmin/central/addRole.$DATETIME.$$
+export SQLFILE=/tmp/sqlfile.$$
+export SQLOUT=/tmp/sqlout.$$
+
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQLFILE && \rm -f $SQLFILE
+	test $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Format serverlist 
+#--------------------------------------------------------------------------
+export DBSERVERLIST=`echo $DBSERVERSPEC | sed -e 's/,/ /g'`
+
+#------------------------------------------------------------------------------
+# Write headers
+#------------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Adding ROLE $ROLE to the following ASEs:" >> $LOGFILE
+echo $DBSERVERLIST >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Format sql to add role
+#------------------------------------------------------------------------------
+> $SQLFILE
+
+echo "use master" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+echo "print \"Adding ROLE ($ROLE) on %1!...\",@@servername" >> $SQLFILE
+echo "if not exists (select name from master..syssrvroles where name = \"$ROLE\")" >> $SQLFILE
+echo "create role $ROLE" >> $SQLFILE
+echo "else" >> $SQLFILE
+echo "print \"ROLE ($ROLE) already exists on %1!\",@@servername" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#------------------------------------------------------------------------------
+# run the sql to add the role
+#------------------------------------------------------------------------------
+echo ""
+for DBSERVER in `echo $DBSERVERLIST`
+do
+	echo "$DBSERVER: Adding ROLE ($ROLE) to $DBSERVER" >> $LOGFILE
+	getPass $DBSERVER $EXEUSER | $ISQLEXE -U$EXEUSER -S$DBSERVER -w200 -i $SQLFILE >> $LOGFILE
+done
+
+#------------------------------------------------------------------------------
+# check output
+# Report on roles that already exist
+# Check for errors
+# Exit
+#------------------------------------------------------------------------------
+egrep '(^ROLE |^Adding ROLE )' $LOGFILE
+echo ""
+
+checkSqlErr $LOGFILE
+if [ $? -ne 0 ]
+then
+        echo "ERROR - adding role"
+        echo "Review $LOGFILE"
+        echo "\nREMINDER:  THIS SCRIPT MUST BE EXECUTED AGAINST BOTH ASEs IN A REPLICATED ENVIRONMENT.\n"
+        exit 1
+else
+        echo "\nREMINDER:  THIS SCRIPT MUST BE EXECUTED AGAINST BOTH ASEs IN A REPLICATED ENVIRONMENT.\n"
+        exit 0
+fi

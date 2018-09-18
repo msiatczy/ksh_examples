@@ -1,0 +1,127 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: dropLogin.scr -S <DBSERVER>|all
+#
+#  Description: Report on locked logins on one or all DBSERVERS
+#
+#     Location:	/sccm/dba/sybase/scripts/dropLogin.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - login of the user running the drop
+#
+#  Modification History:
+#       07/06/06 M. Siatczynski Initial script
+#       07/31/09 M. Siatczynski Add lockedby and lockreason to output
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER>|all"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+			-S)		export ONEDBSERVER=$2;shift 2;;
+			-*)		echo $USAGE;exit 1;;
+			*)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+# these parms must be passed
+if [ ! "$ONEDBSERVER" ]
+then
+	echo $USAGE
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export SQLOUT=/tmp/sqlout.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create working list of ASEs
+#------------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList > $DBSERVERLIST
+	export RPTFILE=$RPTDIR/useradmin/central/findLockedLogins.$DATETIME
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+	export RPTFILE=$RPTDIR/useradmin/$ONEDBSERVER/$ONEDBSERVER.findLockedLogins.$DATETIME
+fi
+
+#------------------------------------------------------------------------------
+# Execute the SQL
+# append the output to the logfile
+#------------------------------------------------------------------------------
+> $RPTFILE
+echo "`date` START Find locked logins" >> $RPTFILE
+
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password: > $SQLOUT
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select count(*),"Logins locked on $DBSERVER" from master..syslogins where status&2=2
+	go
+	select @@servername,name,lockreason,suser_name(locksuid),lockdate from master..syslogins where status&2=2 order by name
+	go
+	!
+
+	cat $SQLOUT >> $RPTFILE
+
+#------------------------------------------------------------------------------
+# check output
+# Report on logins that were dropped
+# Check for errors
+#------------------------------------------------------------------------------
+	checkSqlErr $SQLOUT
+	if [ $? -eq 1 ]
+	then
+		export HIGHRC=1
+		echo "`date` Query FAILED for $DBSERVER" | tee -a $RPTFILE
+	fi
+done
+
+echo "`date` END Find locked logins" >> $RPTFILE
+
+#------------------------------------------------------------------------------
+# exit with final return status
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 1 ]
+then
+        echo "Query FAILED against one or more ASEs - output in $RPTFILE"
+        exit 1
+else
+        echo "Query SUCCESSFUL against all ASEs - output in $RPTFILE"
+        exit 0
+fi
+

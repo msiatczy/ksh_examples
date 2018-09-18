@@ -1,0 +1,111 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: formatViewAudit.scr -S <DBSERVER> -D <dbname> -L <view list> -on|-off
+#
+#  Description: Format sp_audit statements to audit views
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - short description of parm if not obvious
+#              	<-on -off> - turn auditing on or off
+#
+#  NOTE:  tempdb is not included in the audit
+#
+#  Modification History:
+#	03/14/06 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname> -L <view list> -on|-off"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -L)     export VIEWLIST=$2;shift 2;;
+                        -on)    export ON=1;shift 1;;
+                        -off)   export OFF=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$ON" && export ON=0
+test ! "$OFF" && export OFF=0
+
+if [ ! "$DBSERVER" -o ! "$DBNAME" -o ! "$VIEWLIST" ]
+then
+        echo $USAGE
+        exit 1
+elif [ $ON -eq 0 -a $OFF -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ $ON -eq 1 -a $OFF -eq 1 ]
+then
+	echo "ERROR - -on and -off are mutually exclusive"
+	exit 1
+fi
+
+test $ON -eq 1 && export STATUS=on || export STATUS=off
+
+if [ ! -s "$VIEWLIST" ]
+then
+	echo "ERROR - $VIEWLIST does not exist or is 0 bytes"
+	exit 1
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SQLFILE=$SQLDIR/$DBSERVER/$DBSERVER.$DBNAME.viewAudit.$STATUS.$DATETIME.sql
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+#function tempCleanup {
+#	test -f $DBLIST && \rm -f $DBLIST
+#}
+
+#trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  For each database:
+#  format sql for dbaccess audit
+#--------------------------------------------------------------------------
+> $SQLFILE
+echo "use $DBNAME" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+cat $VIEWLIST |
+while read VIEWNAME
+do
+	export VIEWNAME
+	echo "exec sp_audit \"insert\",\"all\",$VIEWNAME,\"$STATUS\"" >> $SQLFILE
+	echo "exec sp_audit \"update\",\"all\",$VIEWNAME,\"$STATUS\"" >> $SQLFILE
+	echo "exec sp_audit \"delete\",\"all\",$VIEWNAME,\"$STATUS\"" >> $SQLFILE
+	echo "exec sp_audit \"select\",\"all\",$VIEWNAME,\"$STATUS\"" >> $SQLFILE
+	echo "go" >> $SQLFILE
+done
+
+#--------------------------------------------------------------------------
+#  Write trailers
+#--------------------------------------------------------------------------
+echo "\nThe following SQL file has been created:  $SQLFILE\n"

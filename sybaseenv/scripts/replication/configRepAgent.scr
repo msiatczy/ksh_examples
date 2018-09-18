@@ -1,0 +1,214 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: configRepAgent.scr -L <control list> -RS <repserver> | -PDS <primary DBSERVER> -RDS <replicate DBSERVER> -TDS <tertiary DBSERVER> -D <dbname> -RS <repserver>
+#
+#  Description: Update servername, username and password for rep agents when databases are refreshed from prod to lower env.
+#
+#     Location:	Full directory path for location of script.  If there is a
+#		master copy, mention where it is located.
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<control list> - input list of databases to be replicated
+#              	<primary DBSERVER> - primary database server
+#              	<replicate DBSERVER> - replicate database server
+#              	<tertiary DBSERVER> - replicate database server
+#              	<dbname> - database to be replicated
+#
+#   NOTE:  -L <control list> and other parameters are mutually exclusive.
+#
+#   NOTE:  Repserver username and password are defaults based on repserver name.
+#
+#  Modification History:
+#	05/13/03 M. Siatczynski	Initial Script
+#	07/23/04 M. Siatczynski	Centralized script
+#	05/04/05 M. Siatczynski	Remove echo on successful exit
+#	02/21/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#       09/16/10 K. Sawant      Added Tertiary connection to incorporate MSA's control list
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+#  Initialize Parameters
+#--------------------------------------------------------------------------
+export USAGE="\nERROR - Usage: $0 -L <control list> -RS <repserver> | -PDS <from DBSERVER> -RDS <to DBSERVER> -TDS <tertiary DBSERVER> -D <dbname> -RS <repserver>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -L)     export LISTFILE=$2;shift 2;;
+                        -RS)    export REPSERVER=$2;shift 2;;
+                        -PDS)   export PDS=$2;shift 2;;
+                        -RDS)   export RDS=$2;shift 2;;
+                        -TDS)   export TDS=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+export TEMPFILE=/tmp/tempfile.$$
+export OUTFILE=$LOGDIR/replication/$REPSERVER/$REPSERVER.configRepAgent.$DATETIME
+
+#--------------------------------------------------------------------------
+#  Verify Parameters
+#--------------------------------------------------------------------------
+if [ "$LISTFILE" ]
+then
+
+#LISTFILE cannot be passed with any other parameters
+	if [ "$PDS" -o "$RDS" -o "$TDS" -o "$DBNAME" ]
+	then
+		echo "$USAGE"
+		echo "\ncontrol list and other parameters are mutually exclusive\n"
+		exit 1
+	fi
+
+#REPSERVER must be passed if LISTFILE is valid
+        if [ ! "$REPSERVER" ]
+        then
+                echo "$USAGE"
+                echo "\nRep server must be specified with control list\n"
+                exit 1
+        fi
+
+#LISTFILE must exist under central control directory
+	CTLFILE=$CTLDIR/replication/$LISTFILE
+	if [ ! -s $CTLFILE ]
+	then
+	        echo "\nERROR - $CALLED"
+	        echo "\n$CTLFILE does not exist or is 0 bytes\n"
+	        exit 1
+	fi
+else
+#if LISTFILE wasn't passed, all other parameters must be passed
+	if [ ! "$PDS" -o ! "$RDS" -o ! "$TDS" -o ! "$DBNAME" -o ! "$REPSERVER" ]
+	then
+		echo "$USAGE"
+		echo "\nIf control list is not passed, ALL other parameters MUST be passed."
+		exit 1
+	fi
+fi
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $TEMPFILE && \rm -f $TEMPFILE
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Format SQL statements
+#--------------------------------------------------------------------------
+
+if [ "$LISTFILE" ]
+then
+	cat $CTLFILE > $TEMPFILE
+else
+	echo "$PDS $DBNAME $RDS dummy dummy $TDS" > $TEMPFILE
+fi
+
+for PDS in `cut -d" " -f1 $TEMPFILE | sort | uniq`
+do
+        export SQLFILE_PDS=$SQLDIR/replication/$PDS.configRepAgent.sql
+#	echo "Removing $SQLFILE_PDS...if it exists"
+	test -f $SQLFILE_PDS && \rm $SQLFILE_PDS
+done
+
+for RDS in `cut -d" " -f3 $TEMPFILE | sort | uniq`
+do
+        export SQLFILE_RDS=$SQLDIR/replication/$RDS.configRepAgent.sql
+#	echo "Removing $SQLFILE_RDS...if it exists"
+	test -f $SQLFILE_RDS && \rm $SQLFILE_RDS
+done
+
+for TDS in `cut -d" " -f6 $TEMPFILE | sort | uniq`
+do
+        export SQLFILE_TDS=$SQLDIR/replication/$TDS.configRepAgent.sql
+#	echo "Removing $SQLFILE_TDS...if it exists"
+	test -f $SQLFILE_TDS && \rm $SQLFILE_TDS
+done
+
+cat $TEMPFILE |
+while read PDS DBNAME RDS LDS LDB TDS
+do
+	export PDS DBNAME RDS LDS LDB TDS
+        export SQLFILE_PDS=$SQLDIR/replication/$PDS.configRepAgent.sql
+        export SQLFILE_RDS=$SQLDIR/replication/$RDS.configRepAgent.sql
+        export SQLFILE_TDS=$SQLDIR/replication/$TDS.configRepAgent.sql
+
+	echo "use $DBNAME" >> $SQLFILE_PDS
+	echo "go" >> $SQLFILE_PDS
+        echo "sp_config_rep_agent $DBNAME,'rs servername',$REPSERVER" >> $SQLFILE_PDS
+        echo "go" >> $SQLFILE_PDS
+        echo "sp_config_rep_agent $DBNAME,'rs username',${REPSERVER}_ra" >> $SQLFILE_PDS
+        echo "go" >> $SQLFILE_PDS
+        echo "sp_config_rep_agent $DBNAME,'rs password',${REPSERVER}_ra_ps" >> $SQLFILE_PDS
+        echo "go" >> $SQLFILE_PDS
+
+	echo "use $DBNAME" >> $SQLFILE_RDS
+	echo "go" >> $SQLFILE_RDS
+        echo "sp_config_rep_agent $DBNAME,'rs servername',$REPSERVER" >> $SQLFILE_RDS
+        echo "go" >> $SQLFILE_RDS
+        echo "sp_config_rep_agent $DBNAME,'rs username',${REPSERVER}_ra" >> $SQLFILE_RDS
+        echo "go" >> $SQLFILE_RDS
+        echo "sp_config_rep_agent $DBNAME,'rs password',${REPSERVER}_ra_ps" >> $SQLFILE_RDS
+        echo "go" >> $SQLFILE_RDS
+	
+	echo "use $DBNAME" >> $SQLFILE_TDS
+	echo "go" >> $SQLFILE_TDS
+        echo "sp_config_rep_agent $DBNAME,'rs servername',$REPSERVER" >> $SQLFILE_TDS
+        echo "go" >> $SQLFILE_TDS
+        echo "sp_config_rep_agent $DBNAME,'rs username',${REPSERVER}_ra" >> $SQLFILE_TDS
+        echo "go" >> $SQLFILE_TDS
+        echo "sp_config_rep_agent $DBNAME,'rs password',${REPSERVER}_ra_ps" >> $SQLFILE_TDS
+        echo "go" >> $SQLFILE_TDS
+done
+
+#------------------------------------------------------------------------------
+# Run the SQL
+#------------------------------------------------------------------------------
+> $OUTFILE
+
+for PDS in `cut -d" " -f1 $TEMPFILE | sort | uniq`
+do
+	echo "Configuring rep agents on $PDS" >> $OUTFILE
+        export SQLFILE_PDS=$SQLDIR/replication/$PDS.configRepAgent.sql
+	getPass $PDS $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$PDS -w200 -e -i $SQLFILE_PDS >> $OUTFILE
+done
+ 
+for RDS in `cut -d" " -f3 $TEMPFILE | sort | uniq`
+do
+	echo "Configuring rep agents on $RDS" >> $OUTFILE
+        export SQLFILE_RDS=$SQLDIR/replication/$RDS.configRepAgent.sql
+	getPass $RDS $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$RDS -w200 -e -i $SQLFILE_RDS >> $OUTFILE
+done
+ 
+for TDS in `cut -d" " -f6 $TEMPFILE | sort | uniq`
+do
+	echo "Configuring rep agents on $TDS" >> $OUTFILE
+        export SQLFILE_TDS=$SQLDIR/replication/$TDS.configRepAgent.sql
+	getPass $TDS $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$TDS -w200 -e -i $SQLFILE_TDS >> $OUTFILE
+done
+#------------------------------------------------------------------------------
+# check output
+#------------------------------------------------------------------------------
+checkSqlErr $OUTFILE
+if [ $? -ne 0 ]
+then
+        echo "$0 FAILED - output in $OUTFILE"
+        exit 1
+else
+        exit 0
+fi

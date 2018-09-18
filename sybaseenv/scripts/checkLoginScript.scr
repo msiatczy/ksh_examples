@@ -1,0 +1,123 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkDbs.scr -S <DBSERVER> -P <procname> {-D <DBNAME>}
+#
+#  Description: Check one or all databases on a server for a designated login script
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	-S Database Server
+#              	-D Database
+#              	-P proc name
+#
+#
+#  Modification History:
+#	04/23/10 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -S <DBSERVER> -P <procname> {-D <dbname>}"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -S)	export DBSERVER=$2;shift 2;;
+	                -D)	export DBNAME=$2;shift 2;;
+	                -P)	export PROCNAME=$2;shift 2;;
+	                -*)	echo $USAGE;exit 1;;
+	                *)	echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+export DBLIST=/tmp/dbnamelist.$$
+export SQL1=/tmp/tempsql.$$
+export OUTFILE=$LOGDIR/misc/$DBSERVER/$DBSERVER.checkLoginScript.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test $SQL1 && \rm -f $SQL1
+	test $DBLIST && \rm -f $DBLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# If a single dbname is passed, put it in the list, otherwise
+# generate a list of all current default databases based on syslogins
+#--------------------------------------------------------------------------
+> $DBLIST
+if [ "$DBNAME" ]
+then
+	echo $DBNAME >> $DBLIST
+else
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -b -w200 <<-! | grep -v Password >> $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select distinct dbname from syslogins where name <> 'probe' order by dbname
+--	select name from sysdatabases where name not in ('model','dba','lookjack')
+--	and name not like 'tempdb%'
+--	and name not like 'sybsystem%'
+--	and name not like 'sybsecurity%'
+--	and name not like 'dbcc%'
+	go
+	!
+fi
+
+#--------------------------------------------------------------------------
+# Format the sql to be run against each database
+#--------------------------------------------------------------------------
+> $SQL1
+echo "set nocount on" >> $SQL1
+echo "go" >> $SQL1
+
+for DBNAME in `cat $DBLIST`
+do
+	export DBNAME
+
+	echo "if exists (select name from $DBNAME..sysobjects where name = \"$PROCNAME\")" >> $SQL1
+	echo "print \"Login script $PROCNAME EXISTS in $DBNAME\"" >> $SQL1
+	echo "else" >> $SQL1
+	echo "print \"Login script $PROCNAME NOT FOUND in $DBNAME\"" >> $SQL1
+
+	echo "go" >> $SQL1
+
+done
+
+#--------------------------------------------------------------------------
+# Pipe in the sql
+#--------------------------------------------------------------------------
+> $OUTFILE
+
+getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -i$SQL1 -b | grep -v Password: >> $OUTFILE
+
+#--------------------------------------------------------------------------
+# Check for errors
+#--------------------------------------------------------------------------
+checkSqlErr $OUTFILE
+if [ $? -eq 1 ]
+then
+        echo "$0 FAILED"
+	echo "Results in $OUTFILE"
+        exit 1
+else
+        echo "$0 SUCCESSFUL\n"
+	grep 'NOT FOUND' $OUTFILE
+	echo "\nResults in $OUTFILE"
+        exit 0
+fi

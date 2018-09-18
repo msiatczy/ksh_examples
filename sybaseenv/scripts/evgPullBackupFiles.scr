@@ -1,0 +1,98 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: evgPullBackupFiles.scr -S <DBSERVER> -D <dbname> -sourcedir <directory> -targetdir <directory> {-date <yyyymmdd>}
+#
+#  Description: Pull Sybase backup files from Evergreen server to local filesystem
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVERS> - ASE name
+#              	<dbname> - dbname
+#              	<sourcedir> - source directory
+#              	<targetdir> - target directory
+#              	<date> - yyyymmdd datestamp on files - defaults to current date
+#
+#  Modification History:
+#	12/06/10 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -D <dbname> -sourcedir <directory> -targetdir <directory> {-date <yyyymmdd>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)	export DBSERVER=$2;shift 2;;
+                        -D)	export DBNAME=$2;shift 2;;
+                        -sourcedir)	export SOURCEDIR=$2;shift 2;;
+                        -targetdir)	export TARGETDIR=$2;shift 2;;
+                        -date)	export DATESPEC=$2;shift 2;;
+                        -m)     export MAILDEST=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DBNAME" -o ! "$SOURCEDIR" -o ! "$TARGETDIR" ]
+then
+        echo $USAGE
+        exit 1
+fi
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+# default datespec to current date
+test ! "$DATESPEC" && export DATESPEC=$YYYYMMDD
+
+# get host/service name for DBSERVER
+export SOURCEHOST=`grep "^${DBSERVER} " $ASEDIRLIST | cut -d" " -f2`
+
+export LOGFILE=$LOGDIR/backup/$DBSERVER/$DBSERVER.evgPullBackupFiles.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+#function tempCleanup {
+#	test -f $TEMPFILE && \rm -f $TEMPFILE
+#}
+#
+#trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Pull the files
+# redirect stderr (warning messages about authorized connection) to LOGFILE
+# error checking is non-existent--rely on error messages from scp as useful debugging info
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` START Pull backup files for $DBNAME from $SOURCEHOST" >> $LOGFILE
+
+# 01 after DATESPEC indicates first backup of the day - AM backup
+scp -p ${SOURCEHOST}:${SOURCEDIR}/${DATESPEC}.01.${DBNAME}.*.??.F ${TARGETDIR}/. >> $LOGFILE 2>&1
+export SCPRC=$?
+
+#------------------------------------------------------------------------------
+# print status message and exit
+#------------------------------------------------------------------------------
+if [ $SCPRC -ne 0 ]
+then
+	echo "\nFile pull FAILED\n" >> $LOGFILE
+else
+	echo "\nFile pull SUCCESSFUL\n" >> $LOGFILE
+fi
+	
+echo "`date` END Pull backup files for $DBNAME from $SOURCEHOST" >> $LOGFILE
+exit $SCPRC

@@ -1,0 +1,86 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: verifyBackups.scr -S <DBSERVER> -mmddyyyy <mmddyyyy>
+#
+#  Description: Cross reference current sqbt control files to a saved version
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	04/19/06	M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> -mmddyyyy <mmddyyyy>"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -mmddyyyy)     export DRDATE=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$DBSERVER" -o ! "$DRDATE" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+
+#--------------------------------------------------------------------------
+#  Initialize Variables
+#--------------------------------------------------------------------------
+export CURRLIST=/tmp/tmpcurrlist.$$
+export DRLIST=/tmp/tmpdrlist.$$
+
+#--------------------------------------------------------------------------
+#  Define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $CURRLIST && \rm -f $CURRLIST
+        test -f $DRLIST && \rm -f $DRLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working sqlbt list
+# If one dbserver is passed, do not process the DBSERVER exclusion list
+# Reformat the exclude list so it will pick up exact servername matches
+#--------------------------------------------------------------------------
+cd $DT_PHYSICAL/$DBSERVER
+grep 'generations=' * | sort > $CURRLIST
+
+cd $SQLBT_DRDIR/$DBSERVER$DRDATE/physical
+grep 'generations=' * | sort > $DRLIST
+
+#--------------------------------------------------------------------------
+#  Find differences  
+#--------------------------------------------------------------------------
+sdiff -s $CURRLIST $DRLIST
+
+#------------------------------------------------------------------------------
+# Exit
+#------------------------------------------------------------------------------
+exit 0

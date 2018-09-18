@@ -1,0 +1,147 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getRepDbs.scr -RS <REPSERVER> {-genctl <filename>}
+#
+#  Description: Get list of databases managed by RSSD
+#		Optionally, gen a control file for use during a switch active
+#
+#     Location:	/sccm/dba/sybase/scripts/getRepDbs.scr
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<REPSERVER> - Repserver
+#
+#  Modification History:
+#	04/02/03 M. Siatczynski	Initial Script
+#	05/13/03 M. Siatczynski	Added logical names and genctl functionality
+#	10/15/03 M. Siatczynski	Add code to check for errors in the genned ctl file
+#	11/06/03 M. Siatczynski	Add code to print warning for NULL entries in ctl file
+#	01/23/04 M. Siatczynski	Centralized script
+#	07/06/04 M. Siatczynski	Generate additional control list to new central CTLDIR
+#	08/04/04 M. Siatczynski	No longer necessary to generate control list under old central directory
+#	02/10/06 M. Siatczynski	Implement ISQLEXE, getPass, ADMINLOGIN
+#	11/29/06 M. Siatczynski	Change label on control file creation so it can be parsed from another script
+#	05/17/07 M. Siatczynski	Pass only RS parm, get RSASE and RSSD from REPDIRLIST
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Input parameters
+#------------------------------------------------------------------------------
+USAGE="ERROR - Usage: $0 -RS <REPSERVER> {-genctl <filename>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+	echo $USAGE
+	exit 1
+else
+	while [ $# -gt 0 ]
+	do
+	        case $1 in
+	                -RS)		export REPSERVER=$2;shift 2;;
+	                -genctl)	export FILESPEC=$2;shift 2;;
+	                -*)		echo $USAGE;exit 1;;
+	                *)		echo $USAGE;exit 1;;
+	        esac
+	done
+fi
+
+if [ ! "$REPSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+# generate control file central location ($CTLDIR/replication)
+export CTLFILE=$CTLDIR/replication/$FILESPEC
+export SQLFILE=/tmp/sqlfile.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+        test -f $SQLFILE && \rm -f $SQLFILE
+}
+ 
+trap 'tempCleanup' EXIT INT TERM
+
+#-----------------------------------------------------------------------
+# Get RSASE and RSSD based on REPSERVER
+# Make sure they are set to something
+#-----------------------------------------------------------------------
+grep "^$REPSERVER " $REPDIRLIST | cut -d" " -f8,9 | read RSASE RSSD
+if [ ! "$RSASE" -o ! "$RSSD" ]
+then
+	echo "ERROR - RSASE or RSSD not properly set"
+	exit 1
+fi
+
+#-----------------------------------------------------------------------
+# Format the SQL
+#-----------------------------------------------------------------------
+> $SQLFILE
+
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "use $RSSD" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "create table #repd (logid int not null, ldsname varchar(15) null, ldbname varchar(25) null, dbname varchar(25) null, active varchar(15) null, standby varchar(15) null)" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "insert #repd (logid, ldsname, ldbname) select ldbid, dsname, dbname from rs_databases where ptype = 'L'" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "update #repd set t.active = d.dsname, t.dbname = d.dbname from #repd t, rs_databases d where t.logid = d.ldbid and d.ptype = 'A'" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "update #repd set t.standby = d.dsname from #repd t, rs_databases d where t.logid = d.ldbid and d.ptype = 'S'" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+if [ ! "$FILESPEC" ]
+then
+	echo "set nocount off" >> $SQLFILE
+	echo "go" >> $SQLFILE
+fi
+
+#echo "select dbname,active,standby,ldsname,ldbname from #repd order by dbname" >> $SQLFILE
+echo "select active,dbname,standby,ldsname,ldbname from #repd order by active,dbname" >> $SQLFILE
+echo "go" >> $SQLFILE
+echo "drop table #repd" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#-----------------------------------------------------------------------
+# Run the SQL
+# If generating a control file, remove leading space and convert multiple spaces to single space
+#-----------------------------------------------------------------------
+if [ "$FILESPEC" ]
+then
+	getPass $RSASE $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$RSASE -w200 -b -i $SQLFILE | grep -v Password | sed -e 's/^ //g' -e 's/  */ /g' > $CTLFILE
+	checkSqlErr $CTLFILE
+	if [ $? -ne 0 ]
+	then
+	        echo "\nGeneration of $CTLFILE FAILED"
+	        echo "\nReview errors in $CTLFILE\n"
+	        exit 1
+	else
+		echo "\nControl file: $CTLFILE\n"
+
+# Check for entries which contain NULL - print warning about these
+		grep 'NULL' $CTLFILE > /dev/null
+		export RC=$?
+		if [ $RC -eq 0 ]
+		then
+			echo "WARNING - $CTLFILE contains NULL entries.  Edit and correct file.\n"
+		fi
+
+	        exit 0
+	fi
+else	
+	echo "\n\n"
+	getPass $RSASE $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$RSASE -w200 -i $SQLFILE | grep -v Password
+	echo "\n\n"
+fi
+
+#-----------------------------------------------------------------------
+# Exit with 0
+#-----------------------------------------------------------------------
+exit 0

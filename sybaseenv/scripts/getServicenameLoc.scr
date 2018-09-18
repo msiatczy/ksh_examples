@@ -1,0 +1,79 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getServicenameLoc.scr -SN <servicename>|all
+#
+#  Description: Get actual hostname for one or all servicenames
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#
+#  Modification History:
+#	02/03/09 M. Siatczynski	Initial Script
+#	01/19/11 M. Siatczynski	Reference to /sccm/cfig/sysinfo/service-names no longer reliable, ssh to SN to get HN
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -SN <servicename>|all"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -SN)    export ONESN=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export SNLIST=/tmp/snlist.$$
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $SNLIST && \rm -f $SNLIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#------------------------------------------------------------------------------
+# Create working list
+#------------------------------------------------------------------------------
+if [ "$ONESN" = "all" ]
+then
+	grep -v '^#' $ASEDIRLIST | cut -d" " -f2 > $SNLIST
+else
+	echo $ONESN > $SNLIST
+fi
+
+#--------------------------------------------------------------------------
+#  Get hostname for each servicename
+#--------------------------------------------------------------------------
+cat $SNLIST |
+while read SN
+do
+	unset HN
+	export HN=`/usr/local/bin/ssh -n $SN 'hostname' 2>/dev/null`
+	echo $SN $HN
+done
+
+exit 0

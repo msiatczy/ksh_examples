@@ -1,0 +1,186 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: formatSystemTableAudit.scr -S <DBSERVER> {-D <dbname>} -on|-off {-execute}
+#
+#  Description: Format sp_audit statements to set auditing for inserts, updates, deletes against system tables
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER> - short description of parm if not obvious
+#              	<-on -off> - turn auditing on or off
+#
+#  NOTE:  tempdb is not included in the audit
+#
+#  Modification History:
+#	12/29/05 M. Siatczynski	Initial Script
+#	02/13/06 M. Siatczynski	Implement ISQLEXE
+#	03/14/06 M. Siatczynski	Add SYSTABLELIST to trap
+#	06/02/06 M. Siatczynski	Ignore read only and offline databases
+#	11/02/06 M. Siatczynski	Add -execute parm to execute sql, add LOGFILE
+#	05/07/07 M. Siatczynski	Add DBSERVER subdirectory to LOGFILE
+#				Moved fi to end loop where DBLIST is created (was never entering following loop if single database was passed)
+#	07/15/07 M. Siatczynski	Do not echo successful status to console (to accommodate batch run)
+#	05/29/09 M. Siatczynski	Updated to call getDbList function
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>} -on|-off {-execute}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -on)    export ON=1;shift 1;;
+                        -off)   export OFF=1;shift 1;;
+                        -execute)   export EXECUTE=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+test ! "$ON" && export ON=0
+test ! "$OFF" && export OFF=0
+test ! "$EXECUTE" && export EXECUTE=0
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+elif [ $ON -eq 0 -a $OFF -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+if [ $ON -eq 1 -a $OFF -eq 1 ]
+then
+	echo "ERROR - -on and -off are mutually exclusive"
+	exit 1
+fi
+
+test $ON -eq 1 && export STATUS=on || export STATUS=off
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/dblist.$$
+export SYSTABLELIST=/tmp/systablelist.$$
+export SQLFILE=$SQLDIR/$DBSERVER/$DBSERVER.systemTableAudit.$STATUS.$DATETIME.sql
+export LOGFILE=$LOGDIR/audit/$DBSERVER/$DBSERVER.systemTableAudit.$STATUS.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SYSTABLELIST && \rm -f $SYSTABLELIST
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# write headers
+#--------------------------------------------------------------------------
+> $LOGFILE
+echo "`date` Formatting system table audits for $DBSERVER" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# Create a working dblist
+# Exclude tempdbs, read only (status=1024) and offline (status2=16) databases
+#--------------------------------------------------------------------------
+> $SQLFILE
+
+if [ "$DBNAME" ]
+then
+	echo $DBNAME > $DBLIST
+else
+	getDbList -S $DBSERVER -user -system -xreadonly > $DBLIST
+	if [ $? -ne 0 ]
+	then
+		cat $DBLIST
+		echo "ERROR - getting list of databases for $DBSERVER" | tee -a $LOGFILE
+		exit 1
+	fi
+fi
+
+#--------------------------------------------------------------------------
+#  For each database:
+#  get list of system tables
+#  format sql for system table audits
+#--------------------------------------------------------------------------
+cat $DBLIST |
+while read DBNAME
+do
+	export DBNAME
+
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | grep -v Password > $SYSTABLELIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	select name from $DBNAME..sysobjects where id <= 99 and type = 'S' order by name
+	go
+	!
+
+	checkSqlErr $SYSTABLELIST
+	if [ $? -ne 0 ]
+	then
+		cat $SYSTABLELIST
+		echo "ERROR - getting list of system tables for database $DBNAME on $DBSERVER" | tee -a $LOGFILE
+		exit 1
+	fi
+
+	echo "use $DBNAME" >> $SQLFILE
+	echo "go" >> $SQLFILE
+	for SYSTABLE in `cat $SYSTABLELIST`
+	do
+		for OPTION in insert update delete
+		do
+			export OPTION
+			echo "exec sp_audit \"$OPTION\",\"all\",\"$SYSTABLE\",\"$STATUS\"" >> $SQLFILE
+		done
+	done
+	echo "go" >> $SQLFILE
+done
+
+#--------------------------------------------------------------------------
+#  Write trailers
+#--------------------------------------------------------------------------
+echo "\nThe following SQL file has been created:  $SQLFILE\n" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+#  If -execute parm passed, execute the sql 
+#  check for errors
+#--------------------------------------------------------------------------
+if [ $EXECUTE -eq 1 ]
+then
+	echo "Executing the SQL file against $DBSERVER\n" >> $LOGFILE
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -i$SQLFILE | grep -v Password >> $LOGFILE
+
+	checkSqlErr $LOGFILE
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR - Executing SQL against $DBSERVER" | tee -a $LOGFILE
+		exit 1
+	else
+		echo "SQL SUCCESSFULLY executed against $DBSERVER" >> $LOGFILE
+	fi
+fi
+#--------------------------------------------------------------------------
+#  Exit with 0 if code gets this far
+#--------------------------------------------------------------------------
+exit 0

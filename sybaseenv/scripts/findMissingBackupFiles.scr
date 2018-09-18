@@ -1,0 +1,150 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: findMissingBackupFiles.scr -S <DBSERVER> {-D <dbname>}
+#
+#  Description: Find entries in SQLBT control files which do not exist on disk or are 0 bytes
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  NOTE:  THIS SCRIPT MUST RUN ON THE HOST FROM WHICH THE BACKUPS RUN.
+#  IT GETS SPACE FOR NAS BACKUPS ONLY--IT DOES NOT GATHER INFORMATION FOR BACKUPS WRITTEN DIRECTLY TO TAPE.
+#
+#  Modification History:
+#	06/06/06 M. Siatczynski	Initial Script
+#	10/12/06 M. Siatczynski	Include logic to find files that are 0 bytes
+#	10/17/06 M. Siatczynski	Write output to RPTFILE
+#--------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER> {-D <dbname>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export DBSERVER=$2;shift 2;;
+                        -D)     export DBNAME=$2;shift 2;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+
+if [ ! "$DBSERVER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+export SETDBSERVER=$DBSERVER
+. /sccm/dba/sybase/.dbaSybProfile
+. /sccm/dba/sybase/.dbaSybProfile.datefunctions
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBLIST=/tmp/db.lst.$$
+export TEMPFILE=/tmp/temp.$$
+export NASFILES=/tmp/nasfiles.$$
+export TODAY=`date +"%d-%b-%Y`
+
+# current date variables - used to compare dates
+export CURRENTJJJ=`date +'%j' | sed -e 's/^0*//g'`
+export CURRENTYYYY=`date +'%Y'`
+export CURRENTDATE=`getMMDDYYYY $CURRENTJJJ $CURRENTYYYY`
+
+export RPTFILE=$RPTDIR/backup/$DBSERVER/$DBSERVER.findMissingBackupFiles.$DATETIME
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $TEMPFILE && \rm -f $TEMPFILE
+	test -f $NASFILES && \rm -f $NASFILES
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+#  Write headers
+#--------------------------------------------------------------------------
+> $RPTFILE
+echo "`date` Checking $DBSERVER for missing or 0-byte backup files..." >> $RPTFILE
+
+#--------------------------------------------------------------------------
+#  Process each dbserver and associated dbnames
+#--------------------------------------------------------------------------
+# get list of db names (for valid control files only)
+if [ "$DBNAME" ]
+then
+	echo $DBNAME > $DBLIST
+else
+	ls $DT_PHYSICAL/$DBSERVER | grep -v '\.skip' > $DBLIST
+fi
+
+cat $DBLIST |
+while read DB
+do
+	echo "Check backup files for $DB..." | tee -a $RPTFILE
+# generate csv dtsreport file for DBSERVER DB
+	export DTSREPORT=`$SCRDIR/sqlbtDtsreport.scr -S $DBSERVER -D $DB -fmt csv`
+	if [ ! -f $DTSREPORT ]
+	then
+		echo "ERROR - Invalid dtsreport ($DTSREPORT) returned for $DBSERVER $DB" | tee -a $RPTFILE
+		echo "Skipping backup data collection for $DBSERVER $DB" | tee -a $RPTFILE
+		continue
+	fi
+
+	export ACTIVEBACKUPS=`grep active_backups_counter $DT_PHYSICAL/$DBSERVER/$DB | cut -d"=" -f2`
+	export REPORTROWS=`wc -l < $DTSREPORT`
+
+	if [ $ACTIVEBACKUPS -ne $REPORTROWS ]
+	then
+		echo "ERROR:  active_backups_counter=$ACTIVEBACKUPS, REPORT_ROWS=$REPORTROWS" | tee -a $RPTFILE
+	fi
+
+# Get the number of generations maintained for the DB 
+# tail -1 uses the generations value from the most recent dump file (full or tran)
+#	export GENERATIONS=`tail -1 $DTSREPORT | cut -d"," -f10`
+#	test ! "$GENERATIONS" -o "$GENERATIONS" = "N/A" && export GENERATIONS=0
+
+# parse out all filenames associated with full and tran log NAS backups
+# NEED TO APPEND -0 ONTO END OF FILE NAMES
+	cut -d"," -f17 $DTSREPORT | grep 'disk:' | sed -e 's/disk:[0-9A-Za-z_]*\//\//g' -e 's/$/-0/g' > $NASFILES
+
+# Check existence of each dump file (full and tran)
+	cat $NASFILES |
+	while read DUMPFILE
+	do
+		export DUMPFILE
+		if [ ! -f $DUMPFILE ]
+		then
+			echo "ERROR:  $DUMPFILE does not exist" | tee -a $RPTFILE
+		elif [ ! -s $DUMPFILE ]
+		then
+			echo "ERROR:  $DUMPFILE is 0 bytes" | tee -a $RPTFILE
+		fi
+	done
+	echo "Check done for $DB..." | tee -a $RPTFILE
+done
+
+#--------------------------------------------------------------------------
+#  Exit the script
+#--------------------------------------------------------------------------
+echo "`date` Check complete" >> $RPTFILE
+exit 0

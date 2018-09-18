@@ -1,0 +1,236 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: getUserInfo.scr -S <DBSERVER>|all -user <target user> -like <like user> {-execute}
+#
+#  Description: Generate DDL to setup a new user like an existing user
+#
+#  NOTE:  this script assumes no permissions are granted directly to the like user
+#	  If this becomes a requirement, the script needs to be updated to pull permissions.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<DBSERVER>
+#		<target user> - new user to be setup
+#		<like user> - user used as model
+#
+#  Modification History:
+#	09/21/06 M. Siatczynski	Initial script
+#	10/05/06 M. Siatczynski	Add code to account for servers where role is granted but user does not exist in any databases
+#	08/18/07 M. Siatczynski	Change name of SQLFILE to include name of NEWUSER rather than LIKEUSER
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|all -user <new user> -like <like user> {-execute}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)     export ONEDBSERVER=$2;shift 2;;
+                        -user)  export NEWUSER=$2;shift 2;;
+                        -like)  export LIKEUSER=$2;shift 2;;
+                        -execute)  export EXECUTE=1;shift 1;;
+                        -*)     echo $USAGE;exit 1;;
+                        *)      echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" -a ! "$NEWUSER" -a ! "$LIKEUSER" ]
+then
+        echo $USAGE
+        exit 1
+fi
+
+test ! "$EXECUTE" && export EXECUTE=0
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export DBLIST=/tmp/dblist.$$
+export ROLELIST=/tmp/rolelist.$$
+export SQLOUT=/tmp/sqlout.$$
+export HIGHRC=0
+
+export LOGFILE=$LOGDIR/useradmin/central/genUserLikeSql.$DATETIME
+
+> $LOGFILE
+echo "`date` START Gen user SQL" >> $LOGFILE
+echo "Generating SQL to setup $NEWUSER like $LIKEUSER" >> $LOGFILE
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $ROLELIST && \rm -f $ROLELIST
+	test -f $SQLOUT && \rm -f $SQLOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create DBSERVER list
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+	getAseList > $DBSERVERLIST
+else
+	echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#------------------------------------------------------------------------------
+# For each DBSERVER...
+# Set replication off so this can be run on each DBSERVER directly
+#------------------------------------------------------------------------------
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+	export DBSERVER
+	echo "$DBSERVER - Getting user access..." >> $LOGFILE
+	export SQLFILE=$SQLDIR/useradmin/$DBSERVER/$DBSERVER.$NEWUSER.setup.sql.$DATETIME
+	> $SQLFILE
+	echo "set replication off" >> $SQLFILE
+	echo "go" >> $SQLFILE
+
+#--------------------------------------------------------------------------
+# Get list of granted roles
+# use sp_login_roles to get the list--remove leading space and convert all multiple spaces to single space
+# Check for errors
+#--------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | egrep -v '(Password:|return status)' | sed -e 's/^ //g' -e 's/  */ /g' > $ROLELIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	if exists (select * from master..syslogins where name = "$LIKEUSER")
+	exec sp_login_roles $LIKEUSER
+	go
+	!
+
+	checkSqlErr $ROLELIST
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting list of roles from $DBSERVER" | tee -a $LOGFILE
+		cat $ROLELIST | tee -a $LOGFILE
+		export HIGHRC=1
+	fi
+
+#------------------------------------------------------------------------------
+# Format the rolelist into grant statements
+#------------------------------------------------------------------------------
+	cat $ROLELIST |
+	while read ROLENAME
+	do
+		export ROLENAME
+		echo "execute sp_role \"grant\",$ROLENAME,$NEWUSER" >> $SQLFILE
+		echo "go" >> $SQLFILE
+		echo "execute sp_modifylogin $NEWUSER,\"add default role\",$ROLENAME" >> $SQLFILE
+		echo "go" >> $SQLFILE
+	done
+
+#--------------------------------------------------------------------------
+# Get list of databases where the user has access
+# use sp_login_dbs to get the list--remove leading space and convert all multiple spaces to single space
+# Check for errors
+#--------------------------------------------------------------------------
+	$ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b <<-! | egrep -v '(Password:|return status|not a user in any databases)' | sed -e 's/^ //g' -e 's/  */ /g' > $DBLIST
+	`getPass $DBSERVER $ADMINLOGIN`
+	set nocount on
+	go
+	if exists (select * from master..syslogins where name = "$LIKEUSER")
+	exec sp_login_dbs $LIKEUSER
+	go
+	!
+
+	checkSqlErr $DBLIST
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - getting list of databases from $DBSERVER" | tee -a $LOGFILE
+		cat $DBLIST | tee -a $LOGFILE
+		export HIGHRC=1
+	fi
+
+#------------------------------------------------------------------------------
+# Format the dblist into sp_adduser statements
+#------------------------------------------------------------------------------
+	cat $DBLIST |
+	while read DBNAME NAMEINDB DBGROUP
+	do
+		export DBNAME NAMEINDB DBGROUP
+		if [ "$NAMEINDB" = "dbo" ]
+		then
+			echo "use $DBNAME" >> $SQLFILE
+			echo "go" >> $SQLFILE
+			echo "if not exists (select * from $DBNAME..sysalternates a,$DBNAME..sysusers u where a.altsuid = u.suid and a.suid = suser_id(\"$NEWUSER\") and user_name(u.uid) = \"$NAMEINDB\")" >> $SQLFILE
+			echo "exec sp_addalias $NEWUSER,dbo" >> $SQLFILE
+			echo "else" >> $SQLFILE
+			echo "print \"$NEWUSER already aliased to $NAMEINDB in $DBNAME\"" >> $SQLFILE
+			echo "go" >> $SQLFILE
+		else
+			echo "use $DBNAME" >> $SQLFILE
+			echo "go" >> $SQLFILE
+			echo "if not exists (select * from $DBNAME..sysusers where name = \"$NEWUSER\")" >> $SQLFILE
+			echo "exec sp_adduser $NEWUSER,$NEWUSER,\"$DBGROUP\"" >> $SQLFILE
+			echo "else" >> $SQLFILE
+			echo "print \"$NEWUSER already exists in $DBNAME\"" >> $SQLFILE
+			echo "go" >> $SQLFILE
+		fi
+	done
+
+	if [ -s $SQLFILE ]
+	then
+		echo "$DBSERVER SQLFILE created: $SQLFILE" | tee -a $LOGFILE
+
+# If execute flag is passed, execute the SQL against the DBSERVER
+		if [ $EXECUTE -eq 1 ]
+		then
+			echo "$DBSERVER Executing SQL..." | tee -a $LOGFILE
+			getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -e -i$SQLFILE | grep -v Password: > $SQLOUT
+
+			cat $SQLOUT >> $LOGFILE
+
+			checkSqlErr $SQLOUT
+			if [ $? -eq 1 ]
+			then
+				echo "ERROR - executing SQL against $DBSERVER" | tee -a $LOGFILE
+				cat $SQLOUT >> $LOGFILE
+				export HIGHRC=1
+			else
+				echo "$DBSERVER User setup of $NEWUSER SUCCESSFUL" | tee -a $LOGFILE
+			fi
+		fi
+		else
+			echo "$DBSERVER No SQLFILE created" >> $LOGFILE
+		fi
+	echo ""
+done
+
+#------------------------------------------------------------------------------
+# Write log trailer
+#------------------------------------------------------------------------------
+echo "`date` END Gen user SQL" >> $LOGFILE
+
+#------------------------------------------------------------------------------
+# Exit with final return code based on HIGHRC
+#------------------------------------------------------------------------------
+if [ $HIGHRC -ne 0 ]
+then
+	echo "ERROR - See $LOGFILE for details"
+	exit 1
+else
+	exit 0
+fi

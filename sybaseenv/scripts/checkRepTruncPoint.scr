@@ -1,0 +1,149 @@
+#!/bin/ksh
+#--------------------------------------------------------------------------
+#        Usage: checkRepTruncPoint.scr -S <DBSERVER>|all {-m <maildest>}
+#
+#  Description: Check one or more ASEs for databases which have a replication
+#		truncation point in a database but rep agents are not enabled on the ASE
+#
+#  NOTE:  This problem typically occurs when a database is refreshed from a replicated env to a non-replicated env.
+#
+#     Location:	/sccm/dba/sybase/scripts
+#
+#    Called by:	(optional) Script or Autosys script that calls this script
+#
+#        Calls:	(optional) Any scripts this script executes
+#   
+#   Parameters:	<parm1> - short description of parm if not obvious
+#              	<parm2> - short description of parm if not obvious
+#
+#  Modification History:
+#	01/10/08 M. Siatczynski	Initial Script
+#--------------------------------------------------------------------------
+. /sccm/dba/sybase/.dbaSybProfile
+
+#------------------------------------------------------------------------------
+# Sample block for input parameters
+#------------------------------------------------------------------------------
+export USAGE="ERROR - Usage: $0 -S <DBSERVER>|all {-m <maildest>}"
+export CALLED="$0 $*"
+
+if [ $# -eq 0 ]
+then
+        echo $USAGE
+        exit 1
+else
+        while [ $# -gt 0 ]
+        do
+                case $1 in
+                        -S)		export ONEDBSERVER=$2;shift 2;;
+                        -m)		export MAILDEST=$2;shift 2;;
+                        -*)		echo $USAGE;exit 1;;
+                        *)		echo $USAGE;exit 1;;
+                esac
+        done
+fi
+
+if [ ! "$ONEDBSERVER" ]
+then
+        echo $USAGE
+        exit 2
+fi
+
+#--------------------------------------------------------------------------
+#  Initialize Variables  
+#--------------------------------------------------------------------------
+export LOGFILE=$LOGDIR/misc/checkRepTruncPoint.$DATETIME
+export DBSERVERLIST=/tmp/dbserverlist.$$
+export DBLIST=/tmp/dblist.$$
+export SQLFILE=/tmp/sqlfile.$$
+export MAILFILE=/tmp/mailfile.$$
+export TEMPOUT=/tmp/tempout.$$
+export HIGHRC=0
+
+#--------------------------------------------------------------------------
+# define cleanup function and trap
+#--------------------------------------------------------------------------
+function tempCleanup {
+	test -f $DBSERVERLIST && \rm -f $DBSERVERLIST
+	test -f $DBLIST && \rm -f $DBLIST
+	test -f $SQLFILE && \rm -f $SQLFILE
+	test -f $MAILFILE && \rm -f $MAILFILE
+	test -f $TEMPOUT && \rm -f $TEMPOUT
+}
+
+trap 'tempCleanup' EXIT INT TERM
+
+#--------------------------------------------------------------------------
+# Create a working dbserverlist
+#--------------------------------------------------------------------------
+if [ "$ONEDBSERVER" = "all" ]
+then
+        getAseList > $DBSERVERLIST
+else
+        echo $ONEDBSERVER > $DBSERVERLIST
+fi
+
+#------------------------------------------------------------------------------
+# format sql to check for replication truncation points if 'enable rep agent threads' is not configured
+#------------------------------------------------------------------------------
+> $SQLFILE
+echo "set nocount on" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+echo "if (select value from master..sysconfigures where name = 'enable rep agent threads') = 0" >> $SQLFILE
+echo "select @@servername,db_name(dbid) from master..syslogshold where name like '%replication_truncation_point%' order by db_name(dbid)" >> $SQLFILE
+echo "go" >> $SQLFILE
+
+#--------------------------------------------------------------------------
+# For each DBSERVER...
+#--------------------------------------------------------------------------
+> $DBLIST
+
+cat $DBSERVERLIST |
+while read DBSERVER
+do
+
+#------------------------------------------------------------------------------
+# pipe in the sql
+# check for errors
+#------------------------------------------------------------------------------
+	> $TEMPOUT
+	getPass $DBSERVER $ADMINLOGIN | $ISQLEXE -U$ADMINLOGIN -S$DBSERVER -w200 -b -i$SQLFILE | grep -v Password: >> $TEMPOUT
+
+	checkSqlErr $TEMPOUT
+	if [ $? -eq 1 ]
+	then
+		echo "ERROR - executing SQL against $DBSERVER" >> $LOGFILE
+		cat $TEMPOUT >> $LOGFILE
+		export HIGHRC=1
+		continue
+	else
+		test -s "$TEMPOUT" && cat $TEMPOUT >> $DBLIST
+	fi
+done
+
+#--------------------------------------------------------------------------
+# mail the report to dba
+#--------------------------------------------------------------------------
+if [ -s $DBLIST ]
+then
+	> $MAILFILE
+	echo "Report date:  `date`" >> $MAILFILE
+	echo "The following databases have a replication truncation point set on an ASE which does NOT have 'enable rep agents threads' configured." >> $MAILFILE
+	echo "Execute dbccSettrunc.scr to REMOVE the secondary truncation point for these databases\n" >> $MAILFILE
+	cat $DBLIST >> $MAILFILE
+	cat $MAILFILE >> $LOGFILE
+	export MAILSUBJECT="INVALID Replication Truncation Points"
+	sendMail
+fi
+
+#------------------------------------------------------------------------------
+# exit with final return code
+#------------------------------------------------------------------------------
+if [ $HIGHRC -eq 0 ]
+then
+	exit 0 
+else
+	echo "Script FAILED - review output in $LOGFILE"
+	exit 2
+fi
